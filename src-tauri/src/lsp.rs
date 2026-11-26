@@ -13,7 +13,7 @@ use crate::{
     CommandResult, Core,
 };
 
-const MAX_MESSAGE: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -23,10 +23,10 @@ pub enum ServerEvent {
 }
 
 pub struct RunningServer {
-    id: u64,
-    input: mpsc::Sender<String>,
-    stop: Option<oneshot::Sender<()>>,
-    group: Arc<ProcessGroup>,
+    pub(crate) id: u64,
+    pub(crate) input: mpsc::Sender<String>,
+    pub(crate) stop: Option<oneshot::Sender<()>>,
+    pub(crate) group: Arc<ProcessGroup>,
 }
 
 impl Drop for RunningServer {
@@ -38,8 +38,13 @@ impl Drop for RunningServer {
     }
 }
 
-async fn frame(reader: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Option<Value>> {
-    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "Invalid gopls message header");
+pub(crate) async fn frame(reader: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Option<Value>> {
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid protocol message header",
+        )
+    };
     let mut length: Option<usize> = None;
     let mut header = String::new();
     let mut limited = (&mut *reader).take(8192);
@@ -69,6 +74,16 @@ async fn frame(reader: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Option<Va
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(io::Error::other)
+}
+
+pub(crate) async fn write_frame(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    message: &str,
+) -> io::Result<()> {
+    writer
+        .write_all(format!("Content-Length: {}\r\n\r\n", message.len()).as_bytes())
+        .await?;
+    writer.write_all(message.as_bytes()).await
 }
 
 #[tauri::command]
@@ -104,10 +119,7 @@ pub async fn start_gopls(
     tauri::async_runtime::spawn(async move {
         let send = async {
             while let Some(message) = outgoing.recv().await {
-                writer
-                    .write_all(format!("Content-Length: {}\r\n\r\n", message.len()).as_bytes())
-                    .await?;
-                writer.write_all(message.as_bytes()).await?;
+                write_frame(&mut writer, &message).await?;
             }
             Ok::<_, io::Error>(())
         };

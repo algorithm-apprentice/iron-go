@@ -2,5 +2,9 @@
   "identifier": "dev.irongo.e2e",
   "productName": "Iron Go Acceptance",
   "mainBinaryName": "iron-go-acceptance",
-  "build": { "frontendDist": "../dist-e2e" }
+  "build": { "frontendDist": "../dist-e2e" },
+  "app": { "security": { "capabilities": [
+    "main-window",
+    { "identifier": "acceptance-window", "windows": ["main"], "permissions": ["core:window:allow-set-size"] }
+  ] } }
 }

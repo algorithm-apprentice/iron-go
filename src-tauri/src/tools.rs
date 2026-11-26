@@ -85,6 +85,7 @@ pub struct GoTools {
     go_version: Option<String>,
     gofmt: bool,
     gopls: bool,
+    delve: bool,
 }
 
 #[tauri::command]
@@ -107,6 +108,7 @@ pub async fn go_tools() -> GoTools {
         go_version,
         gofmt: command("gofmt").is_ok(),
         gopls: command("gopls").is_ok(),
+        delve: command("dlv").is_ok(),
     }
 }
 

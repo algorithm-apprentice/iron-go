@@ -57,12 +57,13 @@ export class Documents {
   private location = 0;
   private opening = new Map<string, Promise<DocumentTab | undefined>>();
 
-  constructor(element: HTMLElement, private readonly events: DocumentEvents) {
+  constructor(private readonly element: HTMLElement, private readonly events: DocumentEvents) {
     this.editor = monaco.editor.create(element, {
       model: null, theme: "vs-dark", automaticLayout: true, editContext: false,
       accessibilitySupport: "off", ariaLabel: "Code editor content", fontSize: 13,
       fontFamily: '"SF Mono", Menlo, Monaco, Consolas, monospace', fontLigatures: false,
       lineHeight: 22, lineNumbersMinChars: 4, padding: { top: 10, bottom: 8 },
+      glyphMargin: true,
       renderLineHighlight: "all", scrollBeyondLastLine: false, roundedSelection: false,
       minimap: { enabled: true, renderCharacters: false, showSlider: "mouseover", maxColumn: 75 },
       guides: { bracketPairs: false, indentation: true, highlightActiveIndentation: true },
@@ -78,6 +79,20 @@ export class Documents {
         return !!await this.open(path, { focus: true, target: selection });
       },
     });
+  }
+
+  layout() {
+    const width = this.element.clientWidth;
+    const height = this.element.clientHeight;
+    const previous = this.editor.getLayoutInfo();
+    if (width > 0 && height > 0 && (width !== previous.width || height !== previous.height)) {
+      this.editor.layout({ width, height });
+    }
+  }
+
+  refreshView() {
+    this.layout();
+    this.editor.render(true);
   }
 
   reset(folder: Project) {
@@ -148,6 +163,7 @@ export class Documents {
       this.editor.setModel(tab.model);
       if (tab.viewState) this.editor.restoreViewState(tab.viewState);
       this.events.changed();
+      this.refreshView();
     }
     if (target) {
       if (monaco.Range.isIRange(target)) {

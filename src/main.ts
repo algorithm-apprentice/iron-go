@@ -1,10 +1,12 @@
 import "./styles.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { byId, element, Forms, message, Palette } from "./dialogs";
 import { bufferText, Documents, monaco, replaceBuffer, type DocumentTab } from "./editor";
 import { Feedback } from "./feedback";
 import { fileIcon, icon, prepareIcons, type Icon } from "./icons";
-import { GoLanguage, runTestCommand, type LanguageState } from "./lsp";
+import { GoLanguage, debugTestCommand, runTestCommand, type LanguageState } from "./lsp";
+import { Breakpoints, DebugSession } from "./debugger";
 import { packageForFile, RunTargets } from "./run-targets";
 import { bindColorTheme, chooseColorTheme } from "./theme";
 import { basename, dirname, initialWorkspaceFile, makeTree, quickFiles, validateRelative, type FileMatch, type ProjectSnapshot, type TreeNode } from "./project-model";
@@ -16,11 +18,11 @@ prepareIcons();
 document.body.classList.toggle("desktop", desktop);
 const palette = new Palette();
 const forms = new Forms();
-const feedback = new Feedback();
+const feedback = new Feedback(() => docs.layout());
 const workbench = byId("workbench");
 const btn = (id: string) => byId<HTMLButtonElement>(id);
 const input = (id: string) => byId<HTMLInputElement>(id);
-const toolsMissing = { goVersion: null, gofmt: false, gopls: false };
+const toolsMissing = { goVersion: null, gofmt: false, gopls: false, delve: false };
 const runTargets = new RunTargets(focus => {
   chooseView("tasks");
   byId<HTMLDetailsElement>("advanced-targets").open = true;
@@ -35,6 +37,9 @@ let view: View = "explorer";
 let rootExpanded = true;
 let busy = false;
 let task: TaskKind | undefined;
+let debug: DebugSession | undefined;
+const breakpoints = new Breakpoints();
+let executionLine: { model: monaco.editor.ITextModel; ids: string[] } | undefined;
 let stopPending = false;
 let formatting = false;
 let tools: ToolStatus | undefined;
@@ -47,10 +52,13 @@ let renderedActive: string | undefined;
 
 const docs = new Documents(byId("editor"), {
   changed: renderDocuments,
-  opened: tab => lsp?.opened(tab),
+  opened: tab => { breakpoints.open(tab); lsp?.opened(tab); },
   edited: tab => lsp?.edited(tab),
-  closed: tab => { lsp?.closed(tab); queueMicrotask(renderProblems); },
+  closed: tab => { breakpoints.close(tab); lsp?.closed(tab); queueMicrotask(renderProblems); },
   saved: tab => lsp?.saved(tab),
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") docs.refreshView();
 });
 
 function status(text: string) { byId("status").textContent = text; }
@@ -214,7 +222,7 @@ function syncControls() {
   btn("new-file").disabled = busy || !!project.welcome;
   btn("refresh-files").disabled = busy || !!project.welcome;
   const run = btn("run");
-  run.disabled = busy || stopPending || !!project.welcome;
+  run.disabled = busy || stopPending || !!debug || !!project.welcome;
   run.dataset.running = String(!!task);
   const primary = runTargets.primaryAction();
   run.innerHTML = `${icon(task ? "stop" : primary === "test" ? "flask" : "play")}<span>${task ? "Stop" : primary === "test" ? "Test" : "Run"}</span>`;
@@ -222,8 +230,11 @@ function syncControls() {
   btn("panel-stop").hidden = !task;
   btn("panel-stop").disabled = stopPending;
   btn("stop-task").disabled = !task || stopPending;
-  runTargets.setDisabled(busy, !!task);
-  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-task]")) button.disabled = !!task || busy || !!project.welcome;
+  runTargets.setDisabled(busy, !!task || !!debug);
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-task]")) button.disabled = !!task || !!debug || busy || !!project.welcome;
+  byId("debug-controls").hidden = !debug;
+  btn("debug-continue").disabled = !debug?.paused;
+  btn("debug-next").disabled = !debug?.paused;
 }
 
 function renderProblems() {
@@ -302,6 +313,11 @@ async function refresh() {
 }
 
 async function install(target: Project) {
+  const previousDebug = debug;
+  debug = undefined;
+  void previousDebug?.stop();
+  clearExecutionLine();
+  breakpoints.reset();
   lsp?.dispose();
   lsp = undefined;
   project = target;
@@ -351,7 +367,8 @@ async function install(target: Project) {
 function canSwitch() {
   if (busy || docs.saving) return false;
   return (!docs.dirty || window.confirm("Discard unsaved edits before leaving this project?")) &&
-    (!task || window.confirm("Stop the current Go task before leaving this project?"));
+    (!task || window.confirm("Stop the current Go task before leaving this project?")) &&
+    (!debug || window.confirm("Stop debugging before leaving this project?"));
 }
 
 async function openFolder() {
@@ -371,6 +388,7 @@ async function closeProject() {
   busy = true;
   syncControls();
   try {
+    await debug?.stop();
     if (project.native) await host.close(project.native.id);
     await install(welcomeProject());
   } catch (error) { showError(error); }
@@ -431,6 +449,7 @@ function chooseView(next: View, focus = true) {
 function showSidebar(visible: boolean) {
   workbench.classList.toggle("sidebar-closed", !visible);
   btn("toggle-sidebar").setAttribute("aria-pressed", String(visible));
+  docs.layout();
 }
 
 function toggleSidebar() { showSidebar(workbench.classList.contains("sidebar-closed")); }
@@ -475,7 +494,7 @@ function searchRow(result: FileMatch) {
 }
 
 async function runTask(kind: TaskKind, singleTest?: { path: string; name: string }) {
-  if (task || busy || docs.saving) return;
+  if (task || debug || busy || docs.saving) return;
   const target = project.native;
   if (!target) {
     toast(desktop ? "Open or create a Go project first." : "Run, build and test are available in the macOS desktop app.");
@@ -520,6 +539,74 @@ async function runTask(kind: TaskKind, singleTest?: { path: string; name: string
   }
 }
 
+function clearExecutionLine() {
+  if (executionLine && !executionLine.model.isDisposed()) executionLine.model.deltaDecorations(executionLine.ids, []);
+  executionLine = undefined;
+}
+
+function toggleBreakpoint(line = docs.editor.getPosition()?.lineNumber) {
+  const tab = docs.active;
+  if (!project.native || !tab?.path.endsWith(".go") || !line) return;
+  breakpoints.toggle(tab, line);
+  docs.refreshView();
+  if (debug?.ready) void debug.setBreakpoints(tab.path).catch(showError);
+}
+
+async function debugTest(path: string, name: string) {
+  const folder = project.native;
+  if (!folder || task || debug || busy || docs.saving) return;
+  if (!tools?.delve) {
+    toast("Install Delve with `brew install delve`, then select Check tools in Settings.", true);
+    return;
+  }
+  busy = true;
+  syncControls();
+  try {
+    for (const tab of docs.tabs.values()) if (tab.dirty) await docs.save(tab);
+    if (docs.dirty || project.native !== folder) throw new Error("Files changed while saving. Debug again.");
+    const session = new DebugSession(folder, breakpoints, {
+      paused(file, line, reason) {
+        if (debug !== session) return;
+        void (async () => {
+          clearExecutionLine();
+          const tab = file ? await docs.open(file, { focus: true, target: { lineNumber: line, column: 1 } }).catch(() => undefined) : undefined;
+          if (debug !== session || !session.paused) return;
+          if (tab) {
+            const ids = tab.model.deltaDecorations([], [{ range: new monaco.Range(line, 1, line, 1), options: { isWholeLine: true, className: "debug-execution-line" } }]);
+            executionLine = { model: tab.model, ids };
+          }
+          const prefix = reason === "breakpoint" ? "Breakpoint hit" : "Paused";
+          status(`${prefix}${file ? ` — ${basename(file)}:${line}` : " outside project source"}`);
+          syncControls();
+        })();
+      },
+      running() {
+        if (debug !== session) return;
+        clearExecutionLine();
+        status(`Debugging ${name}…`);
+        syncControls();
+      },
+      finished(reason) {
+        if (debug !== session) return;
+        debug = undefined;
+        clearExecutionLine();
+        breakpoints.clearVerification();
+        status(reason);
+        feedback.row(reason, reason.startsWith("Debug failed") ? "error" : "quiet");
+        syncControls();
+      },
+      output(value) { if (debug === session && value.trim()) feedback.row(value.trimEnd()); },
+    });
+    debug = session;
+    feedback.clear();
+    feedback.show("output");
+    feedback.row(`Launching ${name} with Delve…`, "command", "command");
+    status(`Launching ${name}…`);
+    void session.start(path, name);
+  } catch (error) { showError(error); }
+  finally { busy = false; syncControls(); }
+}
+
 async function stopTask() {
   const target = project.native;
   if (!target || !task || stopPending) return;
@@ -541,6 +628,7 @@ function updateTools() {
   toolStatus.classList.toggle("warn", desktop && !!tools && !version);
   byId("tools-info").textContent = project.native ? detail : desktop ? "Open or create a Go project to run code." : detail;
   byId("settings-tools-info").textContent = detail + (desktop && tools && !tools.gopls ? " Install with: go install golang.org/x/tools/gopls@latest" : "");
+  if (desktop && tools) byId("settings-tools-info").append(tools.delve ? " · Delve available" : " · Delve not installed (brew install delve)");
   btn("probe-tools").hidden = !desktop;
 }
 
@@ -620,6 +708,7 @@ function bindLayout() {
       const min = vertical ? 160 : 96;
       const max = vertical ? Math.min(420, workbench.clientWidth * .42) : workbench.clientHeight * .55;
       workbench.style.setProperty(vertical ? "--side-width" : "--panel-height", `${Math.max(min, Math.min(max, size))}px`);
+      docs.layout();
     };
     divider.tabIndex = 0;
     divider.addEventListener("pointerdown", event => {
@@ -689,6 +778,17 @@ monaco.editor.addCommand({ id: runTestCommand, run: (_accessor, id: number, path
     void runTask("test", { path, name });
   }
 } });
+monaco.editor.addCommand({ id: debugTestCommand, run: (_accessor, id: number, path: string, name: string) => {
+  if (project.native?.id === id && docs.active?.path === path && path.endsWith("_test.go")) void debugTest(path, name);
+} });
+docs.editor.onMouseDown(event => {
+  if (event.event.leftButton && event.target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) {
+    toggleBreakpoint(event.target.position?.lineNumber);
+  }
+});
+byId("debug-continue").addEventListener("click", () => { void debug?.resume("continue"); });
+byId("debug-next").addEventListener("click", () => { void debug?.resume("next"); });
+byId("debug-stop").addEventListener("click", () => { void debug?.stop(); });
 input("search-text").addEventListener("input", scheduleSearch);
 byId("search-case").addEventListener("click", event => {
   const button = event.currentTarget as HTMLButtonElement;
@@ -721,6 +821,7 @@ document.addEventListener("keydown", event => {
   const key = event.key.toLowerCase();
   const cmd = event.metaKey || (!desktop && event.ctrlKey);
   let apply: (() => unknown) | undefined;
+  if (project.native && event.key === "F9" && !cmd && !event.altKey && !event.shiftKey && !event.ctrlKey) apply = () => toggleBreakpoint();
   if (cmd && !event.altKey) {
     if (key === "p") apply = () => showPalette(event.shiftKey || !!project.welcome);
     if (key === "o") apply = openFolder;
@@ -754,10 +855,27 @@ if (desktop) {
 }
 
 if (import.meta.env.VITE_IRON_E2E === "1") {
+  const runtimeErrors: string[] = [];
+  window.addEventListener("error", event => {
+    runtimeErrors.push(`${event.message} ${event.error?.stack ?? ""}`);
+    if (runtimeErrors.length > 10) runtimeErrors.shift();
+  });
   Object.assign(window, { __ironTest: {
     snapshot: () => ({ root: project.native?.path, path: docs.active?.path, text: docs.active && bufferText(docs.active.model), dirty: docs.active?.dirty,
-      markers: docs.active ? monaco.editor.getModelMarkers({ resource: docs.active.model.uri }) : [], gopls }),
+      markers: docs.active ? monaco.editor.getModelMarkers({ resource: docs.active.model.uri }) : [], gopls,
+      editor: { width: docs.editor.getLayoutInfo().width, height: docs.editor.getLayoutInfo().height, scrollTop: docs.editor.getScrollTop(), contentHeight: docs.editor.getContentHeight(), runtimeErrors } }),
     replace: (value: string) => { if (docs.active) replaceBuffer(docs.active.model, value); },
+    refreshView: () => docs.refreshView(),
+    resize: (width: number, height: number) => getCurrentWindow().setSize(new LogicalSize(width, height)),
+    revealLine: (lineNumber: number) => {
+      docs.layout();
+      docs.editor.setPosition({ lineNumber, column: 1 });
+      const top = docs.editor.getTopForLineNumber(lineNumber, true);
+      const height = docs.editor.getLayoutInfo().height;
+      docs.editor.setScrollTop(Math.max(0, top - height / 2), monaco.editor.ScrollType.Immediate);
+      docs.editor.focus();
+      docs.refreshView();
+    },
     suggest: (lineNumber: number, column: number) => {
       docs.editor.setPosition({ lineNumber, column });
       docs.editor.focus();

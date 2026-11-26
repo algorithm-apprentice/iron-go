@@ -12,6 +12,7 @@ Iron Go.app (macOS)
 │   ├── tools.rs          → tool discovery, gofmt, process group ownership
 │   ├── packages.rs       → cancellable Go module and run target discovery
 │   ├── tasks.rs          → go run/build/test, bounded output and cancellation
+│   ├── debug.rs          → Delve process, private DAP socket and teardown
 │   └── lsp.rs            → gopls stdio ⇄ Tauri IPC channels
 └── TypeScript/Monaco workbench (src)
     ├── main.ts           → workbench assembly and user actions
@@ -20,6 +21,7 @@ Iron Go.app (macOS)
     ├── run-targets.ts    → executable picker, test scope and advanced overrides
     ├── editor.ts         → theme, syntax, files and Monaco model lifetimes
     ├── feedback.ts       → bounded task output and feedback pane
+    ├── debugger.ts       → gutter breakpoints and named-test DAP session
     └── lsp.ts            → vscode-jsonrpc connection and Monaco providers
 ```
 

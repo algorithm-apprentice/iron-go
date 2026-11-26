@@ -11,3 +11,4 @@ record detailed behavior, alternatives, implementation order, and acceptance.
 | [0004](0004-vscode-color-themes.md) | Shared VS Code dark/light palettes for the workbench and Monaco | Accepted |
 | [0005](0005-goland-run-and-test.md) | GoLand-inspired run target and test workflows | Accepted |
 | [0006](0006-project-first-welcome.md) | Project-first welcome; Orbit is test-only | Accepted |
+| [0007](0007-delve-test-debugging.md) | Delve DAP over a private socket for named Go tests | Accepted |

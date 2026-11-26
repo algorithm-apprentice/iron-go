@@ -9,7 +9,7 @@ export type TaskEvent =
   | { type: "output"; stream: "stdout" | "stderr"; bytes: number[] }
   | { type: "notice"; message: string }
   | { type: "finished"; success: boolean; code: number | null; cancelled: boolean };
-export interface ToolStatus { goVersion: string | null; gofmt: boolean; gopls: boolean }
+export interface ToolStatus { goVersion: string | null; gofmt: boolean; gopls: boolean; delve: boolean }
 export interface NativeFolder { id: number; name: string; path: string }
 export interface RunTarget { package: string; importPath: string }
 export interface GoPackages { targets: RunTarget[]; allScopes: string[] }
@@ -34,6 +34,10 @@ export const host = {
   lsp: (id: number, handle: (event: ServerEvent) => void) => invoke<number>("start_gopls", { id, events: channel(handle) }),
   send: (server: number, message: object) => invoke<void>("send_gopls", { server, message: JSON.stringify(message) }),
   stopLsp: (server: number) => invoke<void>("stop_gopls", { server }),
+  debug: (id: number, pkg: string, handle: (event: ServerEvent) => void) =>
+    invoke<{ server: number; output: string }>("start_debug", { id, package: pkg, events: channel(handle) }),
+  sendDebug: (server: number, message: object) => invoke<void>("send_debug", { server, message: JSON.stringify(message) }),
+  stopDebug: (server: number) => invoke<void>("stop_debug", { server }),
 };
 
 export interface Project {

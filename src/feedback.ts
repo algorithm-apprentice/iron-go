@@ -11,7 +11,7 @@ export class Feedback {
   private readonly decoders = { stdout: new TextDecoder(), stderr: new TextDecoder() };
   private tail: Text | undefined;
 
-  constructor() {
+  constructor(private readonly layoutChanged: () => void) {
     for (const button of document.querySelectorAll<HTMLButtonElement>("[data-panel]")) {
       button.addEventListener("click", () => this.show(button.dataset.panel as Pane));
     }
@@ -25,6 +25,7 @@ export class Feedback {
     byId("panel").hidden = !visible;
     byId("panel-resize").hidden = !visible;
     byId("toggle-panel").setAttribute("aria-pressed", String(visible));
+    this.layoutChanged();
   }
 
   show(pane: Pane) {

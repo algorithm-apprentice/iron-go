@@ -11,9 +11,12 @@ import { parseArgs } from "node:util";
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const { values } = parseArgs({ options: {
   "skip-build": { type: "boolean" }, "require-gopls": { type: "boolean" },
-  project: { type: "string" }, "test-file": { type: "string" },
+  "require-delve": { type: "boolean" },
+  "trace-editor": { type: "boolean" },
+  project: { type: "string" }, "test-file": { type: "string" }, "debug-test": { type: "string" },
 } });
 if (process.platform !== "darwin") throw new Error("Native acceptance requires macOS.");
+if (values["debug-test"] && (!values.project || !values["test-file"])) throw new Error("--debug-test requires --project and --test-file.");
 const artifacts = path.join(root, "test-results/native", `${Date.now()}-${process.pid}`);
 await mkdir(artifacts, { recursive: true });
 console.log(`Native acceptance artifacts: ${path.relative(root, artifacts)}`);
@@ -64,11 +67,90 @@ const current = () => js("return window.__ironTest.snapshot();");
 const replace = content => js("return window.__ironTest.replace(arguments[0]);", content);
 const output = () => text("#output-log");
 
+async function chooseCommand(command) {
+  await click("#quick-open");
+  await set("#palette-text", `>${command}`);
+  await click("#palette-options button");
+}
+
+async function assertLineAlignment() {
+  const { text: source } = await current();
+  const lines = source.split(/\r?\n/);
+  const interesting = lines.flatMap((line, index) => /^\s*func\s+(Test\w+|\w+)\(/.test(line) ? [index + 1] : []);
+  const targets = [...new Set([interesting[0] ?? 1, interesting[Math.floor(interesting.length / 2)] ?? 1, interesting.at(-1) ?? lines.length])];
+  for (const number of targets) {
+    await js("window.__ironTest.revealLine(arguments[0]); window.__ironTest.refreshView(); return true;", number);
+    const sample = await eventually(`line ${number} is rendered`, () => js(`
+      const number = String(arguments[0]);
+      const source = arguments[1];
+      const clean = text => text.replace(/\\s+/g,' ').trim();
+      const gutter = [...document.querySelectorAll('#editor .line-numbers')].find(row => row.textContent.trim() === number);
+      const rows = [...document.querySelectorAll('#editor .view-lines .view-line')];
+      const active = document.querySelector('#editor .view-overlays .current-line');
+      if (!gutter || !active) return null;
+      const top = node => node.getBoundingClientRect().top;
+      const expected = clean(source);
+      const row = rows.find(node => {
+        const rendered = clean(node.textContent);
+        return rendered === expected || (rendered.length > 10 && expected.startsWith(rendered));
+      });
+      if (!row) return null;
+      return { gutter: top(gutter), body: top(row), active: top(active), number: gutter.textContent, code: row.textContent };
+    `, number, lines[number - 1]), Boolean, 5000);
+    assert.ok(Math.abs(sample.gutter - sample.body) <= 1,
+      `line ${number} gutter and body: ${JSON.stringify(sample)}`);
+    assert.ok(Math.abs(sample.active - sample.body) <= 1,
+      `line ${number} active highlight and body: ${JSON.stringify(sample)}`);
+  }
+}
+
+async function clickCodeLens(title) {
+  await eventually(`${title} CodeLens`, () => js("return [...document.querySelectorAll('.codelens-decoration a')].some(a => a.title === arguments[0]);", title));
+  assert.equal(await js(`
+    const action = [...document.querySelectorAll('.codelens-decoration a')].find(a => a.title === arguments[0]);
+    if (!action) return false;
+    const r = action.getBoundingClientRect();
+    action.dispatchEvent(new MouseEvent('mousedown', {bubbles:true,cancelable:true,view:window,button:0,buttons:1,clientX:r.x+r.width/2,clientY:r.y+r.height/2}));
+    return true;
+  `, title), true);
+}
+
+async function placeBreakpoint(line) {
+  await eventually("Monaco layout matches the visible editor after panel and tab changes", () => js(`
+    const element = document.querySelector('#editor');
+    const editor = window.__ironTest.snapshot().editor;
+    return { matches: !!editor && editor.width === element.clientWidth && editor.height === element.clientHeight, layout: editor, box: [element.clientWidth, element.clientHeight] };
+  `), result => result?.matches);
+  const key = await js(`
+    const visibleBefore = document.querySelectorAll('.view-line').length;
+    window.__ironTest.revealLine(arguments[0]);
+    const visibleAfterReveal = document.querySelectorAll('.view-line').length;
+    const press = new KeyboardEvent('keydown', {key:'F9', bubbles:true,cancelable:true});
+    document.dispatchEvent(press);
+    const rect = document.querySelector('#editor').getBoundingClientRect();
+    return { prevented: press.defaultPrevented, dialog: document.querySelector('dialog[open]')?.id, top:rect.top, height:rect.height, visibleBefore, visibleAfterReveal, visible:document.querySelectorAll('.view-line').length, side:document.querySelectorAll('.line-numbers').length, cursor:document.querySelector('#cursor').textContent };
+  `, line);
+  assert.equal(key.prevented, true, `F9 should be handled while editing a Go file: ${JSON.stringify(key)}`);
+  await eventually(`pending breakpoint in the editor gutter (${JSON.stringify(key)})`, () => js(`
+    if (document.querySelector('#editor .debug-breakpoint')) return true;
+    return { scroll: window.scrollY, viewport: window.innerHeight, editor: document.querySelector('#editor').getBoundingClientRect().toJSON(), visible:document.querySelectorAll('.view-line').length, gutters:document.querySelectorAll('.line-numbers').length, cursor:document.querySelector('#cursor').textContent };
+  `), value => value === true);
+}
+
 async function record(name, run) {
   const started = Date.now();
   try {
     await run();
-    report.cases.push({ name, result: "pass", ms: Date.now() - started });
+    const entry = { name, result: "pass", ms: Date.now() - started };
+    if (values["trace-editor"] && sid) {
+      entry.editor = await js(`
+        const editor = window.__ironTest?.snapshot();
+        return { path: editor?.path, layout: editor?.editor, visibility: document.visibilityState,
+          rows: document.querySelectorAll('.view-line').length, numbers: document.querySelectorAll('.line-numbers').length,
+          lenses: document.querySelectorAll('.codelens-decoration').length, panel: !document.querySelector('#panel').hidden };
+      `).catch(error => ({ error: String(error) }));
+    }
+    report.cases.push(entry);
     console.log(`  PASS ${name}`);
   } catch (error) {
     report.cases.push({ name, result: "fail", error: error.stack, ms: Date.now() - started });
@@ -117,6 +199,31 @@ async function externalProjectSmoke() {
       await eventually("requested test file active", current, state => state?.path === values["test-file"]);
       await eventually("editor test actions available", () => js("return document.querySelectorAll('.codelens-decoration a').length;"), count => count > 0, 30_000);
     });
+    await record("gutter, Go rows and active highlight align through scrolling and CodeLens", assertLineAlignment);
+    await record("editor lines remain aligned after resizing and enabling wrapping", async () => {
+      await js("void window.__ironTest.resize(760, 600); return true;");
+      await eventually("narrow native window", () => js("return window.innerWidth;"), width => width === 760);
+      await click("#settings");
+      await click("#wrap-setting");
+      await click('[data-dialog-close="settings-dialog"]');
+      await assertLineAlignment();
+    });
+    if (values["debug-test"]) {
+      await record(`Delve hits a real ${values["debug-test"]} breakpoint in this project`, async () => {
+        const { text: source } = await current();
+        const lines = source.split(/\r?\n/);
+        const header = lines.findIndex(line => line.startsWith(`func ${values["debug-test"]}(`));
+        assert.ok(header >= 0, "The named Go test must exist in the requested file");
+        const firstStatement = lines.findIndex((line, index) => index > header && line.trim() && !line.trim().startsWith("//"));
+        assert.ok(firstStatement > header);
+        const place = `${path.basename(values["test-file"])}:${firstStatement + 1}`;
+        await placeBreakpoint(firstStatement + 1);
+        await clickCodeLens(`Debug ${values["debug-test"]}`);
+        await eventually(`breakpoint at ${place}`, () => text("#status"), value => value.includes("Breakpoint hit") && value.includes(place), 90_000);
+        await click("#debug-continue");
+        await eventually("project test debugger finishes", () => text("#status"), value => /Debug session finished/i.test(value), 30_000);
+      });
+    }
   }
 }
 
@@ -156,6 +263,7 @@ try {
   });
   await eventually("embedded macOS WebDriver", () => w3c("/status"), value => value?.ready);
   ({ sessionId: sid } = await w3c("/session", { capabilities: { alwaysMatch: {} } }));
+  await eventually("workbench test adapter", () => js("return !!window.__ironTest;"));
 
   if (values.project) await externalProjectSmoke();
   else await standardWorkbenchSmoke();
@@ -253,6 +361,10 @@ async function standardWorkbenchSmoke() {
     await click("#format");
     const formatted = await eventually("gofmt result", current, state => state?.text.includes("const version =") && state?.text.includes("Native acceptance"));
     assert.equal(await readFile(source, "utf8"), original, "format must not write to disk");
+    await js("window.__ironTest.action('undo', 1, 1); return true;");
+    await eventually("format can be undone", current, state => state?.text === ugly);
+    await click("#format");
+    await eventually("format reapplied", current, state => state?.text === formatted.text);
     await click("#save");
     await eventually("real disk write", () => readFile(source, "utf8"), value => value === formatted.text);
     await eventually("tab clean after save", current, state => !state.dirty);
@@ -266,8 +378,15 @@ async function standardWorkbenchSmoke() {
     await click("#save");
     await eventually("save conflict message", () => text("#toast"), value => value.includes("changed on disk"));
     assert.equal(await readFile(source, "utf8"), external);
-    await writeFile(source, saved);
-    await replace(saved);
+    // The test controls the confirmation answer, not the reload or its disk I/O.
+    await js("window.__realConfirm = window.confirm; window.confirm = () => false; return true;");
+    try {
+      await chooseCommand("reload file from disk");
+      assert.match((await current()).text, /Unsaved buffer/);
+      await js("window.confirm = () => true; return true;");
+      await chooseCommand("reload file from disk");
+      await eventually("confirmed reload reads the real disk", current, state => state?.text === external && !state.dirty);
+    } finally { await js("window.confirm = window.__realConfirm; delete window.__realConfirm; return true;"); }
   });
 
   await record("builds, runs, and tests the actual Go module", async () => {
@@ -338,9 +457,9 @@ async function standardWorkbenchSmoke() {
       await set("#palette-text", "report_test.go");
       await click("#palette-options button");
       await eventually("test file is active", current, state => state?.path === "internal/status/report_test.go");
-      await eventually("the two CodeLens actions", () => js("return document.querySelectorAll('.codelens-decoration a').length;"), count => count === 2);
+      await eventually("the two Run Test actions", () => js("return Array.from(document.querySelectorAll('.codelens-decoration a')).filter(action => action.textContent.trim() === 'Run Test').length;"), count => count === 2);
       assert.equal(await js(`
-        const action = document.querySelector('.codelens-decoration a');
+        const action = Array.from(document.querySelectorAll('.codelens-decoration a')).find(node => node.textContent.trim() === 'Run Test');
         if (!action) return false;
         const bounds = action.getBoundingClientRect();
         // Monaco's CodeLens executes on pointer down, not HTMLElement.click().
@@ -353,14 +472,37 @@ async function standardWorkbenchSmoke() {
       const result = await eventually("test completed from CodeLens", output, value => /PASS: TestSummary[\s\S]*exit code 0/.test(value));
       assert.doesNotMatch(result, /PASS: TestAnother/);
     });
+    if (values["require-delve"]) {
+      await record("Delve pauses at a real editor breakpoint and continues the test", async () => {
+        await placeBreakpoint(9);
+        await clickCodeLens("Debug TestSummary");
+        await eventually("debuggee stops on line 9", () => text("#status"), value => /Breakpoint hit.*report_test\.go:9/.test(value), 60_000);
+        await click("#debug-next");
+        await eventually("stepped to the next source line", () => text("#status"), value => /Paused.*report_test\.go:(10|11)/.test(value), 15_000);
+        await click("#debug-continue");
+        await eventually("debug test finished", () => text("#status"), value => /Debug session finished/i.test(value), 15_000);
+      });
+    }
   }
-  await record("closing a project returns to welcome", async () => {
-    await click("#workspace-actions");
-    await set("#palette-text", "close project");
-    await click("#palette-options button");
-    await eventually("back at welcome", () => js("return document.querySelector('#project-welcome').hidden === false;"));
-    assert.equal((await current()).root ?? null, null);
-    assert.equal(await js("return document.querySelector('#run').disabled;"), true);
+  await record("cancelling a dirty close preserves the buffer, accepting returns to welcome", async () => {
+    const unsaved = (await current()).text + "\n// unsaved close acceptance\n";
+    await replace(unsaved);
+    const active = await current();
+    assert.equal(active.dirty, true);
+    await js("window.__realConfirm = window.confirm; window.confirm = () => false; return true;");
+    try {
+      await chooseCommand("close project");
+      const state = await current();
+      assert.equal(state.root, fixture);
+      assert.equal(state.text, unsaved);
+      assert.equal(state.dirty, true);
+      await js("window.confirm = () => true; return true;");
+      await chooseCommand("close project");
+      await eventually("back at welcome", () => js("return document.querySelector('#project-welcome').hidden === false;"));
+      assert.equal((await current()).root ?? null, null);
+      assert.equal(await js("return document.querySelector('#run').disabled;"), true);
+      assert.doesNotMatch(await readFile(path.join(fixture, active.path), "utf8"), /unsaved close acceptance/);
+    } finally { await js("window.confirm = window.__realConfirm; delete window.__realConfirm; return true;"); }
   });
   await record("a project without an executable offers Test as its primary action", async () => {
     await rename(path.join(fixture, "cmd"), path.join(fixture, ".hidden-cmd"));
@@ -368,5 +510,20 @@ async function standardWorkbenchSmoke() {
     await eventually("library Test toolbar action", () => text("#run"), value => value.trim() === "Test", 5000);
     await click("#run");
     await eventually("library tests run from the toolbar", output, value => /PASS: TestSummary[\s\S]*exit code 0/.test(value), 60_000);
+  });
+  await record("New Project creates and opens a real Go module", async () => {
+    await chooseCommand("close project");
+    await eventually("welcome before creating a project", () => js("return document.querySelector('#project-welcome').hidden === false;"));
+    await click("#welcome-new");
+    await set("#form-name", "fresh-go");
+    await set("#form-module", "example.com/fresh-go");
+    await click("#form-submit");
+    const newRoot = path.join(temporary, "fresh-go");
+    await eventually("created Go module opens in Monaco", current, state => state?.root === newRoot && state?.path === "main.go", 8000);
+    assert.match(await readFile(path.join(newRoot, "go.mod"), "utf8"), /^module example\.com\/fresh-go\n/);
+    assert.match(await readFile(path.join(newRoot, "main.go"), "utf8"), /func main\(\)/);
+    await eventually("new main package selected", () => js("return document.querySelector('#run-target').value === '.' && !document.querySelector('#run').disabled;"));
+    await click("#run");
+    await eventually("new project executes", output, value => /Hello from Iron Go![\s\S]*exit code 0/.test(value));
   });
 }

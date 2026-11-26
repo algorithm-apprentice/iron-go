@@ -1,19 +1,26 @@
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
-import { createServer } from "vite";
+import { build, preview } from "vite";
 
-let server, browser, url;
+let server, browser, url, assets;
 const fixture = fileURLToPath(new URL("../fixtures/orbit", import.meta.url));
 before(async () => {
-  server = await createServer({ server: { port: 0, host: "127.0.0.1" } });
-  await server.listen();
+  assets = await mkdtemp(join(tmpdir(), "iron-go-ui-"));
+  await build({ build: { outDir: assets, emptyOutDir: true }, logLevel: "warn" });
+  server = await preview({ build: { outDir: assets }, preview: { port: 0, host: "127.0.0.1" } });
   url = server.resolvedUrls.local[0];
   browser = await chromium.launch();
 });
-after(async () => { await browser?.close(); await server?.close(); });
+after(async () => {
+  await browser?.close();
+  if (server) await new Promise(resolve => server.httpServer.close(resolve));
+  if (assets) await rm(assets, { recursive: true, force: true });
+});
 
 async function openFixture(page) {
   await page.locator("#import-folder").setInputFiles(fixture);

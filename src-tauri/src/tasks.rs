@@ -107,8 +107,8 @@ pub async fn start_task(
     }
     let mut session = state.0.lock().unwrap();
     let root = session.root(id)?;
-    if session.task.is_some() {
-        return Err("A Go task is already running.".into());
+    if session.task.is_some() || session.debug.is_some() {
+        return Err("A Go task or debug session is already running.".into());
     }
     for package in &packages {
         package_dir(root, package)?;

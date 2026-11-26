@@ -11,13 +11,15 @@ Install Go, Rust, and Xcode Command Line Tools. For native LSP acceptance,
 install `gopls` using `go install golang.org/x/tools/gopls@latest` and put it
 on `PATH` or in `~/go/bin`. Select a compatible gopls version (for example,
 `v0.20.0` with Go 1.25) if you can't use the latest Go toolchain.
+Install Delve (`brew install delve` or `go install github.com/go-delve/delve/cmd/dlv@v1.27.2`)
+to run the debug acceptance. macOS must allow debugging a local Go child process.
 
 | Command | What it proves |
 | --- | --- |
 | `npm run check` | TS types, focused TS tests, Rust formatting and services, real fixture tests. |
 | `npm run test:ui` | Workbench behavior in headless Chromium with isolated browser storage. |
 | `npm run test:native` | Real WKWebView, IPC, local files, and Go tools. Runs the LSP case if gopls is installed. |
-| `npm run test:feedback` | All three layers; fails if gopls is missing. |
+| `npm run test:feedback` | All three layers; requires gopls and real Delve debug acceptance. |
 | `npm run test:picker` | Checks native title-bar placement at the default and minimum widths, then opens and cancels the real macOS project picker. Requires a built `.app` and Accessibility permission for the calling terminal. |
 
 The native suite builds `iron-go-acceptance` and opens a temporary
@@ -32,6 +34,8 @@ npm run test:native -- --project /path/to/checkout --test-file raft_test.go
 ```
 
 The optional `--test-file` checks gopls actions for the requested test file.
+With Delve installed, add `--debug-test TestLeaderElection` to hit a real
+breakpoint in that named test before continuing.
 This mode opens the committed `HEAD` snapshot in a temporary directory,
 runs the module's actual tests, and reuses the host Go toolchain caches. It
 can download the Go SDK or dependencies specified by the selected project.

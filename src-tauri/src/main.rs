@@ -1,3 +1,4 @@
+mod debug;
 mod lsp;
 mod packages;
 mod tasks;
@@ -20,6 +21,7 @@ struct Session {
     task: Option<tasks::RunningTask>,
     discovery: Option<packages::Discovery>,
     lsp: Option<lsp::RunningServer>,
+    debug: Option<lsp::RunningServer>,
 }
 
 impl Session {
@@ -41,6 +43,7 @@ impl Session {
         self.task.take();
         self.discovery.take();
         self.lsp.take();
+        self.debug.take();
     }
 }
 
@@ -92,7 +95,19 @@ async fn new_module(
     module: String,
 ) -> CommandResult<Option<workspace::WorkspaceInfo>> {
     workspace::validate_module(&name, &module)?;
-    let Some(parent) = pick_folder("Choose a Location for the New Go Project").await? else {
+    #[cfg(feature = "e2e")]
+    let fixture_parent = std::env::var_os("IRON_GO_E2E_WORKSPACE").and_then(|path| {
+        PathBuf::from(path)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+    });
+    #[cfg(not(feature = "e2e"))]
+    let fixture_parent = None;
+    let selection = match fixture_parent {
+        Some(path) => Some(path),
+        None => pick_folder("Choose a Location for the New Go Project").await?,
+    };
+    let Some(parent) = selection else {
         return Ok(None);
     };
     let workspace = blocking(move || workspace::create_module(&parent, &name, &module)).await?;
@@ -144,6 +159,9 @@ fn main() {
             lsp::start_gopls,
             lsp::send_gopls,
             lsp::stop_gopls,
+            debug::start_debug,
+            debug::send_debug,
+            debug::stop_debug,
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {

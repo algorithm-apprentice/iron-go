@@ -118,6 +118,10 @@ kbd { font: 11px/1.35 var(--mono); color: var(--muted); padding: 1px 5px; backgr
 .breadcrumbs .file-icon svg { color: inherit; }
 .editor-stage { position: relative; flex: 1; min-height: 0; min-width: 0; }
 #editor { position: absolute; inset: 0; user-select: text; }
+#editor .glyph-margin { cursor: pointer; }
+#editor .debug-breakpoint::after { content: ""; position: absolute; width: 10px; height: 10px; top: 50%; left: 50%; transform: translate(-50%, -50%); border: 2px solid var(--danger); border-radius: 50%; }
+#editor .debug-breakpoint.verified::after { background: var(--danger); }
+#editor .debug-execution-line { background: var(--selection); }
 .empty-editor { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px; background: var(--canvas); }
 .empty-editor > img { filter: grayscale(1); opacity: .58; }
 .empty-editor h2 { font-size: 27px; font-weight: 660; }

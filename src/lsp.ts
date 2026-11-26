@@ -7,6 +7,7 @@ import { host, type NativeFolder } from "./workspace";
 export type LanguageState = "idle" | "missing" | "starting" | "ready" | "failed";
 const markerOwner = "gopls";
 export const runTestCommand = "irongo.runGoTest";
+export const debugTestCommand = "irongo.debugGoTest";
 
 function isTestFunction(name: string) {
   return /^Test[\p{L}\p{Nd}_]*$/u.test(name) && !/^Test\p{Ll}/u.test(name);
@@ -240,10 +241,12 @@ export class GoLanguage {
         const symbols = await this.request<(DocumentSymbol | SymbolInformation)[] | null>("textDocument/documentSymbol", model, undefined, token);
         return { lenses: (symbols ?? []).flatMap(symbol => {
           if (symbol.kind !== SymbolKind.Function || !isTestFunction(symbol.name)) return [];
-          return [{
-            range: fromRange("selectionRange" in symbol ? symbol.selectionRange : symbol.location.range),
-            command: { id: runTestCommand, title: "Run Test", tooltip: `Run ${symbol.name}`, arguments: [this.folder.id, path, symbol.name] },
-          }];
+          const range = fromRange("selectionRange" in symbol ? symbol.selectionRange : symbol.location.range);
+          const args = [this.folder.id, path, symbol.name];
+          return [
+            { range, command: { id: runTestCommand, title: "Run Test", tooltip: `Run ${symbol.name}`, arguments: args } },
+            { range, command: { id: debugTestCommand, title: "Debug Test", tooltip: `Debug ${symbol.name}`, arguments: args } },
+          ];
         }) };
       },
     }));
