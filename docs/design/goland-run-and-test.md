@@ -15,6 +15,10 @@ workspace without first learning Go CLI arguments.
 - Auto-select a sole executable package. For multiple executables, offer a
   picker and do not silently run the first. Preserve an explicit selection on
   refresh when it still exists. Display a name with the package path as detail.
+- After a successful scan that finds no executable, make **Test** the primary
+  toolbar action. Do not send library learners to an empty Run picker. A
+  failed/pending scan is not evidence that the project is a library, and
+  choosing a custom run target keeps the primary action as Run.
 - Build and Test offer **All packages** and **Current package**. An explicit
   custom scope preserves relative CLI patterns. Discovery failure leaves a
   manual package-path fallback under Advanced; even advanced paths are validated
@@ -37,6 +41,10 @@ program arguments/environment overrides, and a structured test result tree.
   two test functions, click one CodeLens, and verify only that test executed.
 - Rust: discover runnable packages with arbitrary Go filenames in a module and
   in an on-disk `go.work`. Package arguments remain relative to the open folder.
+- Native regression: a library-shaped fixture has a Test toolbar action and
+  runs its real package tests. An opt-in external project smoke opens a clean
+  Git snapshot, exercises the module and toolchain through the same app, and
+  never executes tests in the original checkout.
 - Browser: the preview renders the selector and doesn't run native commands.
 
 `npm run test:feedback` passed, including nine native acceptance scenarios.

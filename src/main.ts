@@ -25,7 +25,7 @@ const runTargets = new RunTargets(focus => {
   chooseView("tasks");
   byId<HTMLDetailsElement>("advanced-targets").open = true;
   focus.focus();
-});
+}, syncControls);
 
 let project = welcomeProject();
 let snapshot: ProjectSnapshot = { entries: [], truncated: false, module: null, goWork: false };
@@ -216,8 +216,9 @@ function syncControls() {
   const run = btn("run");
   run.disabled = busy || stopPending || !!project.welcome;
   run.dataset.running = String(!!task);
-  run.innerHTML = `${icon(task ? "stop" : "play")}<span>${task ? "Stop" : "Run"}</span>`;
-  run.title = task ? "Stop Go Task" : "Run Go Package (⌘↵)";
+  const primary = runTargets.primaryAction();
+  run.innerHTML = `${icon(task ? "stop" : primary === "test" ? "flask" : "play")}<span>${task ? "Stop" : primary === "test" ? "Test" : "Run"}</span>`;
+  run.title = task ? "Stop Go Task" : primary === "test" ? "Test Go Packages (⌘↵)" : "Run Go Package (⌘↵)";
   btn("panel-stop").hidden = !task;
   btn("panel-stop").disabled = stopPending;
   btn("stop-task").disabled = !task || stopPending;
@@ -677,7 +678,7 @@ byId("new-file").addEventListener("click", newFile);
 byId("refresh-files").addEventListener("click", () => { void refresh().catch(showError); void runTargets.refresh(); });
 byId("format").addEventListener("click", formatActive);
 byId("save").addEventListener("click", saveActive);
-byId("run").addEventListener("click", () => { if (task) void stopTask(); else void runTask("run"); });
+byId("run").addEventListener("click", () => { if (task) void stopTask(); else void runTask(runTargets.primaryAction()); });
 byId("panel-stop").addEventListener("click", stopTask);
 byId("stop-task").addEventListener("click", stopTask);
 byId("settings").addEventListener("click", showSettings);
@@ -701,8 +702,22 @@ input("import-folder").addEventListener("change", () => {
   picker.value = "";
 });
 
+function nativeBrowserShortcut(event: KeyboardEvent) {
+  if (event.altKey || event.ctrlKey) return false;
+  if (!event.metaKey) return event.key === "F5";
+  const key = event.key.toLowerCase();
+  if (key === "r" || key === "+") return true;
+  return !event.shiftKey && ["l", "=", "-", "0"].includes(key);
+}
+
 document.addEventListener("keydown", event => {
-  if (event.isComposing || (document.querySelector("dialog[open]") && event.key !== "Escape")) return;
+  if (event.isComposing) return;
+  if (desktop && nativeBrowserShortcut(event)) {
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
+  if (document.querySelector("dialog[open]") && event.key !== "Escape") return;
   const key = event.key.toLowerCase();
   const cmd = event.metaKey || (!desktop && event.ctrlKey);
   let apply: (() => unknown) | undefined;
@@ -715,7 +730,7 @@ document.addEventListener("keydown", event => {
     if (key === "j") apply = () => feedback.toggle();
     if (key === "b") apply = toggleSidebar;
     if (key === ",") apply = showSettings;
-    if (key === "enter") apply = () => task ? stopTask() : runTask("run");
+    if (key === "enter") apply = () => task ? stopTask() : runTask(runTargets.primaryAction());
   }
   if (event.altKey && event.shiftKey && (key === "f" || event.code === "KeyF")) apply = formatActive;
   if (apply) { event.preventDefault(); event.stopPropagation(); void apply(); }

@@ -58,6 +58,15 @@ shortcut here and a labeled action on the welcome screen.
 Acceptance: assert the actual 1 px bounding-box separation in the browser
 for horizontal and vertical control groups, including the compact breakpoint.
 
+## Browser-only keys in the native window
+
+In the desktop workbench, prevent browser reload (`⌘R`, `⇧⌘R`, `F5`),
+address-bar focus (`⌘L`), and whole-page zoom (`⌘+`, `⌘-`, `⌘0`).
+Apply the guard before the dialog shortcut check so it also protects unsaved
+project state while a modal is open. Do not blanket-block Command shortcuts:
+preserve Monaco Find, indentation, selection, clipboard, and native window
+shortcuts. The development browser preview keeps the browser's defaults.
+
 ## 3. Ownership and boundaries
 
 One native `Session` owns a canonical root and a monotonically increasing

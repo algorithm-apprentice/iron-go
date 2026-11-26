@@ -13,7 +13,7 @@ export class RunTargets {
   private loading = false;
   private failure?: string;
 
-  constructor(private readonly revealAdvanced: (focus: HTMLElement) => void) {
+  constructor(private readonly revealAdvanced: (focus: HTMLElement) => void, private readonly changed: () => void) {
     this.picker.addEventListener("change", () => {
       this.renderStatus();
       if (this.picker.value === "custom") this.revealAdvanced(this.runPath);
@@ -98,8 +98,13 @@ export class RunTargets {
     byId("run-target-status").textContent = this.loading ? "Scanning Go packages…"
       : this.failure ?? (selected === "custom" ? this.runPath.value.trim() || "Enter a custom package below."
         : selected ? `Run target: ${selected}` : this.info?.targets.length ? "Choose a run target in the editor toolbar."
-          : this.project?.native ? "No executable Go package found. You can set a custom target."
+          : this.project?.native ? "No executable Go package found. Use Test, or choose a custom run target."
             : "Open a Go workspace to discover run targets.");
+    this.changed();
+  }
+
+  primaryAction(): "run" | "test" {
+    return this.info?.targets.length === 0 && this.picker.value !== "custom" ? "test" : "run";
   }
 
   setDisabled(busy: boolean, running: boolean) {

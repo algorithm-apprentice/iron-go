@@ -25,6 +25,17 @@ copy of `tests/fixtures/orbit`. No existing IDE instance or manual folder
 selection is needed. It requires a working macOS app session. For repeat
 runs with an unchanged test build, use `npm run test:native -- --skip-build`.
 
+To check a real Git project without using or modifying its working tree:
+
+```sh
+npm run test:native -- --project /path/to/checkout --test-file raft_test.go
+```
+
+The optional `--test-file` checks gopls actions for the requested test file.
+This mode opens the committed `HEAD` snapshot in a temporary directory,
+runs the module's actual tests, and reuses the host Go toolchain caches. It
+can download the Go SDK or dependencies specified by the selected project.
+
 On headless UI failure, inspect `test-results/ui/<case>/browser.log`,
 `workbench.png`, and open `trace.zip` with `npx playwright show-trace`.
 Native runs print a `test-results/native/<run>/` path containing the per-case

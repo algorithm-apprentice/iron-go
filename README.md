@@ -14,6 +14,8 @@ npm run tauri dev
 
 启动后，从欢迎页选择 **Open Project** 打开 Go 模块或 `go.work` 工作区，或点 **New Project** 创建 Go 模块。右上角会自动选中项目中唯一的可执行目标；有多个时，请先选择。**Run and Test** 默认构建或测试所有本地包，也可选当前包，或在 **Advanced** 手动填路径。要返回欢迎页，在项目菜单或命令面板选择 **Close Project**。
 
+对没有可执行包的 Go 库，右上角会显示 **Test**，直接运行选定范围的测试。
+
 从 Finder 启动时也会查找 Homebrew、Go 官方安装路径和 `~/go/bin` 等常见位置。在右下角的工具状态中可以重新检测。
 
 ## 当前功能

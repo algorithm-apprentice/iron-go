@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { cp, mkdir, mkdtemp, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -9,13 +9,16 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
-const { values } = parseArgs({ options: { "skip-build": { type: "boolean" }, "require-gopls": { type: "boolean" } } });
+const { values } = parseArgs({ options: {
+  "skip-build": { type: "boolean" }, "require-gopls": { type: "boolean" },
+  project: { type: "string" }, "test-file": { type: "string" },
+} });
 if (process.platform !== "darwin") throw new Error("Native acceptance requires macOS.");
 const artifacts = path.join(root, "test-results/native", `${Date.now()}-${process.pid}`);
 await mkdir(artifacts, { recursive: true });
 console.log(`Native acceptance artifacts: ${path.relative(root, artifacts)}`);
 const temporary = await realpath(await mkdtemp(path.join(tmpdir(), "iron-go-acceptance-")));
-const fixture = path.join(temporary, "orbit");
+const fixture = path.join(temporary, values.project ? path.basename(path.resolve(values.project)) : "orbit");
 const home = path.join(temporary, "home");
 const report = { cases: [] };
 let app, driver, sid;
@@ -86,10 +89,51 @@ async function processLogged(executable, args, logfile, env) {
   } finally { await log.close(); }
 }
 
+async function externalProjectSmoke() {
+  const module = (await readFile(path.join(fixture, "go.mod"), "utf8")).match(/^module\s+(\S+)/m)?.[1];
+  assert.ok(module, "The project smoke expects a root go.mod");
+  await record(`opens the committed ${module} snapshot as a real Go project`, async () => {
+    await eventually("workbench ready", () => js("return !!window.__ironTest && document.querySelector('#project-welcome')?.hidden === false;"));
+    await click("#open-folder");
+    await eventually("external module editor", current, state => state?.root === fixture && state.path?.endsWith(".go"), 30_000);
+    assert.equal(await text("#module-name"), module);
+  });
+  await record("discovers Go package metadata for the external project", async () => {
+    await eventually("Go package metadata", () => text("#run-target-status"), value => /Run target:|Choose a run target|No executable Go package found/.test(value), 30_000);
+  });
+  await record("runs the actual project tests from Iron Go", async () => {
+    await click('[data-view="tasks"]');
+    await click('[data-task="test"]');
+    const finished = await eventually("Go tests complete", output, value => /exit code \d+/i.test(value), 180_000);
+    assert.match(finished, /exit code 0/i);
+    await writeFile(path.join(artifacts, "go-test-output.log"), finished);
+  });
+  if (values["test-file"]) {
+    await record("opens a real test file with gopls test actions", async () => {
+      await eventually("gopls ready", current, state => state?.gopls === "ready", 30_000);
+      await click("#quick-open");
+      await set("#palette-text", values["test-file"]);
+      await click("#palette-options button");
+      await eventually("requested test file active", current, state => state?.path === values["test-file"]);
+      await eventually("editor test actions available", () => js("return document.querySelectorAll('.codelens-decoration a').length;"), count => count > 0, 30_000);
+    });
+  }
+}
+
 try {
-  await cp(path.join(root, "tests/fixtures/orbit"), fixture, { recursive: true });
+  if (values.project) {
+    await mkdir(fixture);
+    const snapshot = execFileSync("git", ["-C", path.resolve(values.project), "archive", "--format=tar", "HEAD"], { maxBuffer: 64 * 1024 * 1024 });
+    execFileSync("tar", ["-xf", "-", "-C", fixture], { input: snapshot });
+  } else {
+    await cp(path.join(root, "tests/fixtures/orbit"), fixture, { recursive: true });
+  }
   await mkdir(home);
-  const goTestEnv = { ...process.env, GOTOOLCHAIN: "local", GOENV: "off", GOWORK: "off", GOFLAGS: "" };
+  const goTestEnv = { ...process.env, GOTOOLCHAIN: values.project ? "auto" : "local", GOENV: "off", GOWORK: "off", GOFLAGS: "" };
+  if (values.project) {
+    const cache = execFileSync("go", ["env", "GOMODCACHE", "GOCACHE"], { encoding: "utf8", env: { ...goTestEnv, GOTOOLCHAIN: "local" } }).trimEnd().split("\n");
+    [goTestEnv.GOMODCACHE, goTestEnv.GOCACHE] = cache;
+  }
   const configuredGoBin = execFileSync("go", ["env", "GOBIN", "GOPATH"], { encoding: "utf8" }).trimEnd().split("\n");
   const searchPath = [process.env.PATH, configuredGoBin[0], ...((configuredGoBin[1] ?? "").split(":").filter(Boolean).map(dir => path.join(dir, "bin"))), path.join(homedir(), "go/bin")].filter(Boolean).join(":");
 
@@ -112,6 +156,35 @@ try {
   await eventually("embedded macOS WebDriver", () => w3c("/status"), value => value?.ready);
   ({ sessionId: sid } = await w3c("/session", { capabilities: { alwaysMatch: {} } }));
 
+  if (values.project) await externalProjectSmoke();
+  else await standardWorkbenchSmoke();
+} catch (error) {
+  report.failure = error.stack;
+  if (sid) {
+    try {
+      const screenshot = await w3c(`/session/${sid}/screenshot`);
+      await writeFile(path.join(artifacts, "workbench.png"), Buffer.from(screenshot, "base64"));
+    } catch { /* The WebView may not be available. */ }
+    try {
+      await writeFile(path.join(artifacts, "workbench.json"), JSON.stringify({ state: await current(), output: await output(), status: await text("#status"), toast: await text("#toast") }, null, 2));
+    } catch { /* The backend/build logs remain available. */ }
+  }
+  console.error(error);
+  process.exitCode = 1;
+} finally {
+  if (sid) await js("window.__ironTest?.quit(); return true;").catch(() => {});
+  if (sid) await w3c(`/session/${sid}`, undefined, "DELETE").catch(() => {});
+  if (app) {
+    await Promise.race([app.exited.catch(() => {}), delay(1000, undefined, { ref: false })]);
+    if (app.child.exitCode === null && app.child.signalCode === null) app.child.kill("SIGTERM");
+    const exited = await Promise.race([app.exited.then(() => true, () => true), delay(1200, false, { ref: false })]);
+    if (!exited) { app.child.kill("SIGKILL"); await app.exited.catch(() => {}); }
+  }
+  await rm(temporary, { recursive: true, force: true });
+  await writeFile(path.join(artifacts, "report.json"), JSON.stringify(report, null, 2));
+}
+
+async function standardWorkbenchSmoke() {
   const source = path.join(fixture, "cmd/orbit/main.go");
   const original = await readFile(source, "utf8");
   const checkTheme = () => record("native theme switches both the editor and workbench", async () => {
@@ -146,6 +219,20 @@ try {
     assert.doesNotMatch(await text("#project-welcome"), /orbit/i);
     assert.match(await text("#project-welcome"), /Open Project/);
     assert.match(await text("#project-welcome"), /New Project/);
+  });
+  await record("native chrome suppresses browser-only keys, not editor keys", async () => {
+    const result = await js(`
+      const keys = [
+        {key:'r',metaKey:true}, {key:'R',metaKey:true,shiftKey:true}, {key:'F5'},
+        {key:'l',metaKey:true}, {key:'=',metaKey:true}, {key:'-',metaKey:true}, {key:'0',metaKey:true},
+        {key:'f',metaKey:true}, {key:'[',metaKey:true}, {key:'c',metaKey:true}, {key:'ArrowLeft',altKey:true},
+      ];
+      return keys.map(options => {
+        const event = new KeyboardEvent('keydown', {...options,bubbles:true,cancelable:true});
+        document.dispatchEvent(event); return event.defaultPrevented;
+      });
+    `);
+    assert.deepEqual(result, [true, true, true, true, true, true, true, false, false, false, false]);
   });
   await record("native workbench opens a disposable folder", async () => {
     await eventually("workbench boot", () => js("return !!window.__ironTest && document.body.classList.contains('desktop');"));
@@ -274,28 +361,11 @@ try {
     assert.equal((await current()).root ?? null, null);
     assert.equal(await js("return document.querySelector('#run').disabled;"), true);
   });
-} catch (error) {
-  report.failure = error.stack;
-  if (sid) {
-    try {
-      const screenshot = await w3c(`/session/${sid}/screenshot`);
-      await writeFile(path.join(artifacts, "workbench.png"), Buffer.from(screenshot, "base64"));
-    } catch { /* The WebView may not be available. */ }
-    try {
-      await writeFile(path.join(artifacts, "workbench.json"), JSON.stringify({ state: await current(), output: await output(), status: await text("#status"), toast: await text("#toast") }, null, 2));
-    } catch { /* The backend/build logs remain available. */ }
-  }
-  console.error(error);
-  process.exitCode = 1;
-} finally {
-  if (sid) await js("window.__ironTest?.quit(); return true;").catch(() => {});
-  if (sid) await w3c(`/session/${sid}`, undefined, "DELETE").catch(() => {});
-  if (app) {
-    await Promise.race([app.exited.catch(() => {}), delay(1000, undefined, { ref: false })]);
-    if (app.child.exitCode === null && app.child.signalCode === null) app.child.kill("SIGTERM");
-    const exited = await Promise.race([app.exited.then(() => true, () => true), delay(1200, false, { ref: false })]);
-    if (!exited) { app.child.kill("SIGKILL"); await app.exited.catch(() => {}); }
-  }
-  await rm(temporary, { recursive: true, force: true });
-  await writeFile(path.join(artifacts, "report.json"), JSON.stringify(report, null, 2));
+  await record("a project without an executable offers Test as its primary action", async () => {
+    await rename(path.join(fixture, "cmd"), path.join(fixture, ".hidden-cmd"));
+    await click("#open-folder");
+    await eventually("library Test toolbar action", () => text("#run"), value => value.trim() === "Test", 5000);
+    await click("#run");
+    await eventually("library tests run from the toolbar", output, value => /PASS: TestSummary[\s\S]*exit code 0/.test(value), 60_000);
+  });
 }
