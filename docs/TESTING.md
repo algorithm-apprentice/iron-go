@@ -54,5 +54,9 @@ For a mixed-DPI setup, use `npm run test:picker -- --retina-probe` to put the
 disposable editor on a Retina display and report the picker screen and capture
 dimensions. Bitmap measurement requires Screen Recording permission; it
 captures only the disposable app's picker and does not retain the image.
+Add `--display-round-trip` to move that test picker to a 1× display and
+back, reporting bitmap dimensions and a title-edge sharpness sample at
+each step. This is diagnostic, not a portable pixel threshold: an initial
+and a restored 2× bitmap can have different underlying text detail.
 
 See [ADR 0002](adr/0002-test-feedback-loop.md) and [the acceptance design](design/test-feedback-loop.md).

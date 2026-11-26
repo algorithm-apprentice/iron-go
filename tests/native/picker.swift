@@ -55,7 +55,7 @@ func scale(at rectangle: CGRect) -> CGFloat? {
     NSScreen.screens.first { screenFrame($0).contains(CGPoint(x: rectangle.midX, y: rectangle.midY)) }?.backingScaleFactor
 }
 
-func reportPickerRaster(_ rectangle: CGRect, owner: pid_t, directory: URL) {
+func reportPickerRaster(_ rectangle: CGRect, owner: pid_t, directory: URL, tag: String = "picker") {
     guard CGPreflightScreenCaptureAccess() else {
         print("Picker bitmap probe skipped: Screen Recording permission is unavailable")
         return
@@ -72,14 +72,30 @@ func reportPickerRaster(_ rectangle: CGRect, owner: pid_t, directory: URL) {
         print("Picker bitmap probe skipped: no matching on-screen window")
         return
     }
-    let image = directory.appendingPathComponent("picker-probe.png")
+    let image = directory.appendingPathComponent("\(tag).png")
     let capture = Process()
     capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
     capture.arguments = ["-x", "-o", "-l", String(window), "-t", "png", image.path]
     guard (try? capture.run()) != nil else { return }
     capture.waitUntilExit()
     guard capture.terminationStatus == 0, let data = try? Data(contentsOf: image), let bitmap = NSBitmapImageRep(data: data) else { return }
-    print("Picker screenshot: \(bitmap.pixelsWide) × \(bitmap.pixelsHigh) pixels for \(rectangle.width) × \(rectangle.height) points")
+    print("\(tag) screenshot: \(bitmap.pixelsWide) × \(bitmap.pixelsHigh) pixels for \(rectangle.width) × \(rectangle.height) points")
+    let backing = CGFloat(bitmap.pixelsWide) / rectangle.width
+    let left = Int(142 * backing), right = min(bitmap.pixelsWide - 1, Int(233 * backing))
+    let top = Int(12 * backing), bottom = min(bitmap.pixelsHigh, Int(27 * backing))
+    guard left < right, top < bottom else { return }
+    var edges = 0
+    var steep = 0
+    for row in top..<bottom {
+        for column in left..<right {
+            guard let a = bitmap.colorAt(x: column, y: row)?.usingColorSpace(.deviceRGB),
+                  let b = bitmap.colorAt(x: column + 1, y: row)?.usingColorSpace(.deviceRGB) else { continue }
+            let difference = abs(a.greenComponent - b.greenComponent)
+            if difference > 0.05 { edges += 1 }
+            if difference > 0.3 { steep += 1 }
+        }
+    }
+    print("\(tag) steep title edges: \(steep)/\(edges)")
 }
 
 func verifyTitleBar(_ window: AXUIElement) throws {
@@ -114,6 +130,7 @@ func checkPicker() throws {
     let child = Process()
     let args = CommandLine.arguments.dropFirst()
     let retinaProbe = args.contains("--retina-probe")
+    let roundTripProbe = args.contains("--display-round-trip")
     let executable = args.first { !$0.hasPrefix("--") } ?? "src-tauri/target/release/bundle/macos/Iron Go.app/Contents/MacOS/iron-go"
     child.executableURL = URL(fileURLWithPath: executable)
     child.currentDirectoryURL = home
@@ -169,7 +186,30 @@ func checkPicker() throws {
     if retinaProbe, let openerFrame = frame(window), let panelFrame = focused.flatMap(frame) {
         print("Opener: \(openerFrame), scale \(scale(at: openerFrame).map(String.init(describing:)) ?? "unknown")")
         print("Picker: \(panelFrame), scale \(scale(at: panelFrame).map(String.init(describing:)) ?? "unknown")")
-        reportPickerRaster(panelFrame, owner: child.processIdentifier, directory: home)
+        reportPickerRaster(panelFrame, owner: child.processIdentifier, directory: home, tag: "initial")
+        if roundTripProbe, let focused, let other = NSScreen.screens.first(where: { $0.backingScaleFactor == 1 }) {
+            let otherFrame = screenFrame(other)
+            var offRetina = CGPoint(x: otherFrame.minX + 80, y: otherFrame.minY + 110)
+            if let value = AXValueCreate(.cgPoint, &offRetina) {
+                let result = AXUIElementSetAttributeValue(focused, "AXPosition" as CFString, value)
+                print("AX picker move: \(result.rawValue)")
+                if result == .success {
+                    let moved = try eventually("Picker did not reach 1× display") {
+                        frame(focused).flatMap { scale(at: $0) == 1 ? $0 : nil }
+                    }
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+                    reportPickerRaster(moved, owner: child.processIdentifier, directory: home, tag: "one-x")
+                    var original = panelFrame.origin
+                    if let back = AXValueCreate(.cgPoint, &original), AXUIElementSetAttributeValue(focused, "AXPosition" as CFString, back) == .success {
+                        let restored = try eventually("Picker did not return to Retina") {
+                            frame(focused).flatMap { scale(at: $0) == 2 ? $0 : nil }
+                        }
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+                        reportPickerRaster(restored, owner: child.processIdentifier, directory: home, tag: "back-on-retina")
+                    }
+                }
+            }
+        }
     }
     guard AXUIElementPerformAction(cancel, kAXPressAction as CFString) == .success else {
         throw Failure(message: "The standalone picker could not be cancelled")
