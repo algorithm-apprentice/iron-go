@@ -1,0 +1,48 @@
+name: macOS feedback
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  feedback:
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Install Go language server
+        run: go install golang.org/x/tools/gopls@v0.20.0
+      - name: Install dependencies
+        run: npm ci
+      - name: Install headless browser
+        run: npx playwright install chromium
+      - name: Run feedback loop
+        run: npm run test:feedback
+      - name: Verify the production app bundle
+        run: npm run tauri build -- --bundles app
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-feedback
+          path: test-results/
+          if-no-files-found: ignore

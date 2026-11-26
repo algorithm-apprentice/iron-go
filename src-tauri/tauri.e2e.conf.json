@@ -1,0 +1,6 @@
+{
+  "identifier": "dev.irongo.e2e",
+  "productName": "Iron Go Acceptance",
+  "mainBinaryName": "iron-go-acceptance",
+  "build": { "frontendDist": "../dist-e2e" }
+}

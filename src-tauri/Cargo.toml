@@ -1,0 +1,28 @@
+[package]
+name = "iron-go"
+version = "0.1.0"
+description = "A lightweight desktop IDE for Go"
+license = "Apache-2.0"
+edition = "2021"
+
+[features]
+e2e = ["dep:tauri-plugin-wdio-webdriver"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+libc = "0.2"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-wdio-webdriver = { version = "=1.5.1", optional = true }
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+
+[profile.release]
+# Cargo's inferred stripping produced proc-macros that macOS 27 dyld rejected.
+# See docs/GOTCHAS.md; verify the release bundle before removing this setting.
+strip = "none"

@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#171c24" />
+    <link rel="icon" type="image/svg+xml" href="/assets/icon.svg" />
+    <title>Iron Go</title>
+  </head>
+  <body>
+    <div id="workbench" class="workbench">
+      <header class="titlebar" data-tauri-drag-region>
+        <div class="brand" data-tauri-drag-region>
+          <img src="/assets/icon.svg" alt="" width="29" height="29" data-tauri-drag-region />
+          <span data-tauri-drag-region>Iron<span class="brand-go">Go</span></span>
+        </div>
+        <button id="quick-open" class="command-center" title="Go to File (⌘P)">
+          <span data-icon="search"></span><span id="quick-label">Search files</span><kbd>⌘ P</kbd>
+        </button>
+        <div class="title-actions">
+          <button id="open-folder" class="button quiet" title="Open Folder (⌘O)"><span data-icon="folderOpen"></span><span class="action-label">Open Folder</span></button>
+          <button id="toggle-sidebar" class="icon-button sidebar-toggle" title="Toggle Side Bar (⌘B)" aria-label="Toggle Side Bar" aria-pressed="true" data-icon="sidebar"></button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <nav class="activity-bar" aria-label="Workbench views">
+          <button class="activity active" data-view="explorer" title="Explorer (⇧⌘E)" aria-label="Explorer" aria-pressed="true" data-icon="files"></button>
+          <button class="activity" data-view="search" title="Search (⇧⌘F)" aria-label="Search" aria-pressed="false" data-icon="search"></button>
+          <button class="activity" data-view="tasks" title="Run and Test" aria-label="Run and Test" aria-pressed="false" data-icon="terminal"></button>
+          <div class="spacer"></div>
+          <button id="settings" class="activity" title="Settings (⌘,)" aria-label="Settings" data-icon="settings"></button>
+        </nav>
+        <aside id="sidebar" class="sidebar" aria-label="Primary side bar">
+          <div id="explorer-view" class="side-view">
+            <header class="side-header">
+              <h1>Explorer</h1>
+              <div class="inline-actions">
+                <button id="new-file" class="icon-button" title="New File" aria-label="New File" data-icon="filePlus"></button>
+                <button id="refresh-files" class="icon-button" title="Refresh Explorer" aria-label="Refresh Explorer" data-icon="refresh"></button>
+                <button id="workspace-actions" class="icon-button" title="Workspace Actions" aria-label="Workspace Actions" data-icon="more"></button>
+              </div>
+            </header>
+            <div class="explorer" id="explorer"></div>
+            <div class="module-card">
+              <span class="module-icon" data-icon="package"></span>
+              <div class="module-label"><span id="module-kind" class="eyebrow">Go module</span><strong id="module-name">example.com/orbit</strong></div>
+            </div>
+          </div>
+          <div id="search-view" class="side-view" hidden>
+            <header class="side-header"><h1>Search</h1></header>
+            <form id="search-form" class="search-form">
+              <label for="search-text" class="sr-only">Search saved files</label>
+              <div class="search-field"><span data-icon="search"></span><input id="search-text" placeholder="Search saved files" maxlength="160" autocomplete="off" />
+                <button type="button" class="case-button" id="search-case" aria-pressed="false" title="Match Case" aria-label="Match Case">Aa</button>
+              </div>
+              <div id="search-status" class="view-note" role="status">Enter a term to search the workspace.</div>
+            </form>
+            <div id="search-results" class="side-scroll"></div>
+          </div>
+          <div id="tasks-view" class="side-view" hidden>
+            <header class="side-header"><h1>Run and Test</h1></header>
+            <div class="task-settings side-scroll">
+              <label for="run-package">Run package</label>
+              <input id="run-package" class="text-field mono" value="." placeholder="./cmd/app" />
+              <p>One executable package in this folder.</p>
+              <label for="task-scope">Build / test scope</label>
+              <input id="task-scope" class="text-field mono" value="./..." placeholder="./..." />
+              <div class="task-actions">
+                <button type="button" class="button task-button" data-task="run"><span data-icon="play"></span>Run package</button>
+                <button type="button" class="button task-button" data-task="build"><span data-icon="hammer"></span>Build</button>
+                <button type="button" class="button task-button" data-task="test"><span data-icon="flask"></span>Run tests</button>
+                <button type="button" id="stop-task" class="button task-button" disabled><span data-icon="stop"></span>Stop task</button>
+              </div>
+              <p id="tools-info" role="status"></p>
+            </div>
+          </div>
+        </aside>
+        <div id="sidebar-resize" class="divider v-divider" role="separator" aria-label="Resize sidebar" aria-orientation="vertical"></div>
+
+        <section class="editor-area" aria-label="Editor workbench">
+          <div class="tabs-line">
+            <div id="tabs" class="tabs" role="tablist" aria-label="Open editors"></div>
+            <div class="editor-actions">
+              <button id="run" class="button primary" title="Run Go Package (⌘↵)"><span data-icon="play"></span><span>Run</span></button>
+              <button id="format" class="icon-button" title="Format Go File (⇧⌥F)" aria-label="Format Go File" data-icon="format"></button>
+              <button id="save" class="icon-button" title="Save File (⌘S)" aria-label="Save File" data-icon="save"></button>
+              <button id="toggle-panel" class="icon-button" title="Toggle Bottom Panel (⌘J)" aria-label="Toggle Bottom Panel" aria-pressed="true" data-icon="layout"></button>
+            </div>
+          </div>
+          <div id="breadcrumbs" class="breadcrumbs" aria-label="Current file path"></div>
+          <div class="editor-stage">
+            <div id="editor" aria-label="Code editor"></div>
+            <div id="empty-editor" class="empty-editor" hidden>
+              <img src="/assets/icon.svg" width="76" height="76" alt="" />
+              <h2>Iron Go</h2>
+              <p>A focused workbench for Go.</p>
+              <button id="empty-quick-open" class="button quiet"><span data-icon="search"></span> Go to File <kbd>⌘ P</kbd></button>
+            </div>
+          </div>
+          <div id="panel-resize" class="divider h-divider" role="separator" aria-label="Resize bottom panel" aria-orientation="horizontal"></div>
+          <section id="panel" class="bottom-panel" aria-label="Go feedback">
+            <div class="panel-header">
+              <div class="panel-tabs" role="tablist" aria-label="Feedback view">
+                <button class="panel-tab" id="problems-tab" role="tab" aria-controls="problems-pane" aria-selected="false" data-panel="problems">Problems <span id="problem-count" class="count">0</span></button>
+                <button class="panel-tab active" id="output-tab" role="tab" aria-controls="output-pane" aria-selected="true" data-panel="output">Output</button>
+              </div>
+              <div class="panel-actions inline-actions">
+                <span class="output-source"><span data-icon="terminal"></span> Go Tasks</span>
+                <button id="panel-stop" class="icon-button" title="Stop Task" aria-label="Stop Task" data-icon="stop" hidden></button>
+                <button id="clear-output" class="icon-button" title="Clear Output" aria-label="Clear Output" data-icon="trash"></button>
+                <button id="hide-panel" class="icon-button" title="Hide Panel (⌘J)" aria-label="Hide Panel" data-icon="close"></button>
+              </div>
+            </div>
+            <div id="output-pane" class="output-pane" role="tabpanel" aria-labelledby="output-tab" tabindex="0">
+              <div id="output-log" class="output-log"></div>
+            </div>
+            <div id="problems-pane" class="problems-pane" role="tabpanel" aria-labelledby="problems-tab" hidden></div>
+          </section>
+        </section>
+      </main>
+
+      <footer class="statusbar" aria-label="Workspace status">
+        <span class="status-context"><span data-icon="branch"></span><span id="status-project">orbit</span></span>
+        <button id="status-problems" class="status-button" title="Show Problems" aria-label="Show Problems">
+          <span data-icon="error"></span><span id="error-count">0</span><span data-icon="warning"></span><span id="warning-count">0</span>
+        </button>
+        <span class="status-notice" id="status" role="status">Ready</span>
+        <div class="spacer"></div>
+        <span id="cursor" class="status-detail mono">Ln 1, Col 1</span>
+        <span id="indent" class="status-detail">Tab Size: 4</span>
+        <span class="status-detail encoding">UTF-8</span>
+        <span id="language" class="status-detail">Go</span>
+        <button id="tool-status" class="status-button tool-status" aria-label="Go tools and settings" title="Go tools and settings"><span class="status-dot"></span><span id="tool-version">Preview</span></button>
+      </footer>
+    </div>
+
+    <dialog id="palette" class="palette" aria-label="Quick Open">
+      <label class="palette-field"><span data-icon="search"></span><input id="palette-text" autocomplete="off" aria-label="Quick Open search" /><kbd>esc</kbd></label>
+      <div id="palette-options" class="palette-options"></div>
+      <div class="palette-footer"><span id="palette-hint">Type a path to go to a file</span><span><kbd>↑</kbd> <kbd>↓</kbd> Navigate <kbd>↵</kbd> Open</span></div>
+    </dialog>
+    <dialog id="form-dialog" class="form-dialog" aria-labelledby="form-title">
+      <form id="dialog-form" method="dialog">
+        <div class="dialog-header"><h2 id="form-title"></h2><button type="button" class="icon-button" data-dialog-close="form-dialog" aria-label="Close dialog" data-icon="close"></button></div>
+        <p id="form-description" class="view-note"></p>
+        <div id="form-fields"></div>
+        <p id="form-error" class="form-error" role="alert" hidden></p>
+        <div class="dialog-actions"><button type="button" class="button quiet" data-dialog-close="form-dialog">Cancel</button><button type="submit" id="form-submit" class="button primary">Create</button></div>
+      </form>
+    </dialog>
+    <dialog id="settings-dialog" class="form-dialog" aria-labelledby="settings-title">
+      <div class="dialog-header"><h2 id="settings-title">Workbench Settings</h2><button type="button" class="icon-button" data-dialog-close="settings-dialog" aria-label="Close settings" data-icon="close"></button></div>
+      <label class="settings-row"><div><strong>Minimap</strong><small>Show a compact overview of the file.</small></div><input id="minimap-setting" type="checkbox" /></label>
+      <label class="settings-row"><div><strong>Word wrap</strong><small>Wrap long lines to the editor width.</small></div><input id="wrap-setting" type="checkbox" /></label>
+      <div class="settings-tools"><h3>Go Toolchain</h3><div id="settings-tools-info" class="view-note"></div><button id="probe-tools" class="button quiet"><span data-icon="refresh"></span>Check tools</button></div>
+    </dialog>
+    <input id="import-folder" type="file" webkitdirectory multiple hidden />
+    <div id="toast" class="toast" role="alert" hidden></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

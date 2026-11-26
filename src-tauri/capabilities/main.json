@@ -1,0 +1,6 @@
+{
+  "identifier": "main-window",
+  "description": "Allow the local workbench to drag its title bar and guard the window close action.",
+  "windows": ["main"],
+  "permissions": ["core:event:default", "core:window:allow-start-dragging", "core:window:allow-destroy"]
+}
