@@ -114,6 +114,28 @@ try {
 
   const source = path.join(fixture, "cmd/orbit/main.go");
   const original = await readFile(source, "utf8");
+  await record("native theme switches both the editor and workbench", async () => {
+    await eventually("workbench boot", () => js("return !!window.__ironTest && document.body.classList.contains('desktop');"));
+    await click("#settings");
+    const selectTheme = value => js(`
+      const select = document.querySelector('#theme-setting');
+      if (!select) return 'Color Theme selector missing';
+      let error = null;
+      const onError = event => { error = [event.message, event.error?.stack].filter(Boolean).join("\\n"); };
+      window.addEventListener('error', onError);
+      try {
+        select.value = arguments[0];
+        select.dispatchEvent(new Event('change'));
+        return error;
+      } finally { window.removeEventListener('error', onError); }
+    `, value);
+    const colors = () => js("return ['.monaco-editor-background', '.sidebar', '.bottom-panel'].map(selector => getComputedStyle(document.querySelector(selector)).backgroundColor);");
+    assert.equal(await selectTheme("light"), null);
+    await eventually("native VS Code Light colors", colors, value => value?.join("/") === "rgb(255, 255, 255)/rgb(250, 250, 253)/rgb(250, 250, 253)");
+    assert.equal(await selectTheme("dark"), null);
+    await eventually("native VS Code Dark colors", colors, value => value?.join("/") === "rgb(18, 19, 20)/rgb(25, 26, 27)/rgb(25, 26, 27)");
+    await click('[data-dialog-close="settings-dialog"]');
+  });
   await record("native workbench opens a disposable folder", async () => {
     await eventually("workbench boot", () => js("return !!window.__ironTest && document.body.classList.contains('desktop');"));
     await click("#open-folder");

@@ -1,0 +1,67 @@
+/* Workbench roles follow the VS Code 2026 dark/light palette. */
+:root {
+  color-scheme: dark;
+  --canvas: #121314;
+  --editor-text: #bbbebf;
+  --side: #191a1b;
+  --widget: #202122;
+  --field: #191a1b;
+  --edge: #2a2b2c;
+  --control-edge: #333536;
+  --text: #bfbfbf;
+  --muted: #a0a0a0;
+  --quiet: #8c8c8c;
+  --accent: #48a0c7;
+  --focus: #3994bc;
+  --selection: #3994bc26;
+  --hover: #ffffff0d;
+  --primary: #297aa0;
+  --primary-hover: #2b7da3;
+  --on-primary: #ffffff;
+  --danger: #f48771;
+  --warning: #e2c08d;
+  --success: #89d185;
+  --stop-bg: #352625;
+  --stop-hover: #463030;
+  --stop-edge: #754d47;
+  --go-icon: #65cae2;
+  --mod-icon: #c5a5ed;
+  --status-context: #262728;
+  --shadow: #00000066;
+  --backdrop: #00000066;
+  --editor-selection: #3994bc45;
+  --editor-line: #202122;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --canvas: #ffffff;
+  --editor-text: #202020;
+  --side: #fafafd;
+  --widget: #f8f8fb;
+  --field: #ffffff;
+  --edge: #e6e6e9;
+  --control-edge: #d2d2d8;
+  --text: #202020;
+  --muted: #515154;
+  --quiet: #606060;
+  --accent: #0069cc;
+  --focus: #0069cc;
+  --selection: #0069cc1a;
+  --hover: #dadada4f;
+  --primary: #0069cc;
+  --primary-hover: #0063c1;
+  --danger: #a1260d;
+  --warning: #875400;
+  --success: #236a31;
+  --stop-bg: #fff1ed;
+  --stop-hover: #ffe4dc;
+  --stop-edge: #d4988a;
+  --go-icon: #007f9c;
+  --mod-icon: #7441a0;
+  --status-context: #ededef;
+  --shadow: #00000026;
+  --backdrop: #00000030;
+  --editor-selection: #add6ff;
+  --editor-line: #f6f7fa;
+}

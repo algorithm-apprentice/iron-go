@@ -97,3 +97,37 @@ test("creates a nested file, rejects duplicates, and does not fake native tasks"
     assert.match(await page.locator("#toast").innerText(), /desktop app/i);
   });
 });
+
+test("VS Code themes switch the entire workbench and persist without dropping edits", async () => {
+  await scenario("color-themes", async page => {
+    const backgrounds = () => page.evaluate(() => [".monaco-editor-background", ".sidebar", ".bottom-panel"].map(selector =>
+      getComputedStyle(document.querySelector(selector)).backgroundColor,
+    ));
+    const dark = ["rgb(18, 19, 20)", "rgb(25, 26, 27)", "rgb(25, 26, 27)"];
+    const light = ["rgb(255, 255, 255)", "rgb(250, 250, 253)", "rgb(250, 250, 253)"];
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    const theme = page.getByRole("combobox", { name: "Color Theme" });
+    await theme.waitFor({ timeout: 3000 });
+    assert.deepEqual(await backgrounds(), dark);
+    await page.getByRole("button", { name: "Close settings" }).click();
+    await page.locator("#editor textarea.inputarea").focus();
+    await page.keyboard.insertText("// Unsaved theme check");
+    await page.locator('.tab.dirty [data-path="cmd/orbit/main.go"]').waitFor();
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await theme.selectOption({ label: "VS Code Light" });
+    await page.getByRole("button", { name: "Close settings" }).click();
+    assert.deepEqual(await backgrounds(), light);
+    assert.match(await page.locator("#editor .view-lines").innerText(), /Unsaved\s+theme\s+check/);
+    assert.equal(await page.locator('.tab.dirty [data-path="cmd/orbit/main.go"]').count(), 1);
+    await page.getByRole("button", { name: "Save File" }).click();
+    await page.locator(".tab.dirty").waitFor({ state: "detached" });
+    await page.reload();
+    await page.getByRole("tab", { name: "main.go", selected: true }).waitFor();
+    assert.deepEqual(await backgrounds(), light);
+    await page.locator("#quick-open").click();
+    const palette = page.getByRole("textbox", { name: "Quick Open search" });
+    await palette.fill(">color theme dark");
+    await palette.press("Enter");
+    assert.deepEqual(await backgrounds(), dark);
+  });
+});

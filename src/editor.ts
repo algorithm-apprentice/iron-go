@@ -18,37 +18,6 @@ export { monaco };
 
 Object.assign(globalThis, { MonacoEnvironment: { getWorker: () => new EditorWorker() } });
 
-monaco.editor.defineTheme("iron-night", {
-  base: "vs-dark", inherit: true,
-  rules: [
-    { token: "keyword", foreground: "C79AF1" },
-    { token: "keyword.package.go", foreground: "8AB8FF" },
-    { token: "keyword.import.go", foreground: "8AB8FF" },
-    { token: "keyword.func.go", foreground: "C4A5F0" },
-    { token: "keyword.nil.go", foreground: "F1AFB8" },
-    { token: "keyword.false.go", foreground: "F1AFB8" },
-    { token: "string", foreground: "A8D9A5" },
-    { token: "number", foreground: "EDC995" },
-    { token: "comment", foreground: "7B90A6", fontStyle: "italic" },
-    { token: "delimiter", foreground: "A2B0C4" },
-    { token: "identifier.go", foreground: "D5E4F6" },
-  ],
-  colors: {
-    "editor.background": "#13171E", "editor.foreground": "#D3DFEC",
-    "editorGutter.background": "#13171E", "editorLineNumber.foreground": "#65768C",
-    "editorLineNumber.activeForeground": "#B9D2E4", "editorCursor.foreground": "#86E9CB",
-    "editor.lineHighlightBackground": "#1B242F", "editor.lineHighlightBorder": "#00000000",
-    "editor.selectionBackground": "#315A62", "editor.inactiveSelectionBackground": "#263B4C",
-    "editorIndentGuide.background1": "#2A3442", "editorIndentGuide.activeBackground1": "#425C67",
-    "editorWidget.background": "#202834", "editorWidget.border": "#48586E",
-    "editorSuggestWidget.selectedBackground": "#2D454C", "editorSuggestWidget.highlightForeground": "#86E9CB",
-    "editorWhitespace.foreground": "#314052", "editorBracketMatch.background": "#254044",
-    "editorBracketMatch.border": "#438876", "minimap.background": "#13171E",
-    "scrollbarSlider.background": "#60748D3A", "scrollbarSlider.hoverBackground": "#60748D60",
-    "scrollbarSlider.activeBackground": "#60748D84",
-  },
-});
-
 export interface DocumentTab {
   path: string;
   model: monaco.editor.ITextModel;
@@ -89,7 +58,7 @@ export class Documents {
 
   constructor(element: HTMLElement, private readonly events: DocumentEvents) {
     this.editor = monaco.editor.create(element, {
-      model: null, theme: "iron-night", automaticLayout: true, editContext: false,
+      model: null, theme: "vs-dark", automaticLayout: true, editContext: false,
       accessibilitySupport: "off", ariaLabel: "Code editor content", fontSize: 13,
       fontFamily: '"SF Mono", Menlo, Monaco, Consolas, monospace', fontLigatures: false,
       lineHeight: 22, lineNumbersMinChars: 4, padding: { top: 10, bottom: 8 },

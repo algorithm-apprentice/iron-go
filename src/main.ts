@@ -5,6 +5,7 @@ import { bufferText, Documents, monaco, replaceBuffer, type DocumentTab } from "
 import { Feedback } from "./feedback";
 import { fileIcon, icon, prepareIcons, type Icon } from "./icons";
 import { GoLanguage, type LanguageState } from "./lsp";
+import { bindColorTheme, chooseColorTheme } from "./theme";
 import { basename, defaultRunPackage, dirname, makeTree, quickFiles, validateRelative, type FileMatch, type ProjectSnapshot, type TreeNode } from "./project-model";
 import { desktop, host, importedProject, nativeProject, sampleProject, type Project, type TaskKind, type ToolStatus } from "./workspace";
 
@@ -581,6 +582,8 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Toggle Sidebar", detail: "⌘B", icon: "files", run: toggleSidebar },
     { label: "Toggle Bottom Panel", detail: "⌘J", icon: "layout", run: () => feedback.toggle() },
     { label: "Workbench Settings", detail: "⌘,", icon: "settings", run: showSettings },
+    { label: "Color Theme: VS Code Dark", icon: "settings", run: () => chooseColorTheme("dark") },
+    { label: "Color Theme: VS Code Light", icon: "settings", run: () => chooseColorTheme("light") },
   ];
   const paths = snapshot.entries.filter(entry => !entry.directory).map(entry => entry.path);
   palette.show(workspaceOnly ? "Workspace actions" : command ? "Type a command" : "Type a path to go to a file", query => {
@@ -627,6 +630,7 @@ function bindLayout() {
 }
 
 function bindSettings() {
+  bindColorTheme();
   const options = [
     { field: "minimap-setting", enabled: true },
     { field: "wrap-setting", enabled: false },

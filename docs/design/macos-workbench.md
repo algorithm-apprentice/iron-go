@@ -37,8 +37,9 @@ Use the VS Code workbench layout, not Iron C++'s toolbar layout. The title
 bar holds Quick Open and layout controls; global Open Folder stays available
 there. The editor group has tabs and breadcrumbs, with Run, Format, and Save
 in its top-right action area. Explorer, Search and Go Tasks live in the left
-activity bar; Problems and Output share the lower panel. Keep Iron Go colors
-and macOS controls rather than copying VS Code branding. Sidebar and bottom
+activity bar; Problems and Output share the lower panel. Use the selectable
+[VS Code color palettes](vscode-color-themes.md) while retaining Iron Go branding
+and macOS controls. Sidebar and bottom
 panel can be resized and toggled. Primary macOS shortcuts: `⌘O` open folder, `⌘P` quick open,
 `⇧⌘P` commands, `⌘S` save, `⇧⌘F` workspace search, `⇧⌥F` format,
 `⌘↵` run, `⌘B` sidebar, `⌘J` bottom panel.
