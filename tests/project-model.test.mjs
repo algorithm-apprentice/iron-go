@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { defaultRunPackage, makeTree, quickFiles, scanText, validateRelative } from "../src/project-model.ts";
+import { initialWorkspaceFile, makeTree, quickFiles, scanText, validateRelative } from "../src/project-model.ts";
 
 const files = (...paths) => paths.map(path => ({ path, directory: false }));
 
@@ -11,10 +11,11 @@ test("constructs parent folders once and places folders before files", () => {
   assert.equal(tree[1].directory, true);
 });
 
-test("honors a root main.go and otherwise suggests a cmd package", () => {
-  assert.equal(defaultRunPackage(files("main.go", "cmd/app/main.go")), ".");
-  assert.equal(defaultRunPackage(files("hello/main.go", "cmd/app/main.go")), "./cmd/app");
-  assert.equal(defaultRunPackage(files("local/main.go")), "./local");
+test("opens a conventional entry file before other Go files, without choosing a run target", () => {
+  assert.equal(initialWorkspaceFile(files("main.go", "cmd/app/main.go")), "main.go");
+  assert.equal(initialWorkspaceFile(files("hello/main.go", "cmd/app/main.go")), "cmd/app/main.go");
+  assert.equal(initialWorkspaceFile(files("local/main.go")), "local/main.go");
+  assert.equal(initialWorkspaceFile(files("readme.md", "pkg/example.go")), "pkg/example.go");
 });
 
 test("quick open finds path terms and ranks basename matches", () => {

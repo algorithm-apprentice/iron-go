@@ -2,6 +2,7 @@ import * as monaco from "monaco-editor/editor/editor.api.js";
 import "monaco-editor/languages/definitions/go/register.js";
 import "monaco-editor/languages/definitions/markdown/register.js";
 import "monaco-editor/editor/contrib/bracketMatching/browser/bracketMatching.js";
+import "monaco-editor/editor/contrib/codelens/browser/codelensController.js";
 import "monaco-editor/editor/contrib/comment/browser/comment.js";
 import "monaco-editor/editor/contrib/contextmenu/browser/contextmenu.js";
 import "monaco-editor/editor/contrib/folding/browser/folding.js";

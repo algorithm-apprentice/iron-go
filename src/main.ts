@@ -4,9 +4,10 @@ import { byId, element, Forms, message, Palette } from "./dialogs";
 import { bufferText, Documents, monaco, replaceBuffer, type DocumentTab } from "./editor";
 import { Feedback } from "./feedback";
 import { fileIcon, icon, prepareIcons, type Icon } from "./icons";
-import { GoLanguage, type LanguageState } from "./lsp";
+import { GoLanguage, runTestCommand, type LanguageState } from "./lsp";
+import { packageForFile, RunTargets } from "./run-targets";
 import { bindColorTheme, chooseColorTheme } from "./theme";
-import { basename, defaultRunPackage, dirname, makeTree, quickFiles, validateRelative, type FileMatch, type ProjectSnapshot, type TreeNode } from "./project-model";
+import { basename, dirname, initialWorkspaceFile, makeTree, quickFiles, validateRelative, type FileMatch, type ProjectSnapshot, type TreeNode } from "./project-model";
 import { desktop, host, importedProject, nativeProject, sampleProject, type Project, type TaskKind, type ToolStatus } from "./workspace";
 
 type View = "explorer" | "search" | "tasks";
@@ -20,6 +21,11 @@ const workbench = byId("workbench");
 const btn = (id: string) => byId<HTMLButtonElement>(id);
 const input = (id: string) => byId<HTMLInputElement>(id);
 const toolsMissing = { goVersion: null, gofmt: false, gopls: false };
+const runTargets = new RunTargets(focus => {
+  chooseView("tasks");
+  byId<HTMLDetailsElement>("advanced-targets").open = true;
+  focus.focus();
+});
 
 let project = sampleProject();
 let snapshot: ProjectSnapshot = { entries: [], truncated: false, module: null, goWork: false };
@@ -206,8 +212,7 @@ function syncControls() {
   btn("panel-stop").hidden = !task;
   btn("panel-stop").disabled = stopPending;
   btn("stop-task").disabled = !task || stopPending;
-  input("run-package").disabled = !!task;
-  input("task-scope").disabled = !!task;
+  runTargets.setDisabled(busy, !!task);
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-task]")) button.disabled = !!task || busy;
 }
 
@@ -245,7 +250,10 @@ async function saveActive() {
     if (!tab.dirty) { status(`${basename(tab.path)} is saved`); return; }
     if (await docs.save(tab)) {
       status(`Saved ${basename(tab.path)}`);
-      if (tab.path === "go.mod" || tab.path === "go.work") await refresh();
+      if (/(^|\/)go\.(mod|work)$/.test(tab.path)) {
+        await refresh();
+        void runTargets.refresh();
+      }
       if (view === "search") scheduleSearch();
     }
   } catch (error) { showError(error); }
@@ -287,6 +295,7 @@ async function install(target: Project) {
   lsp?.dispose();
   lsp = undefined;
   project = target;
+  runTargets.reset(target);
   task = undefined;
   stopPending = false;
   gopls = "idle";
@@ -311,10 +320,7 @@ async function install(target: Project) {
   catch (error) { showError(error); }
   if (target !== project) return;
   const files = snapshot.entries.filter(entry => !entry.directory).map(entry => entry.path);
-  const runPackage = defaultRunPackage(snapshot.entries);
-  input("run-package").value = runPackage;
-  input("task-scope").value = "./...";
-  const initial = files.includes("main.go") ? "main.go" : files.find(path => path === `${runPackage.slice(2)}/main.go`) ?? files.find(path => path.endsWith(".go")) ?? files[0];
+  const initial = initialWorkspaceFile(snapshot.entries);
   if (target.sample) {
     if (files.includes("go.mod")) await docs.open("go.mod", { activate: false });
     if (files.includes("README.md")) await docs.open("README.md", { activate: false });
@@ -465,7 +471,7 @@ function searchRow(result: FileMatch) {
   return row;
 }
 
-async function runTask(kind: TaskKind) {
+async function runTask(kind: TaskKind, singleTest?: { path: string; name: string }) {
   if (task || busy || docs.saving) return;
   const target = project.native;
   if (!target) {
@@ -473,6 +479,11 @@ async function runTask(kind: TaskKind) {
     return;
   }
   if (!tools?.goVersion) { toast("Install Go, then check the toolchain in Settings.", true); return; }
+  let packages: string[];
+  try {
+    packages = singleTest ? [packageForFile(singleTest.path)]
+      : kind === "run" ? runTargets.runArguments() : runTargets.buildTestArguments(docs.active?.path);
+  } catch (error) { showError(error); return; }
   task = kind;
   stopPending = true;
   syncControls();
@@ -481,8 +492,7 @@ async function runTask(kind: TaskKind) {
   try {
     for (const tab of docs.tabs.values()) if (tab.dirty) await docs.save(tab);
     if (docs.dirty || project.native !== target) throw new Error("Files changed while saving. Run the task again.");
-    const pkg = input(kind === "run" ? "run-package" : "task-scope").value.trim();
-    await host.task(target.id, kind, pkg, event => {
+    await host.task(target.id, kind, packages, singleTest?.name, event => {
       if (project.native !== target) return;
       const result = feedback.task(event);
       if (event.type === "started") {
@@ -533,11 +543,13 @@ function updateTools() {
 
 async function probeTools() {
   if (!desktop) return;
+  const hadGo = !!tools?.goVersion;
   btn("probe-tools").disabled = true;
   try { tools = await host.tools(); }
   catch (error) { tools = toolsMissing; showError(error); }
   finally { btn("probe-tools").disabled = false; }
   updateTools();
+  if (!hadGo && tools?.goVersion) void runTargets.refresh();
   maybeStartLsp();
 }
 
@@ -575,7 +587,8 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Save File", detail: "⌘S", icon: "save", run: saveActive },
     { label: "Reload File from Disk", icon: "refresh", run: reloadActive },
     { label: "Format Go File", detail: "⇧⌥F", icon: "format", run: formatActive },
-    { label: "Go: Run Package", detail: "⌘↵", icon: "play", run: () => { void runTask("run"); } },
+    { label: "Go: Run Selected Target", detail: "⌘↵", icon: "play", run: () => { void runTask("run"); } },
+    { label: "Go: Choose Run Target", icon: "package", run: () => runTargets.picker.focus() },
     { label: "Go: Build Packages", icon: "hammer", run: () => { void runTask("build"); } },
     { label: "Go: Run Tests", icon: "flask", run: () => { void runTask("test"); } },
     { label: "Go: Stop Task", icon: "stop", run: stopTask },
@@ -657,7 +670,7 @@ byId("workspace-actions").addEventListener("click", () => showPalette(false, tru
 byId("open-folder").addEventListener("click", openFolder);
 byId("toggle-sidebar").addEventListener("click", toggleSidebar);
 byId("new-file").addEventListener("click", newFile);
-byId("refresh-files").addEventListener("click", () => { void refresh().catch(showError); });
+byId("refresh-files").addEventListener("click", () => { void refresh().catch(showError); void runTargets.refresh(); });
 byId("format").addEventListener("click", formatActive);
 byId("save").addEventListener("click", saveActive);
 byId("run").addEventListener("click", () => { if (task) void stopTask(); else void runTask("run"); });
@@ -666,6 +679,11 @@ byId("stop-task").addEventListener("click", stopTask);
 byId("settings").addEventListener("click", showSettings);
 byId("tool-status").addEventListener("click", showSettings);
 byId("probe-tools").addEventListener("click", probeTools);
+monaco.editor.addCommand({ id: runTestCommand, run: (_accessor, id: number, path: string, name: string) => {
+  if (project.native?.id === id && docs.active?.path === path && path.endsWith("_test.go")) {
+    void runTask("test", { path, name });
+  }
+} });
 input("search-text").addEventListener("input", scheduleSearch);
 byId("search-case").addEventListener("click", event => {
   const button = event.currentTarget as HTMLButtonElement;

@@ -3,14 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="icon" type="image/svg+xml" href="/assets/icon.svg" />
+    <link rel="icon" type="image/png" href="/assets/icon-64.png" />
     <title>Iron Go</title>
   </head>
   <body>
     <div id="workbench" class="workbench">
       <header class="titlebar" data-tauri-drag-region>
         <div class="brand" data-tauri-drag-region>
-          <img src="/assets/icon.svg" alt="" width="29" height="29" data-tauri-drag-region />
+          <img src="/assets/icon-64.png" alt="" width="29" height="29" data-tauri-drag-region />
           <span data-tauri-drag-region>Iron<span class="brand-go">Go</span></span>
         </div>
         <button id="quick-open" class="command-center" title="Go to File (⌘P)">
@@ -60,17 +60,28 @@
           <div id="tasks-view" class="side-view" hidden>
             <header class="side-header"><h1>Run and Test</h1></header>
             <div class="task-settings side-scroll">
-              <label for="run-package">Run package</label>
-              <input id="run-package" class="text-field mono" value="." placeholder="./cmd/app" />
-              <p>One executable package in this folder.</p>
-              <label for="task-scope">Build / test scope</label>
-              <input id="task-scope" class="text-field mono" value="./..." placeholder="./..." />
+              <p id="run-target-status" class="run-target-status" role="status">Open a Go workspace to discover run targets.</p>
+              <button type="button" class="button quiet" id="refresh-targets"><span data-icon="refresh"></span>Refresh Targets</button>
+              <label for="package-scope">Build and test</label>
+              <select id="package-scope" class="text-field">
+                <option value="all">All packages</option>
+                <option value="current">Current package</option>
+                <option value="custom">Custom scope…</option>
+              </select>
               <div class="task-actions">
                 <button type="button" class="button task-button" data-task="run"><span data-icon="play"></span>Run package</button>
                 <button type="button" class="button task-button" data-task="build"><span data-icon="hammer"></span>Build</button>
                 <button type="button" class="button task-button" data-task="test"><span data-icon="flask"></span>Run tests</button>
                 <button type="button" id="stop-task" class="button task-button" disabled><span data-icon="stop"></span>Stop task</button>
               </div>
+              <details id="advanced-targets">
+                <summary>Advanced</summary>
+                <label for="manual-run-package">Custom run package</label>
+                <input id="manual-run-package" class="text-field mono" autocomplete="off" placeholder="./cmd/app" />
+                <p>Select Custom target in the toolbar to use this path.</p>
+                <label for="task-scope">Custom build / test scope</label>
+                <input id="task-scope" class="text-field mono" value="./..." placeholder="./..." />
+              </details>
               <p id="tools-info" role="status"></p>
             </div>
           </div>
@@ -81,6 +92,7 @@
           <div class="tabs-line">
             <div id="tabs" class="tabs" role="tablist" aria-label="Open editors"></div>
             <div class="editor-actions">
+              <select id="run-target" class="text-field run-picker" aria-label="Run target" title="Go executable package"></select>
               <button id="run" class="button primary" title="Run Go Package (⌘↵)"><span data-icon="play"></span><span>Run</span></button>
               <button id="format" class="icon-button" title="Format Go File (⇧⌥F)" aria-label="Format Go File" data-icon="format"></button>
               <button id="save" class="icon-button" title="Save File (⌘S)" aria-label="Save File" data-icon="save"></button>
@@ -91,7 +103,7 @@
           <div class="editor-stage">
             <div id="editor" aria-label="Code editor"></div>
             <div id="empty-editor" class="empty-editor" hidden>
-              <img src="/assets/icon.svg" width="76" height="76" alt="" />
+              <img src="/assets/icon-128.png" width="76" height="76" alt="" />
               <h2>Iron Go</h2>
               <p>A focused workbench for Go.</p>
               <button id="empty-quick-open" class="button quiet"><span data-icon="search"></span> Go to File <kbd>⌘ P</kbd></button>
@@ -105,7 +117,7 @@
                 <button class="panel-tab active" id="output-tab" role="tab" aria-controls="output-pane" aria-selected="true" data-panel="output">Output</button>
               </div>
               <div class="panel-actions inline-actions">
-                <span class="output-source"><span data-icon="terminal"></span> Go Tasks</span>
+                <span class="output-source"><span data-icon="terminal"></span> Go Output</span>
                 <button id="panel-stop" class="icon-button" title="Stop Task" aria-label="Stop Task" data-icon="stop" hidden></button>
                 <button id="clear-output" class="icon-button" title="Clear Output" aria-label="Clear Output" data-icon="trash"></button>
                 <button id="hide-panel" class="icon-button" title="Hide Panel (⌘J)" aria-label="Hide Panel" data-icon="close"></button>

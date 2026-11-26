@@ -42,6 +42,8 @@ test("sample uses the real workbench, tree and quick open", async () => {
   await scenario("navigation", async page => {
     assert.equal(await page.locator(".titlebar #quick-open").count(), 1);
     assert.equal(await page.locator(".editor-actions #run").count(), 1, "Run belongs to the editor group");
+    assert.equal(await page.getByRole("combobox", { name: "Run target" }).isDisabled(), true, "The preview does not discover local targets");
+    await page.waitForFunction(() => document.querySelector(".brand img")?.naturalWidth === 64);
     assert.deepEqual(await page.locator(".panel-tabs [data-panel]").evaluateAll(tabs => tabs.map(tab => tab.dataset.panel)), ["problems", "output"]);
     const sidebar = page.getByRole("button", { name: "Toggle Side Bar", exact: true });
     await sidebar.click();

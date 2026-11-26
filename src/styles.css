@@ -39,6 +39,7 @@ kbd { font: 11px/1.35 var(--mono); color: var(--muted); padding: 1px 5px; backgr
 .button.primary:hover:not(:disabled) { background: var(--primary-hover); }
 #run { min-width: 62px; min-height: 26px; padding: 2px 8px; margin-right: 5px; font-size: 11px; }
 #run svg { height: 13px; width: 13px; }
+.editor-actions .run-picker { width: clamp(95px, 12vw, 165px); padding: 3px 4px; min-height: 26px; font-size: 11px; }
 #run[data-running="true"] { background: var(--stop-bg); color: var(--danger); border-color: var(--stop-edge); }
 #run[data-running="true"]:hover:not(:disabled) { background: var(--stop-hover); }
 
@@ -176,6 +177,10 @@ kbd { font: 11px/1.35 var(--mono); color: var(--muted); padding: 1px 5px; backgr
 .search-preview { color: var(--muted); font: 10px/1.45 var(--mono); }
 .text-field { width: 100%; padding: 6px 8px; color: var(--text); border: 1px solid var(--control-edge); border-radius: 4px; background: var(--field); user-select: text; }
 .task-settings label, .field-label { display: block; color: var(--text); font-weight: 600; margin-bottom: 5px; }
+.task-settings #refresh-targets { margin-bottom: 12px; }
+.run-target-status { overflow-wrap: anywhere; }
+.task-settings details { border-top: 1px solid var(--edge); padding-top: 8px; }
+.task-settings summary { color: var(--muted); cursor: pointer; margin-bottom: 8px; }
 .task-settings p { margin: 5px 0 13px; color: var(--muted); font-size: 11px; }
 .task-actions { display: grid; gap: 6px; margin: 12px 0; }
 .task-button { justify-content: start; color: var(--text); background: var(--widget); border-color: var(--control-edge); }

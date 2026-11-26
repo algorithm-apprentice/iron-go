@@ -1,4 +1,5 @@
 mod lsp;
+mod packages;
 mod tasks;
 mod tools;
 mod workspace;
@@ -18,6 +19,7 @@ struct Session {
     serial: u64,
     workspace: Option<Workspace>,
     task: Option<tasks::RunningTask>,
+    discovery: Option<packages::Discovery>,
     lsp: Option<lsp::RunningServer>,
 }
 
@@ -38,6 +40,7 @@ impl Session {
     fn stop_processes(&mut self) {
         // Dropping the handles closes the workers' cancellation channels.
         self.task.take();
+        self.discovery.take();
         self.lsp.take();
     }
 }
@@ -152,6 +155,7 @@ fn main() {
             tools::format_go,
             tasks::start_task,
             tasks::stop_task,
+            packages::discover_packages,
             lsp::start_gopls,
             lsp::send_gopls,
             lsp::stop_gopls,

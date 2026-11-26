@@ -8,5 +8,5 @@ go run ./cmd/orbit
 go test ./...
 ```
 
-To run it in Iron Go, open this folder in the desktop app and set the Run
-package to `./cmd/orbit`.
+To run it in Iron Go, open this folder in the desktop app and use the
+automatically selected **orbit** target in the editor toolbar.

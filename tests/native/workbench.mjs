@@ -143,6 +143,7 @@ try {
     assert.equal(state.text, original);
     assert.equal(await text("#module-name"), "example.com/orbit");
     await eventually("Go toolchain reported", () => text("#tool-version"), value => /go?\s*\d+\.\d+/i.test(value));
+    await eventually("sole executable selected without typing", () => js("return document.querySelector('#run-target')?.value;"), value => value === "./cmd/orbit", 5000);
   });
 
   await record("formats only the buffer, then saves actual disk bytes", async () => {
@@ -179,10 +180,16 @@ try {
     await eventually("real go test output", output, value => /PASS: TestSummary[\s\S]*exit code 0/i.test(value), 45_000);
   });
 
-  await record("stops a running Go program and its process group", async () => {
+  await record("chooses between two actual Go targets and stops the inferior", async () => {
     await mkdir(path.join(fixture, "cmd/wait"));
-    await writeFile(path.join(fixture, "cmd/wait/main.go"), 'package main\nimport ("fmt"; "os"; "time")\nfunc main(){fmt.Printf("agent-ready %d\\n", os.Getpid()); time.Sleep(time.Minute)}\n');
-    await set("#run-package", "./cmd/wait");
+    await writeFile(path.join(fixture, "cmd/wait/entry.go"), 'package main\nimport ("fmt"; "os"; "time")\nfunc main(){fmt.Printf("agent-ready %d\\n", os.Getpid()); time.Sleep(time.Minute)}\n');
+    await click("#open-folder");
+    await eventually("both discovered targets", () => js("return Array.from(document.querySelector('#run-target').options).map(option => option.value);"), values => values?.includes("./cmd/orbit") && values?.includes("./cmd/wait"));
+    await eventually("workspace ready", () => js("return !document.querySelector('#run').disabled;"));
+    assert.equal(await js("return document.querySelector('#run-target').value;"), "");
+    await click("#run");
+    await eventually("run requires an explicit selection", () => text("#toast"), value => /choose a run target/i.test(value));
+    await js("const select = document.querySelector('#run-target'); select.value = './cmd/wait'; select.dispatchEvent(new Event('change')); return true;");
     await click("#run");
     const ready = await eventually("long-running Go program", output, value => /agent-ready \d+/.test(value), 30_000);
     const pid = Number(ready.match(/agent-ready (\d+)/)[1]);
@@ -223,6 +230,28 @@ try {
       await action("editor.action.revealDefinition");
       const result = await eventually("definition opened in workspace", current, state => state?.path === "internal/status/report.go", 20_000);
       assert.match(result.text, /func NewReport\(/);
+    });
+    await record("runs exactly one Go test from its editor action", async () => {
+      const file = path.join(fixture, "internal/status/report_test.go");
+      await writeFile(file, (await readFile(file, "utf8")) + "\nfunc TestAnother(t *testing.T) {}\n");
+      await click("#quick-open");
+      await set("#palette-text", "report_test.go");
+      await click("#palette-options button");
+      await eventually("test file is active", current, state => state?.path === "internal/status/report_test.go");
+      await eventually("the two CodeLens actions", () => js("return document.querySelectorAll('.codelens-decoration a').length;"), count => count === 2);
+      assert.equal(await js(`
+        const action = document.querySelector('.codelens-decoration a');
+        if (!action) return false;
+        const bounds = action.getBoundingClientRect();
+        // Monaco's CodeLens executes on pointer down, not HTMLElement.click().
+        action.dispatchEvent(new MouseEvent('mousedown', {
+          bubbles: true, cancelable: true, view: window, button: 0, buttons: 1,
+          clientX: bounds.x + bounds.width / 2, clientY: bounds.y + bounds.height / 2,
+        }));
+        return true;
+      `), true);
+      const result = await eventually("test completed from CodeLens", output, value => /PASS: TestSummary[\s\S]*exit code 0/.test(value));
+      assert.doesNotMatch(result, /PASS: TestAnother/);
     });
   }
 } catch (error) {

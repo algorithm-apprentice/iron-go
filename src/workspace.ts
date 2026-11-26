@@ -16,6 +16,8 @@ export type TaskEvent =
   | { type: "finished"; success: boolean; code: number | null; cancelled: boolean };
 export interface ToolStatus { goVersion: string | null; gofmt: boolean; gopls: boolean }
 export interface NativeFolder { id: number; name: string; path: string }
+export interface RunTarget { package: string; importPath: string }
+export interface GoPackages { targets: RunTarget[]; allScopes: string[] }
 export type ServerEvent = { type: "message"; message: unknown } | { type: "closed"; reason: string };
 
 function channel<T>(handler: (event: T) => void) {
@@ -30,8 +32,9 @@ export const host = {
   close: (id: number) => invoke<void>("close_workspace", { id }),
   tools: () => invoke<ToolStatus>("go_tools"),
   format: (text: string) => invoke<string>("format_go", { text }),
-  task: (id: number, kind: TaskKind, pkg: string, handle: (event: TaskEvent) => void) =>
-    invoke<void>("start_task", { id, kind, package: pkg, events: channel(handle) }),
+  discoverPackages: (id: number) => invoke<GoPackages>("discover_packages", { id }),
+  task: (id: number, kind: TaskKind, packages: string[], testName: string | undefined, handle: (event: TaskEvent) => void) =>
+    invoke<void>("start_task", { id, kind, packages, testName, events: channel(handle) }),
   stop: (id: number) => invoke<void>("stop_task", { id }),
   lsp: (id: number, handle: (event: ServerEvent) => void) => invoke<number>("start_gopls", { id, events: channel(handle) }),
   send: (server: number, message: object) => invoke<void>("send_gopls", { server, message: JSON.stringify(message) }),

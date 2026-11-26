@@ -42,11 +42,10 @@ export function makeTree(entries: Entry[]): TreeNode[] {
   return root.children;
 }
 
-export function defaultRunPackage(entries: Entry[]): string {
+export function initialWorkspaceFile(entries: Entry[]): string | undefined {
   const files = entries.filter(entry => !entry.directory).map(entry => entry.path);
-  if (files.includes("main.go")) return ".";
-  const main = files.find(path => /^cmd\/[^/]+\/main\.go$/.test(path)) ?? files.find(path => path.endsWith("/main.go"));
-  return main ? `./${dirname(main)}` : ".";
+  return files.find(path => path === "main.go") ?? files.find(path => /^cmd\/[^/]+\/main\.go$/.test(path))
+    ?? files.find(path => path.endsWith("/main.go")) ?? files.find(path => path.endsWith(".go")) ?? files[0];
 }
 
 export function quickFiles(paths: string[], input: string, limit = 60) {

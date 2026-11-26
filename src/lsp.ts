@@ -1,11 +1,16 @@
 import { AbstractMessageReader, AbstractMessageWriter, createMessageConnection, type DataCallback, type Message, type MessageConnection } from "vscode-jsonrpc/lib/browser/main.js";
-import type { CompletionItem, CompletionList, Diagnostic, Hover, Location, LocationLink, MarkedString, MarkupContent, Range } from "vscode-languageserver-types";
+import { SymbolKind, type CompletionItem, type CompletionList, type Diagnostic, type DocumentSymbol, type Hover, type Location, type LocationLink, type MarkedString, type MarkupContent, type Range, type SymbolInformation } from "vscode-languageserver-types";
 import { message } from "./dialogs";
 import { monaco, type DocumentTab, type Documents } from "./editor";
 import { host, type NativeFolder } from "./workspace";
 
 export type LanguageState = "idle" | "missing" | "starting" | "ready" | "failed";
 const markerOwner = "gopls";
+export const runTestCommand = "irongo.runGoTest";
+
+function isTestFunction(name: string) {
+  return /^Test[\p{L}\p{Nd}_]*$/u.test(name) && !/^Test\p{Ll}/u.test(name);
+}
 
 // Tauri carries decoded messages; vscode-jsonrpc owns request IDs, responses,
 // cancellation, and dispatch. Only this transport adapter knows about IPC.
@@ -112,6 +117,7 @@ export class GoLanguage {
               publishDiagnostics: { versionSupport: true },
               completion: { completionItem: { snippetSupport: true, insertReplaceSupport: true, documentationFormat: ["markdown", "plaintext"] } },
               definition: { linkSupport: true },
+              documentSymbol: { hierarchicalDocumentSymbolSupport: true },
               hover: { contentFormat: ["markdown", "plaintext"] },
             },
           },
@@ -184,13 +190,14 @@ export class GoLanguage {
     })));
   }
 
-  private async request<T>(method: string, model: monaco.editor.ITextModel, pos: monaco.Position, token: monaco.CancellationToken, extra = {}) {
+  private async request<T>(method: string, model: monaco.editor.ITextModel, pos: monaco.Position | undefined, token: monaco.CancellationToken, extra = {}) {
     if (!this.ready || !this.models.has(model) || token.isCancellationRequested) return undefined;
     const version = model.getVersionId();
     this.flush(model);
     try {
       const result = await this.connection?.sendRequest<T>(method, {
-        textDocument: { uri: model.uri.toString() }, position: { line: pos.lineNumber - 1, character: pos.column - 1 }, ...extra,
+        textDocument: { uri: model.uri.toString() },
+        ...(pos ? { position: { line: pos.lineNumber - 1, character: pos.column - 1 } } : {}), ...extra,
       }, token);
       return this.ready && !model.isDisposed() && version === model.getVersionId() && !token.isCancellationRequested ? result : undefined;
     } catch { return undefined; }
@@ -225,6 +232,19 @@ export class GoLanguage {
           if (!this.docs.relative(uri)) return [];
           return [{ uri, range: fromRange("targetUri" in item ? item.targetSelectionRange : item.range) }];
         });
+      },
+    }), monaco.languages.registerCodeLensProvider("go", {
+      provideCodeLenses: async (model, token) => {
+        const path = this.docs.relative(model.uri);
+        if (!path?.endsWith("_test.go")) return { lenses: [] };
+        const symbols = await this.request<(DocumentSymbol | SymbolInformation)[] | null>("textDocument/documentSymbol", model, undefined, token);
+        return { lenses: (symbols ?? []).flatMap(symbol => {
+          if (symbol.kind !== SymbolKind.Function || !isTestFunction(symbol.name)) return [];
+          return [{
+            range: fromRange("selectionRange" in symbol ? symbol.selectionRange : symbol.location.range),
+            command: { id: runTestCommand, title: "Run Test", tooltip: `Run ${symbol.name}`, arguments: [this.folder.id, path, symbol.name] },
+          }];
+        }) };
       },
     }));
   }
