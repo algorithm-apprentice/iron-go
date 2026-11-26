@@ -27,3 +27,21 @@ the user's foreground row mismatch.
 The native Raft geometry gate now passes at normal size and at 760 px with
 wrapping enabled. The native Orbit gate checks the editor viewport against
 Monaco before a gutter breakpoint is exercised.
+
+## Diagnosing a gutter click
+
+Use the native acceptance build to log the rendered gutter row, the source
+line hit by Monaco's mouse target, the selection and its active endpoint,
+and the highlighted gutter number. Compare row coordinates separately from
+selection behavior. The probe runs on a disposable project and does not add
+logging or change settings in the installed application.
+
+```sh
+npm run test:native -- --project /path/to/raft --test-file raft_test.go --gutter-line 28
+```
+
+The probe reproduced the reported click: row delta `0`, mouse target
+`GUTTER_LINE_NUMBERS` at line 28, selection `28:1` through `29:1`, caret at
+`29:1`, highlighted number `29`. Monaco's whole-line selection includes
+the newline and its active-number styling follows the caret, not the mouse
+target. The probe does not change this behavior.

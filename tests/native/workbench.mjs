@@ -13,10 +13,14 @@ const { values } = parseArgs({ options: {
   "skip-build": { type: "boolean" }, "require-gopls": { type: "boolean" },
   "require-delve": { type: "boolean" },
   "trace-editor": { type: "boolean" },
+  "gutter-line": { type: "string" },
   project: { type: "string" }, "test-file": { type: "string" }, "debug-test": { type: "string" },
 } });
 if (process.platform !== "darwin") throw new Error("Native acceptance requires macOS.");
 if (values["debug-test"] && (!values.project || !values["test-file"])) throw new Error("--debug-test requires --project and --test-file.");
+if (values["gutter-line"] && (!values.project || !values["test-file"] || !/^[1-9]\d*$/.test(values["gutter-line"]))) {
+  throw new Error("--gutter-line requires a positive line number, --project and --test-file.");
+}
 const artifacts = path.join(root, "test-results/native", `${Date.now()}-${process.pid}`);
 await mkdir(artifacts, { recursive: true });
 console.log(`Native acceptance artifacts: ${path.relative(root, artifacts)}`);
@@ -137,6 +141,30 @@ async function placeBreakpoint(line) {
   `), value => value === true);
 }
 
+async function traceGutterClick(line) {
+  const trace = await js(`
+    const line = arguments[0];
+    window.__ironTest.revealLine(line);
+    const before = window.__ironTest.gutterTrace();
+    const number = [...document.querySelectorAll('#editor .line-numbers')].find(row => row.textContent.trim() === String(line));
+    if (!number) return { before, error: 'gutter number is not visible' };
+    const bounds = number.getBoundingClientRect();
+    const options = { bubbles:true, cancelable:true, view:window, detail:1, button:0,
+        clientX:bounds.x + bounds.width/2, clientY:bounds.y + bounds.height/2 };
+    const rowDelta = Math.min(...[...document.querySelectorAll('#editor .view-lines .view-line')]
+      .map(row => Math.abs(row.getBoundingClientRect().top - bounds.top)));
+    number.dispatchEvent(new MouseEvent('mousedown', { ...options, buttons:1 }));
+    number.dispatchEvent(new MouseEvent('mouseup', { ...options, buttons:0 }));
+    window.__ironTest.refreshView();
+    return { requestedLine:line, rowDelta, before, after:window.__ironTest.gutterTrace() };
+  `, line);
+  await writeFile(path.join(artifacts, "gutter-click.json"), JSON.stringify(trace, null, 2));
+  console.log(JSON.stringify(trace, null, 2));
+  assert.equal(trace.after?.hit?.type, "GUTTER_LINE_NUMBERS", "the diagnostic must use the number column, not the breakpoint gutter");
+  assert.equal(trace.after.hit.line, line, "Monaco should hit the number clicked");
+  assert.ok(trace.rowDelta <= 1, "gutter and code geometry should align before the click");
+}
+
 async function record(name, run) {
   const started = Date.now();
   try {
@@ -199,6 +227,7 @@ async function externalProjectSmoke() {
       await eventually("requested test file active", current, state => state?.path === values["test-file"]);
       await eventually("editor test actions available", () => js("return document.querySelectorAll('.codelens-decoration a').length;"), count => count > 0, 30_000);
     });
+    if (values["gutter-line"]) await record("trace a real Monaco gutter click", () => traceGutterClick(Number(values["gutter-line"])));
     await record("gutter, Go rows and active highlight align through scrolling and CodeLens", assertLineAlignment);
     await record("editor lines remain aligned after resizing and enabling wrapping", async () => {
       await js("void window.__ironTest.resize(760, 600); return true;");

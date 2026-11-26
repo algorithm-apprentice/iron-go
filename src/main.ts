@@ -856,6 +856,12 @@ if (desktop) {
 
 if (import.meta.env.VITE_IRON_E2E === "1") {
   const runtimeErrors: string[] = [];
+  let gutterHit: { line: number | null; type: string } | undefined;
+  let selectionSource: string | undefined;
+  docs.editor.onMouseDown(event => {
+    gutterHit = { line: event.target.position?.lineNumber ?? null, type: monaco.editor.MouseTargetType[event.target.type] };
+  });
+  docs.editor.onDidChangeCursorSelection(event => { selectionSource = event.source; });
   window.addEventListener("error", event => {
     runtimeErrors.push(`${event.message} ${event.error?.stack ?? ""}`);
     if (runtimeErrors.length > 10) runtimeErrors.shift();
@@ -865,6 +871,15 @@ if (import.meta.env.VITE_IRON_E2E === "1") {
       markers: docs.active ? monaco.editor.getModelMarkers({ resource: docs.active.model.uri }) : [], gopls,
       editor: { width: docs.editor.getLayoutInfo().width, height: docs.editor.getLayoutInfo().height, scrollTop: docs.editor.getScrollTop(), contentHeight: docs.editor.getContentHeight(), runtimeErrors } }),
     replace: (value: string) => { if (docs.active) replaceBuffer(docs.active.model, value); },
+    gutterTrace: () => {
+      const selection = docs.editor.getSelection();
+      return {
+        hit: gutterHit, selectionSource,
+        caret: docs.editor.getPosition(),
+        selection: selection && { start: selection.getStartPosition(), end: selection.getEndPosition(), empty: selection.isEmpty() },
+        highlightedNumbers: [...document.querySelectorAll("#editor .line-numbers.active-line-number")].map(row => row.textContent?.trim()),
+      };
+    },
     refreshView: () => docs.refreshView(),
     resize: (width: number, height: number) => getCurrentWindow().setSize(new LogicalSize(width, height)),
     revealLine: (lineNumber: number) => {
