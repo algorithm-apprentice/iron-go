@@ -14,8 +14,8 @@ not a VS Code extension theme or a complete import of its token rules.
 
 - Share semantic CSS tokens across both workbench palettes. Map the editor's
   principal colors from those same tokens onto Monaco's public theme API.
-- Offer Dark (default) and Light in Workbench Settings, with a matching
-  command palette for quick switching. Persist the choice locally. An invalid
+- Display the names `Dark` (default) and `Light` in Workbench Settings and the
+  command palette, without a VS Code prefix. Persist the choice locally. An invalid
   or inaccessible preference falls back to Dark. Do not bind the theme to a
   workspace or change native system dialogs.
 - Update the editor theme in place. Switching must not replace the editor or

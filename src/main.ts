@@ -582,8 +582,8 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Toggle Sidebar", detail: "⌘B", icon: "files", run: toggleSidebar },
     { label: "Toggle Bottom Panel", detail: "⌘J", icon: "layout", run: () => feedback.toggle() },
     { label: "Workbench Settings", detail: "⌘,", icon: "settings", run: showSettings },
-    { label: "Color Theme: VS Code Dark", icon: "settings", run: () => chooseColorTheme("dark") },
-    { label: "Color Theme: VS Code Light", icon: "settings", run: () => chooseColorTheme("light") },
+    { label: "Color Theme: Dark", icon: "settings", run: () => chooseColorTheme("dark") },
+    { label: "Color Theme: Light", icon: "settings", run: () => chooseColorTheme("light") },
   ];
   const paths = snapshot.entries.filter(entry => !entry.directory).map(entry => entry.path);
   palette.show(workspaceOnly ? "Workspace actions" : command ? "Type a command" : "Type a path to go to a file", query => {

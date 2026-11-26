@@ -98,7 +98,7 @@ test("creates a nested file, rejects duplicates, and does not fake native tasks"
   });
 });
 
-test("VS Code themes switch the entire workbench and persist without dropping edits", async () => {
+test("Dark and Light switch the entire workbench and persist without dropping edits", async () => {
   await scenario("color-themes", async page => {
     const backgrounds = () => page.evaluate(() => [".monaco-editor-background", ".sidebar", ".bottom-panel"].map(selector =>
       getComputedStyle(document.querySelector(selector)).backgroundColor,
@@ -108,13 +108,14 @@ test("VS Code themes switch the entire workbench and persist without dropping ed
     await page.getByRole("button", { name: "Settings", exact: true }).click();
     const theme = page.getByRole("combobox", { name: "Color Theme" });
     await theme.waitFor({ timeout: 3000 });
+    assert.deepEqual(await theme.locator("option").allTextContents(), ["Dark", "Light"]);
     assert.deepEqual(await backgrounds(), dark);
     await page.getByRole("button", { name: "Close settings" }).click();
     await page.locator("#editor textarea.inputarea").focus();
     await page.keyboard.insertText("// Unsaved theme check");
     await page.locator('.tab.dirty [data-path="cmd/orbit/main.go"]').waitFor();
     await page.getByRole("button", { name: "Settings", exact: true }).click();
-    await theme.selectOption({ label: "VS Code Light" });
+    await theme.selectOption({ label: "Light" });
     await page.getByRole("button", { name: "Close settings" }).click();
     assert.deepEqual(await backgrounds(), light);
     assert.match(await page.locator("#editor .view-lines").innerText(), /Unsaved\s+theme\s+check/);
@@ -127,6 +128,7 @@ test("VS Code themes switch the entire workbench and persist without dropping ed
     await page.locator("#quick-open").click();
     const palette = page.getByRole("textbox", { name: "Quick Open search" });
     await palette.fill(">color theme dark");
+    await page.getByRole("button", { name: "Color Theme: Dark", exact: true }).waitFor({ timeout: 3000 });
     await palette.press("Enter");
     assert.deepEqual(await backgrounds(), dark);
   });
