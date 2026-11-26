@@ -118,6 +118,9 @@ kbd { font: 11px/1.35 var(--mono); color: var(--muted); padding: 1px 5px; backgr
 .breadcrumbs .file-icon svg { color: inherit; }
 .editor-stage { position: relative; flex: 1; min-height: 0; min-width: 0; }
 #editor { position: absolute; inset: 0; user-select: text; }
+#editor.has-gutter-selection .line-numbers.active-line-number:not(.gutter-selected-number) { color: var(--vscode-editorLineNumber-foreground); }
+#editor.has-gutter-selection .line-numbers.gutter-selected-number { color: var(--vscode-editorLineNumber-activeForeground); }
+#editor.has-gutter-selection .margin-view-overlays .current-line-margin { background: transparent; border-color: transparent; }
 #editor .glyph-margin { cursor: pointer; }
 #editor .debug-breakpoint::after { content: ""; position: absolute; width: 10px; height: 10px; top: 50%; left: 50%; transform: translate(-50%, -50%); border: 2px solid var(--danger); border-radius: 50%; }
 #editor .debug-breakpoint.verified::after { background: var(--danger); }

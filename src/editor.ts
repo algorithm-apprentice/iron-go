@@ -72,6 +72,7 @@ export class Documents {
       wordBasedSuggestions: "off", suggest: { showWords: false },
       stickyScroll: { enabled: false },
     });
+    this.bindGutterSelection();
     monaco.editor.registerEditorOpener({
       openCodeEditor: async (_source, uri, selection) => {
         const path = this.relative(uri);
@@ -79,6 +80,43 @@ export class Documents {
         return !!await this.open(path, { focus: true, target: selection });
       },
     });
+  }
+
+  private bindGutterSelection() {
+    const numbers = this.editor.createDecorationsCollection();
+    let fromGutter = false;
+    const clear = () => {
+      fromGutter = false;
+      numbers.clear();
+      this.element.classList.remove("has-gutter-selection");
+    };
+    const update = () => {
+      const selections = this.editor.getSelections();
+      const selection = selections?.[0];
+      if (selections?.length !== 1 || !selection || selection.isEmpty()) { clear(); return; }
+      // The forward caret may sit at column 1 of the following row; the
+      // newline belongs to the selection, but that following row does not.
+      const end = selection.endColumn === 1 && selection.endLineNumber > selection.startLineNumber
+        ? selection.endLineNumber - 1 : selection.endLineNumber;
+      numbers.set([{
+        range: new monaco.Range(selection.startLineNumber, 1, end, 1),
+        options: { lineNumberClassName: "gutter-selected-number" },
+      }]);
+      this.element.classList.add("has-gutter-selection");
+    };
+    // Monaco has already performed its normal whole-line selection when it
+    // emits this event. Only change the gutter decoration, not the selection.
+    this.editor.onMouseDown(event => {
+      if (event.target.type === monaco.editor.MouseTargetType.GUTTER_LINE_NUMBERS && event.event.leftButton && !event.event.ctrlKey) {
+        fromGutter = true;
+        update();
+      } else if (fromGutter) clear();
+    });
+    this.editor.onDidChangeCursorSelection(event => {
+      if (!fromGutter) return;
+      if (event.source === "mouse") update(); else clear();
+    });
+    this.editor.onDidChangeModel(clear);
   }
 
   layout() {

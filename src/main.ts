@@ -871,13 +871,21 @@ if (import.meta.env.VITE_IRON_E2E === "1") {
       markers: docs.active ? monaco.editor.getModelMarkers({ resource: docs.active.model.uri }) : [], gopls,
       editor: { width: docs.editor.getLayoutInfo().width, height: docs.editor.getLayoutInfo().height, scrollTop: docs.editor.getScrollTop(), contentHeight: docs.editor.getContentHeight(), runtimeErrors } }),
     replace: (value: string) => { if (docs.active) replaceBuffer(docs.active.model, value); },
-    gutterTrace: () => {
+    gutterTrace: (inspect: number[] = []) => {
       const selection = docs.editor.getSelection();
+      const rows = [...document.querySelectorAll<HTMLElement>("#editor .line-numbers")];
+      const selected = rows.filter(row => row.classList.contains("gutter-selected-number"));
+      const caret = rows.filter(row => row.classList.contains("active-line-number"));
       return {
         hit: gutterHit, selectionSource,
         caret: docs.editor.getPosition(),
         selection: selection && { start: selection.getStartPosition(), end: selection.getEndPosition(), empty: selection.isEmpty() },
-        highlightedNumbers: [...document.querySelectorAll("#editor .line-numbers.active-line-number")].map(row => row.textContent?.trim()),
+        caretNumbers: caret.map(row => row.textContent?.trim()),
+        highlightedNumbers: (selected.length ? selected : caret).map(row => row.textContent?.trim()).filter(Boolean),
+        numberColors: Object.fromEntries(rows.flatMap(row => {
+          const number = row.textContent?.trim();
+          return number && inspect.includes(Number(number)) ? [[number, getComputedStyle(row).color]] : [];
+        })),
       };
     },
     refreshView: () => docs.refreshView(),

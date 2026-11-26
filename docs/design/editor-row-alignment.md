@@ -44,4 +44,17 @@ The probe reproduced the reported click: row delta `0`, mouse target
 `GUTTER_LINE_NUMBERS` at line 28, selection `28:1` through `29:1`, caret at
 `29:1`, highlighted number `29`. Monaco's whole-line selection includes
 the newline and its active-number styling follows the caret, not the mouse
-target. The probe does not change this behavior.
+target.
+
+Keep Monaco's whole-line selection and caret behavior (including newline,
+copy, and drag). While that selection originates in the number column, show
+the selected model rows in the gutter instead of the active endpoint. Clear
+the override when the user moves the caret normally, clicks in the editor,
+or changes files. Verify a native click on line 28 still selects `28:1` to
+`29:1` but visually highlights only `28`; a subsequent caret move to 29 must
+restore the normal gutter highlight and colors.
+
+Verified in both the native Orbit suite and the Raft probe: the selected
+row uses the normal active foreground; the caret's following row retains
+the inactive foreground until the selection is cleared. The caret endpoint
+and zero-pixel vertical alignment are unchanged.

@@ -145,7 +145,7 @@ async function traceGutterClick(line) {
   const trace = await js(`
     const line = arguments[0];
     window.__ironTest.revealLine(line);
-    const before = window.__ironTest.gutterTrace();
+    const before = window.__ironTest.gutterTrace([line, line + 1]);
     const number = [...document.querySelectorAll('#editor .line-numbers')].find(row => row.textContent.trim() === String(line));
     if (!number) return { before, error: 'gutter number is not visible' };
     const bounds = number.getBoundingClientRect();
@@ -156,13 +156,23 @@ async function traceGutterClick(line) {
     number.dispatchEvent(new MouseEvent('mousedown', { ...options, buttons:1 }));
     number.dispatchEvent(new MouseEvent('mouseup', { ...options, buttons:0 }));
     window.__ironTest.refreshView();
-    return { requestedLine:line, rowDelta, before, after:window.__ironTest.gutterTrace() };
+    const after = window.__ironTest.gutterTrace([line, line + 1]);
+    window.__ironTest.revealLine(line + 1);
+    const moved = window.__ironTest.gutterTrace([line, line + 1]);
+    return { requestedLine:line, rowDelta, before, after, moved };
   `, line);
   await writeFile(path.join(artifacts, "gutter-click.json"), JSON.stringify(trace, null, 2));
-  console.log(JSON.stringify(trace, null, 2));
+  if (values["gutter-line"] || values["trace-editor"]) console.log(JSON.stringify(trace, null, 2));
   assert.equal(trace.after?.hit?.type, "GUTTER_LINE_NUMBERS", "the diagnostic must use the number column, not the breakpoint gutter");
   assert.equal(trace.after.hit.line, line, "Monaco should hit the number clicked");
   assert.ok(trace.rowDelta <= 1, "gutter and code geometry should align before the click");
+  assert.deepEqual(trace.after.selection, { start: { lineNumber: line, column: 1 }, end: { lineNumber: line + 1, column: 1 }, empty: false });
+  assert.deepEqual(trace.after.caret, { lineNumber: line + 1, column: 1 }, "keep Monaco's whole-line selection endpoint");
+  assert.deepEqual(trace.after.highlightedNumbers, [String(line)]);
+  assert.equal(trace.after.numberColors[line], trace.before.numberColors[line], "selected number uses the active foreground");
+  assert.equal(trace.after.numberColors[line + 1], trace.before.numberColors[line + 1], "selection endpoint number uses the normal foreground");
+  assert.deepEqual(trace.moved.highlightedNumbers, [String(line + 1)], "normal caret moves restore the active number");
+  assert.ok(trace.moved.selection.empty);
 }
 
 async function record(name, run) {
@@ -501,6 +511,7 @@ async function standardWorkbenchSmoke() {
       const result = await eventually("test completed from CodeLens", output, value => /PASS: TestSummary[\s\S]*exit code 0/.test(value));
       assert.doesNotMatch(result, /PASS: TestAnother/);
     });
+    await record("whole-line selection highlights the selected number, not its endpoint", () => traceGutterClick(9));
     if (values["require-delve"]) {
       await record("Delve pauses at a real editor breakpoint and continues the test", async () => {
         await placeBreakpoint(9);
