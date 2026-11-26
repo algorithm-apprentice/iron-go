@@ -35,6 +35,8 @@ The optional `--test-file` checks gopls actions for the requested test file.
 This mode opens the committed `HEAD` snapshot in a temporary directory,
 runs the module's actual tests, and reuses the host Go toolchain caches. It
 can download the Go SDK or dependencies specified by the selected project.
+It also honors an explicit `GOTOOLCHAIN` for testing against a matching SDK
+while the project's suggested version is unavailable.
 
 On headless UI failure, inspect `test-results/ui/<case>/browser.log`,
 `workbench.png`, and open `trace.zip` with `npx playwright show-trace`.

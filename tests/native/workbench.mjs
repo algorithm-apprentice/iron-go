@@ -129,7 +129,8 @@ try {
     await cp(path.join(root, "tests/fixtures/orbit"), fixture, { recursive: true });
   }
   await mkdir(home);
-  const goTestEnv = { ...process.env, GOTOOLCHAIN: values.project ? "auto" : "local", GOENV: "off", GOWORK: "off", GOFLAGS: "" };
+  const toolchain = values.project ? process.env.GOTOOLCHAIN || "auto" : "local";
+  const goTestEnv = { ...process.env, GOTOOLCHAIN: toolchain, GOENV: "off", GOWORK: "off", GOFLAGS: "" };
   if (values.project) {
     const cache = execFileSync("go", ["env", "GOMODCACHE", "GOCACHE"], { encoding: "utf8", env: { ...goTestEnv, GOTOOLCHAIN: "local" } }).trimEnd().split("\n");
     [goTestEnv.GOMODCACHE, goTestEnv.GOCACHE] = cache;
