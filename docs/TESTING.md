@@ -50,5 +50,9 @@ GitHub Actions runs the full feedback loop for pushes to `main` and pull
 requests on a macOS runner and attaches available diagnostics to the run.
 The optional picker smoke runs locally after `npm run tauri build -- --bundles app`;
 its disposable process is independent of any currently open Iron Go window.
+For a mixed-DPI setup, use `npm run test:picker -- --retina-probe` to put the
+disposable editor on a Retina display and report the picker screen and capture
+dimensions. Bitmap measurement requires Screen Recording permission; it
+captures only the disposable app's picker and does not retain the image.
 
 See [ADR 0002](adr/0002-test-feedback-loop.md) and [the acceptance design](design/test-feedback-loop.md).

@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import CoreGraphics
 import Foundation
 
 struct Failure: LocalizedError {
@@ -45,6 +46,42 @@ func frame(_ element: AXUIElement) -> CGRect? {
     return CGRect(origin: origin, size: dimensions)
 }
 
+func screenFrame(_ screen: NSScreen) -> CGRect {
+    let top = NSScreen.screens.first?.frame.maxY ?? 0
+    return CGRect(x: screen.frame.minX, y: top - screen.frame.maxY, width: screen.frame.width, height: screen.frame.height)
+}
+
+func scale(at rectangle: CGRect) -> CGFloat? {
+    NSScreen.screens.first { screenFrame($0).contains(CGPoint(x: rectangle.midX, y: rectangle.midY)) }?.backingScaleFactor
+}
+
+func reportPickerRaster(_ rectangle: CGRect, owner: pid_t, directory: URL) {
+    guard CGPreflightScreenCaptureAccess() else {
+        print("Picker bitmap probe skipped: Screen Recording permission is unavailable")
+        return
+    }
+    let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
+    let matching = windows.first { item in
+        guard item[kCGWindowOwnerPID as String] as? Int32 == owner,
+              let details = item[kCGWindowBounds as String] as? NSDictionary,
+              let bounds = CGRect(dictionaryRepresentation: details as CFDictionary) else { return false }
+        return abs(rectangle.minX - bounds.minX) <= 2 && abs(rectangle.minY - bounds.minY) <= 2
+            && abs(rectangle.width - bounds.width) <= 2 && abs(rectangle.height - bounds.height) <= 2
+    }
+    guard let window = matching?[kCGWindowNumber as String] as? Int else {
+        print("Picker bitmap probe skipped: no matching on-screen window")
+        return
+    }
+    let image = directory.appendingPathComponent("picker-probe.png")
+    let capture = Process()
+    capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    capture.arguments = ["-x", "-o", "-l", String(window), "-t", "png", image.path]
+    guard (try? capture.run()) != nil else { return }
+    capture.waitUntilExit()
+    guard capture.terminationStatus == 0, let data = try? Data(contentsOf: image), let bitmap = NSBitmapImageRep(data: data) else { return }
+    print("Picker screenshot: \(bitmap.pixelsWide) × \(bitmap.pixelsHigh) pixels for \(rectangle.width) × \(rectangle.height) points")
+}
+
 func verifyTitleBar(_ window: AXUIElement) throws {
     var measured = "Accessibility frames are unavailable"
     do { _ = try eventually("Native title bar geometry is not centered or overlaps window controls") { () -> Bool? in
@@ -75,7 +112,9 @@ func checkPicker() throws {
     try FileManager.default.createDirectory(at: home, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: home) }
     let child = Process()
-    let executable = CommandLine.arguments.dropFirst().first ?? "src-tauri/target/release/bundle/macos/Iron Go.app/Contents/MacOS/iron-go"
+    let args = CommandLine.arguments.dropFirst()
+    let retinaProbe = args.contains("--retina-probe")
+    let executable = args.first { !$0.hasPrefix("--") } ?? "src-tauri/target/release/bundle/macos/Iron Go.app/Contents/MacOS/iron-go"
     child.executableURL = URL(fileURLWithPath: executable)
     child.currentDirectoryURL = home
     child.environment = ProcessInfo.processInfo.environment.merging(["HOME": home.path, "CFFIXED_USER_HOME": home.path]) { _, new in new }
@@ -99,6 +138,18 @@ func checkPicker() throws {
         try verifyTitleBar(window)
     }
     print("PASS: native title bar stays centered at default and minimum widths")
+    if retinaProbe, let retina = NSScreen.screens.first(where: { $0.backingScaleFactor > 1 }) {
+        let screen = screenFrame(retina)
+        var target = CGPoint(x: screen.minX + 30, y: screen.minY + 45)
+        var dimensions = CGSize(width: min(950, screen.width - 80), height: min(620, screen.height - 100))
+        if let position = AXValueCreate(.cgPoint, &target), let size = AXValueCreate(.cgSize, &dimensions) {
+            AXUIElementSetAttributeValue(window, "AXSize" as CFString, size)
+            AXUIElementSetAttributeValue(window, "AXPosition" as CFString, position)
+        }
+        _ = try eventually("Could not move the disposable app to a Retina display") {
+            frame(window).flatMap { scale(at: $0) == retina.backingScaleFactor ? $0 : nil }
+        }
+    }
     let open = try eventually("Open Project control did not appear") {
         button(["Open Project", "Open Folder", "Open Folder (⌘O)"], in: app)
     }
@@ -113,6 +164,12 @@ func checkPicker() throws {
         }
         guard windows.count >= 2, let focused: AXUIElement = attribute(app, "AXFocusedWindow") else { return nil }
         return button(["Cancel"], in: focused)
+    }
+    let focused: AXUIElement? = attribute(app, "AXFocusedWindow")
+    if retinaProbe, let openerFrame = frame(window), let panelFrame = focused.flatMap(frame) {
+        print("Opener: \(openerFrame), scale \(scale(at: openerFrame).map(String.init(describing:)) ?? "unknown")")
+        print("Picker: \(panelFrame), scale \(scale(at: panelFrame).map(String.init(describing:)) ?? "unknown")")
+        reportPickerRaster(panelFrame, owner: child.processIdentifier, directory: home)
     }
     guard AXUIElementPerformAction(cancel, kAXPressAction as CFString) == .success else {
         throw Failure(message: "The standalone picker could not be cancelled")
