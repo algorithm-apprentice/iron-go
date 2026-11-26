@@ -20,6 +20,7 @@ transparent. Use the same image in the workbench, favicon, and app bundle.
 When replacing it, generate macOS assets with
 `npm run tauri icon -- assets/icon.png --output <temporary-directory>` and
 copy the generated `icon.icns` and `icon.png` into `src-tauri/icons/`. Copy
-the 64×64 and 128×128 variants to `assets/icon-64.png` and
-`assets/icon-128.png` for the workbench.
+the 64×64 variant to `assets/icon-64.png` for the favicon and the 128×128
+variant to `assets/icon-128.png` for the welcome screen. Do not duplicate
+the Dock icon in the native title bar.
 Inspect the alpha edges and verify the built bundle's icon resource.

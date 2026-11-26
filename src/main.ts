@@ -8,7 +8,7 @@ import { GoLanguage, runTestCommand, type LanguageState } from "./lsp";
 import { packageForFile, RunTargets } from "./run-targets";
 import { bindColorTheme, chooseColorTheme } from "./theme";
 import { basename, dirname, initialWorkspaceFile, makeTree, quickFiles, validateRelative, type FileMatch, type ProjectSnapshot, type TreeNode } from "./project-model";
-import { desktop, host, importedProject, nativeProject, sampleProject, type Project, type TaskKind, type ToolStatus } from "./workspace";
+import { desktop, host, importedProject, nativeProject, welcomeProject, type Project, type TaskKind, type ToolStatus } from "./workspace";
 
 type View = "explorer" | "search" | "tasks";
 
@@ -27,7 +27,7 @@ const runTargets = new RunTargets(focus => {
   focus.focus();
 });
 
-let project = sampleProject();
+let project = welcomeProject();
 let snapshot: ProjectSnapshot = { entries: [], truncated: false, module: null, goWork: false };
 let tree: TreeNode[] = [];
 let opened = new Set<string>();
@@ -66,12 +66,17 @@ function showError(error: unknown) { toast(message(error), true); }
 
 function renderExplorer() {
   const explorer = byId("explorer");
+  byId("module-card").hidden = !!project.welcome;
+  if (project.welcome) {
+    explorer.replaceChildren(element("p", "view-note tree-note", "No project open."));
+    return;
+  }
   const root = element("button", "explorer-root");
   root.innerHTML = `<span class="tree-twist">${icon(rootExpanded ? "down" : "chevron")}</span>`;
   root.append(element("strong", "", project.name));
-  root.title = project.native?.path ?? `${project.name} · ${project.sample ? "sample workspace" : "browser import"}`;
+  root.title = project.native?.path ?? `${project.name} · browser import`;
   root.setAttribute("aria-expanded", String(rootExpanded));
-  if (!project.native) root.append(element("span", "root-tag", project.sample ? "SAMPLE" : "COPY"));
+  if (!project.native) root.append(element("span", "root-tag", "COPY"));
   root.addEventListener("click", () => {
     rootExpanded = !rootExpanded;
     renderExplorer();
@@ -183,7 +188,9 @@ function renderDocuments() {
     renderedActive = active?.path;
     renderExplorer();
   }
-  byId("empty-editor").hidden = !!active;
+  byId("project-welcome").hidden = !project.welcome;
+  byId("editor-toolbar").hidden = !!project.welcome;
+  byId("empty-editor").hidden = !!active || !!project.welcome;
   byId("breadcrumbs").hidden = !active;
   updateCursor();
   syncControls();
@@ -202,10 +209,12 @@ function syncControls() {
   btn("format").disabled = !active?.path.endsWith(".go") || formatting || busy;
   btn("save").disabled = !active || active.saving || busy;
   btn("open-folder").disabled = busy || docs.saving;
-  btn("new-file").disabled = busy;
-  btn("refresh-files").disabled = busy;
+  btn("welcome-open").disabled = busy;
+  btn("welcome-new").disabled = busy;
+  btn("new-file").disabled = busy || !!project.welcome;
+  btn("refresh-files").disabled = busy || !!project.welcome;
   const run = btn("run");
-  run.disabled = busy || stopPending;
+  run.disabled = busy || stopPending || !!project.welcome;
   run.dataset.running = String(!!task);
   run.innerHTML = `${icon(task ? "stop" : "play")}<span>${task ? "Stop" : "Run"}</span>`;
   run.title = task ? "Stop Go Task" : "Run Go Package (⌘↵)";
@@ -213,7 +222,7 @@ function syncControls() {
   btn("panel-stop").disabled = stopPending;
   btn("stop-task").disabled = !task || stopPending;
   runTargets.setDisabled(busy, !!task);
-  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-task]")) button.disabled = !!task || busy;
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-task]")) button.disabled = !!task || busy || !!project.welcome;
 }
 
 function renderProblems() {
@@ -311,44 +320,37 @@ async function install(target: Project) {
   rootExpanded = true;
   docs.reset(target);
   byId("status-project").textContent = target.name;
-  byId("quick-label").textContent = `Search files in ${target.name}`;
+  byId("quick-label").textContent = target.welcome ? "Search commands" : `Search files in ${target.name}`;
+  const commandName = target.welcome ? "Search commands" : "Go to File";
+  btn("quick-open").title = `${commandName} (⌘P)`;
+  btn("quick-open").setAttribute("aria-label", commandName);
   feedback.clear();
-  feedback.show("output");
+  if (target.welcome) feedback.toggle(false); else feedback.show("output");
   chooseView("explorer", false);
   status("Opening workspace…");
   try { await refresh(); }
   catch (error) { showError(error); }
   if (target !== project) return;
-  const files = snapshot.entries.filter(entry => !entry.directory).map(entry => entry.path);
   const initial = initialWorkspaceFile(snapshot.entries);
-  if (target.sample) {
-    if (files.includes("go.mod")) await docs.open("go.mod", { activate: false });
-    if (files.includes("README.md")) await docs.open("README.md", { activate: false });
-    for (const folder of ["cmd", "cmd/orbit", "internal", "internal/status"]) opened.add(folder);
-  }
   if (initial) {
     try { await docs.open(initial); revealParents(initial); }
     catch (error) { showError(error); }
   }
   if (target !== project) return;
   renderExplorer();
-  if (target.sample) {
-    feedback.row("Iron Go · Orbit sample ready", "success", "check");
-    feedback.row("Explore the editor and search, or open a Go module to work on your own code.");
-    feedback.row(desktop ? "Open examples/orbit from the repository to build and run this sample." : "Browser preview · Local Go tasks are available in the macOS app.", "quiet", "info");
-  } else {
-    feedback.row(`Workspace opened: ${target.name}`, "success", "check");
+  if (!target.welcome) {
+    feedback.row(`Project opened: ${target.name}`, "success", "check");
     feedback.row(target.native ? target.native.path : "Imported as a copy. Edits stay in memory and do not write to disk.", "quiet", "info");
   }
-  status(target.sample ? "Sample workspace" : target.native ? "Ready" : "Browser copy");
+  status(target.welcome ? "Open or create a project" : target.native ? "Ready" : "Browser copy");
   updateTools();
   maybeStartLsp();
 }
 
 function canSwitch() {
   if (busy || docs.saving) return false;
-  return (!docs.dirty || window.confirm("Discard unsaved edits and switch workspaces?")) &&
-    (!task || window.confirm("Stop the current Go task and switch workspaces?"));
+  return (!docs.dirty || window.confirm("Discard unsaved edits before leaving this project?")) &&
+    (!task || window.confirm("Stop the current Go task before leaving this project?"));
 }
 
 async function openFolder() {
@@ -363,23 +365,23 @@ async function openFolder() {
   finally { busy = false; syncControls(); }
 }
 
-async function openSample() {
-  if (!canSwitch()) return;
+async function closeProject() {
+  if (project.welcome || !canSwitch()) return;
   busy = true;
   syncControls();
   try {
     if (project.native) await host.close(project.native.id);
-    await install(sampleProject());
+    await install(welcomeProject());
   } catch (error) { showError(error); }
   finally { busy = false; syncControls(); }
 }
 
 function newModule() {
-  if (!desktop) { toast("Creating a Go module on disk requires the macOS desktop app."); return; }
+  if (!desktop) { toast("Creating a Go project on disk requires the macOS desktop app."); return; }
   forms.show({
-    title: "New Go Module", description: "Choose a name and a module path. Iron Go will create a folder, go.mod, and main.go.", submit: "Choose Parent Folder…",
+    title: "New Project", description: "Create a Go module with a starter main.go. Choose your project name and module path.", submit: "Choose Location…",
     fields: [
-      { name: "name", label: "Folder name", value: "hello-go", maxLength: 80 },
+      { name: "name", label: "Project name", value: "hello-go", maxLength: 80 },
       { name: "module", label: "Go module path", value: "example.com/hello-go", maxLength: 240 },
     ],
     async run({ name, module }) {
@@ -396,7 +398,7 @@ function newModule() {
 }
 
 function newFile() {
-  if (busy) return;
+  if (busy || project.welcome) return;
   const target = project;
   forms.show({
     title: "New File", description: `Create a file inside ${project.name}. Include a folder prefix to create missing folders.`,
@@ -475,7 +477,7 @@ async function runTask(kind: TaskKind, singleTest?: { path: string; name: string
   if (task || busy || docs.saving) return;
   const target = project.native;
   if (!target) {
-    toast(desktop ? "Open a local Go folder before running a task." : "Run, build and test are available in the macOS desktop app.");
+    toast(desktop ? "Open or create a Go project first." : "Run, build and test are available in the macOS desktop app.");
     return;
   }
   if (!tools?.goVersion) { toast("Install Go, then check the toolchain in Settings.", true); return; }
@@ -536,7 +538,7 @@ function updateTools() {
   toolStatus.title = detail;
   toolStatus.classList.toggle("good", !!version);
   toolStatus.classList.toggle("warn", desktop && !!tools && !version);
-  byId("tools-info").textContent = project.native ? detail : desktop ? "Open a local Go folder to run tasks." : detail;
+  byId("tools-info").textContent = project.native ? detail : desktop ? "Open or create a Go project to run code." : detail;
   byId("settings-tools-info").textContent = detail + (desktop && tools && !tools.gopls ? " Install with: go install golang.org/x/tools/gopls@latest" : "");
   btn("probe-tools").hidden = !desktop;
 }
@@ -577,11 +579,11 @@ function showSettings() { byId<HTMLDialogElement>("settings-dialog").showModal()
 
 function showPalette(command = false, workspaceOnly = false) {
   const actions: { label: string; detail?: string; icon: Icon; run(): void; workspace?: boolean }[] = [
-    { label: "Open Folder…", detail: "⌘O", icon: "folderOpen", run: openFolder, workspace: true },
-    { label: "New Go Module…", icon: "package", run: newModule, workspace: true },
+    { label: "Open Project…", detail: "⌘O", icon: "folderOpen", run: openFolder, workspace: true },
+    { label: "New Project…", icon: "package", run: newModule, workspace: true },
+    { label: "Close Project", icon: "close", run: closeProject, workspace: true },
     { label: "New File…", icon: "filePlus", run: newFile, workspace: true },
-    { label: "Open Orbit Sample", icon: "package", run: openSample, workspace: true },
-    { label: "Refresh Explorer", icon: "refresh", run: () => { void refresh().catch(showError); }, workspace: true },
+    { label: "Refresh Project", icon: "refresh", run: () => { void refresh().catch(showError); }, workspace: true },
     { label: "Collapse Folders", icon: "folder", run: () => { opened.clear(); renderExplorer(); }, workspace: true },
     { label: "Search Saved Files", detail: "⇧⌘F", icon: "search", run: () => chooseView("search") },
     { label: "Save File", detail: "⌘S", icon: "save", run: saveActive },
@@ -599,7 +601,7 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Color Theme: Light", icon: "settings", run: () => chooseColorTheme("light") },
   ];
   const paths = snapshot.entries.filter(entry => !entry.directory).map(entry => entry.path);
-  palette.show(workspaceOnly ? "Workspace actions" : command ? "Type a command" : "Type a path to go to a file", query => {
+  palette.show(workspaceOnly ? "Project actions" : command ? "Type a command" : "Type a path to go to a file", query => {
     if (workspaceOnly || query.startsWith(">")) {
       const words = query.replace(/^>/, "").toLowerCase().trim().split(/\s+/);
       return actions.filter(action => (!workspaceOnly || action.workspace) && words.every(word => action.label.toLowerCase().includes(word)));
@@ -664,10 +666,12 @@ function bindSettings() {
 
 for (const button of document.querySelectorAll<HTMLButtonElement>("[data-view]")) button.addEventListener("click", () => chooseView(button.dataset.view as View));
 for (const button of document.querySelectorAll<HTMLButtonElement>("[data-task]")) button.addEventListener("click", () => { void runTask(button.dataset.task as TaskKind); });
-byId("quick-open").addEventListener("click", () => showPalette());
+byId("quick-open").addEventListener("click", () => showPalette(!!project.welcome));
 byId("empty-quick-open").addEventListener("click", () => showPalette());
 byId("workspace-actions").addEventListener("click", () => showPalette(false, true));
 byId("open-folder").addEventListener("click", openFolder);
+byId("welcome-open").addEventListener("click", openFolder);
+byId("welcome-new").addEventListener("click", newModule);
 byId("toggle-sidebar").addEventListener("click", toggleSidebar);
 byId("new-file").addEventListener("click", newFile);
 byId("refresh-files").addEventListener("click", () => { void refresh().catch(showError); void runTargets.refresh(); });
@@ -703,7 +707,7 @@ document.addEventListener("keydown", event => {
   const cmd = event.metaKey || (!desktop && event.ctrlKey);
   let apply: (() => unknown) | undefined;
   if (cmd && !event.altKey) {
-    if (key === "p") apply = () => showPalette(event.shiftKey);
+    if (key === "p") apply = () => showPalette(event.shiftKey || !!project.welcome);
     if (key === "o") apply = openFolder;
     if (key === "s") apply = saveActive;
     if (key === "f" && event.shiftKey) apply = () => chooseView("search");

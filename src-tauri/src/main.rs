@@ -6,7 +6,6 @@ mod workspace;
 
 use std::{path::PathBuf, sync::Mutex};
 use tauri::{Manager, State};
-use tauri_plugin_dialog::DialogExt;
 use workspace::Workspace;
 
 type CommandResult<T> = Result<T, String>;
@@ -53,20 +52,11 @@ async fn blocking<T: Send + 'static>(
         .map_err(|error| error.to_string())?
 }
 
-async fn pick_folder(app: &tauri::AppHandle, title: &str) -> CommandResult<Option<PathBuf>> {
-    let (send, receive) = tokio::sync::oneshot::channel();
-    let mut dialog = app.dialog().file().set_title(title);
-    if let Some(window) = app.get_webview_window("main") {
-        dialog = dialog.set_parent(&window);
-    }
-    dialog.pick_folder(move |path| {
-        let _ = send.send(path);
-    });
-    receive
-        .await
-        .map_err(|error| error.to_string())?
-        .map(|path| path.into_path().map_err(|error| error.to_string()))
-        .transpose()
+async fn pick_folder(title: &'static str) -> CommandResult<Option<PathBuf>> {
+    // On macOS RFD's async picker automatically attaches a sheet to the
+    // main window, even without an explicit parent. The synchronous picker
+    // presents an independent NSOpenPanel; RFD dispatches it to AppKit.
+    blocking(move || Ok(rfd::FileDialog::new().set_title(title).pick_folder())).await
 }
 
 fn install_workspace(state: &Core, mut workspace: Workspace) -> workspace::WorkspaceInfo {
@@ -79,17 +69,14 @@ fn install_workspace(state: &Core, mut workspace: Workspace) -> workspace::Works
 }
 
 #[tauri::command]
-async fn open_workspace(
-    app: tauri::AppHandle,
-    state: State<'_, Core>,
-) -> CommandResult<Option<workspace::WorkspaceInfo>> {
+async fn open_workspace(state: State<'_, Core>) -> CommandResult<Option<workspace::WorkspaceInfo>> {
     #[cfg(feature = "e2e")]
     let fixture = std::env::var_os("IRON_GO_E2E_WORKSPACE").map(PathBuf::from);
     #[cfg(not(feature = "e2e"))]
     let fixture = None;
     let selection = match fixture {
         Some(path) => Some(path),
-        None => pick_folder(&app, "Open Go Workspace").await?,
+        None => pick_folder("Open Project").await?,
     };
     let Some(root) = selection else {
         return Ok(None);
@@ -100,13 +87,12 @@ async fn open_workspace(
 
 #[tauri::command]
 async fn new_module(
-    app: tauri::AppHandle,
     state: State<'_, Core>,
     name: String,
     module: String,
 ) -> CommandResult<Option<workspace::WorkspaceInfo>> {
     workspace::validate_module(&name, &module)?;
-    let Some(parent) = pick_folder(&app, "Choose a Parent Folder for the New Module").await? else {
+    let Some(parent) = pick_folder("Choose a Location for the New Go Project").await? else {
         return Ok(None);
     };
     let workspace = blocking(move || workspace::create_module(&parent, &name, &module)).await?;
@@ -140,7 +126,6 @@ fn main() {
     };
 
     builder
-        .plugin(tauri_plugin_dialog::init())
         .manage(Core::default())
         .invoke_handler(tauri::generate_handler![
             open_workspace,

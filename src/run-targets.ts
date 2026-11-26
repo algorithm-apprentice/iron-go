@@ -75,7 +75,7 @@ export class RunTargets {
     };
     this.picker.replaceChildren();
     if (!available) {
-      append("", this.project?.sample ? "orbit (sample)" : "No local target");
+      append("", "No local target");
     } else {
       append("", targets.length ? "Choose a run target…" : this.loading ? "Scanning packages…" : "No executable package");
       const labels = targets.map(target => basename(target.importPath) || target.package);

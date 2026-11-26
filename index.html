@@ -9,22 +9,20 @@
   <body>
     <div id="workbench" class="workbench">
       <header class="titlebar" data-tauri-drag-region>
-        <div class="brand" data-tauri-drag-region>
-          <img src="/assets/icon-64.png" alt="" width="29" height="29" data-tauri-drag-region />
-          <span data-tauri-drag-region>Iron<span class="brand-go">Go</span></span>
-        </div>
-        <button id="quick-open" class="command-center" title="Go to File (⌘P)">
+        <div class="titlebar-spacer" aria-hidden="true" data-tauri-drag-region></div>
+        <button id="quick-open" class="command-center" title="Search commands (⌘P)" aria-label="Search commands">
           <span data-icon="search"></span><span id="quick-label">Search files</span><kbd>⌘ P</kbd>
         </button>
         <div class="title-actions">
-          <button id="open-folder" class="button quiet" title="Open Folder (⌘O)"><span data-icon="folderOpen"></span><span class="action-label">Open Folder</span></button>
-          <button id="toggle-sidebar" class="icon-button sidebar-toggle" title="Toggle Side Bar (⌘B)" aria-label="Toggle Side Bar" aria-pressed="true" data-icon="sidebar"></button>
+          <button id="open-folder" class="icon-button" title="Open Project (⌘O)" aria-label="Open Project" data-icon="folderOpen"></button>
+          <button id="toggle-sidebar" class="icon-button" title="Toggle Side Bar (⌘B)" aria-label="Toggle Side Bar" aria-pressed="true" data-icon="sidebar"></button>
+          <button id="toggle-panel" class="icon-button" title="Toggle Bottom Panel (⌘J)" aria-label="Toggle Bottom Panel" aria-pressed="true" data-icon="layout"></button>
         </div>
       </header>
 
       <main class="workspace">
         <nav class="activity-bar" aria-label="Workbench views">
-          <button class="activity active" data-view="explorer" title="Explorer (⇧⌘E)" aria-label="Explorer" aria-pressed="true" data-icon="files"></button>
+          <button class="activity active" data-view="explorer" title="Project (⇧⌘E)" aria-label="Project" aria-pressed="true" data-icon="files"></button>
           <button class="activity" data-view="search" title="Search (⇧⌘F)" aria-label="Search" aria-pressed="false" data-icon="search"></button>
           <button class="activity" data-view="tasks" title="Run and Test" aria-label="Run and Test" aria-pressed="false" data-icon="terminal"></button>
           <div class="spacer"></div>
@@ -33,17 +31,17 @@
         <aside id="sidebar" class="sidebar" aria-label="Primary side bar">
           <div id="explorer-view" class="side-view">
             <header class="side-header">
-              <h1>Explorer</h1>
+              <h1>Project</h1>
               <div class="inline-actions">
                 <button id="new-file" class="icon-button" title="New File" aria-label="New File" data-icon="filePlus"></button>
-                <button id="refresh-files" class="icon-button" title="Refresh Explorer" aria-label="Refresh Explorer" data-icon="refresh"></button>
-                <button id="workspace-actions" class="icon-button" title="Workspace Actions" aria-label="Workspace Actions" data-icon="more"></button>
+                <button id="refresh-files" class="icon-button" title="Refresh Project" aria-label="Refresh Project" data-icon="refresh"></button>
+                <button id="workspace-actions" class="icon-button" title="Project Actions" aria-label="Project Actions" data-icon="more"></button>
               </div>
             </header>
             <div class="explorer" id="explorer"></div>
-            <div class="module-card">
+            <div class="module-card" id="module-card" hidden>
               <span class="module-icon" data-icon="package"></span>
-              <div class="module-label"><span id="module-kind" class="eyebrow">Go module</span><strong id="module-name">example.com/orbit</strong></div>
+              <div class="module-label"><span id="module-kind" class="eyebrow"></span><strong id="module-name"></strong></div>
             </div>
           </div>
           <div id="search-view" class="side-view" hidden>
@@ -89,19 +87,27 @@
         <div id="sidebar-resize" class="divider v-divider" role="separator" aria-label="Resize sidebar" aria-orientation="vertical"></div>
 
         <section class="editor-area" aria-label="Editor workbench">
-          <div class="tabs-line">
+          <div id="editor-toolbar" class="tabs-line" hidden>
             <div id="tabs" class="tabs" role="tablist" aria-label="Open editors"></div>
             <div class="editor-actions">
               <select id="run-target" class="text-field run-picker" aria-label="Run target" title="Go executable package"></select>
               <button id="run" class="button primary" title="Run Go Package (⌘↵)"><span data-icon="play"></span><span>Run</span></button>
               <button id="format" class="icon-button" title="Format Go File (⇧⌥F)" aria-label="Format Go File" data-icon="format"></button>
               <button id="save" class="icon-button" title="Save File (⌘S)" aria-label="Save File" data-icon="save"></button>
-              <button id="toggle-panel" class="icon-button" title="Toggle Bottom Panel (⌘J)" aria-label="Toggle Bottom Panel" aria-pressed="true" data-icon="layout"></button>
             </div>
           </div>
           <div id="breadcrumbs" class="breadcrumbs" aria-label="Current file path"></div>
           <div class="editor-stage">
             <div id="editor" aria-label="Code editor"></div>
+            <div id="project-welcome" class="empty-editor project-welcome" hidden>
+              <img src="/assets/icon-128.png" width="84" height="84" alt="" />
+              <h2>Welcome to Iron Go</h2>
+              <p>Start by opening or creating a Go project.</p>
+              <div class="welcome-actions">
+                <button id="welcome-open" class="button primary"><span data-icon="folderOpen"></span>Open Project</button>
+                <button id="welcome-new" class="button quiet"><span data-icon="filePlus"></span>New Project</button>
+              </div>
+            </div>
             <div id="empty-editor" class="empty-editor" hidden>
               <img src="/assets/icon-128.png" width="76" height="76" alt="" />
               <h2>Iron Go</h2>
@@ -132,7 +138,7 @@
       </main>
 
       <footer class="statusbar" aria-label="Workspace status">
-        <span class="status-context"><span data-icon="branch"></span><span id="status-project">orbit</span></span>
+        <span class="status-context"><span data-icon="branch"></span><span id="status-project">No Project</span></span>
         <button id="status-problems" class="status-button" title="Show Problems" aria-label="Show Problems">
           <span data-icon="error"></span><span id="error-count">0</span><span data-icon="warning"></span><span id="warning-count">0</span>
         </button>

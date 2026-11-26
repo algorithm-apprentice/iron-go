@@ -1,9 +1,4 @@
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
-import mainGo from "../examples/orbit/cmd/orbit/main.go?raw";
-import reportGo from "../examples/orbit/internal/status/report.go?raw";
-import reportTest from "../examples/orbit/internal/status/report_test.go?raw";
-import goMod from "../examples/orbit/go.mod?raw";
-import readme from "../examples/orbit/README.md?raw";
 import { MAX_FILES, MAX_TEXT_BYTES, scanText, validateRelative, type ProjectSnapshot, type SearchResult } from "./project-model";
 
 export const desktop = isTauri();
@@ -44,7 +39,7 @@ export const host = {
 export interface Project {
   readonly name: string;
   readonly native?: NativeFolder;
-  readonly sample?: boolean;
+  readonly welcome?: boolean;
   snapshot(): Promise<ProjectSnapshot>;
   read(path: string): Promise<string>;
   save(path: string, expected: string, text: string): Promise<void>;
@@ -64,6 +59,16 @@ export function nativeProject(native: NativeFolder): Project {
   };
 }
 
+export function welcomeProject(): Project {
+  const unavailable = async () => { throw new Error("Open a project first."); };
+  return {
+    name: "No Project", welcome: true,
+    snapshot: async () => ({ entries: [], truncated: false, module: null, goWork: false }),
+    read: unavailable, save: unavailable, createFile: unavailable,
+    search: async () => ({ matches: [], truncated: false }),
+  };
+}
+
 const encoder = new TextEncoder();
 function checkSize(text: string) {
   if (text.includes("\0") || encoder.encode(text).length > MAX_TEXT_BYTES) {
@@ -71,22 +76,8 @@ function checkSize(text: string) {
   }
 }
 
-function previewProject(
-  name: string, input: Map<string, string | File>, sample = false, importTruncated = false,
-): Project {
+function previewProject(name: string, input: Map<string, File>, importTruncated: boolean): Project {
   const edits = new Map<string, string>();
-  const key = "irongo.sample.v1";
-  if (sample) {
-    try {
-      const saved = JSON.parse(localStorage.getItem(key) ?? "{}");
-      for (const [path, content] of Object.entries(saved)) {
-        if (typeof content !== "string") continue;
-        validateRelative(path);
-        checkSize(content);
-        edits.set(path, content);
-      }
-    } catch { /* An unavailable or corrupt browser store should not block the sample. */ }
-  }
   const paths = () => [...new Set([...input.keys(), ...edits.keys()])].sort();
   const read = async (path: string) => {
     const value = edits.get(path) ?? input.get(path);
@@ -96,12 +87,8 @@ function previewProject(
     checkSize(text);
     return text;
   };
-  const persist = (path: string, text: string) => {
-    if (sample) localStorage.setItem(key, JSON.stringify(Object.fromEntries(new Map([...edits, [path, text]]))));
-    edits.set(path, text);
-  };
   return {
-    name, sample, read,
+    name, read,
     async snapshot() {
       const all = paths();
       const mod = await read("go.mod").catch(() => "");
@@ -115,7 +102,7 @@ function previewProject(
     async save(path, expected, text) {
       checkSize(text);
       if (await read(path) !== expected) throw new Error("The saved content changed. Reload the tab before saving.");
-      persist(path, text);
+      edits.set(path, text);
     },
     async createFile(path) {
       validateRelative(path);
@@ -123,7 +110,7 @@ function previewProject(
       if (all.some(existing => existing === path || existing.startsWith(`${path}/`) || path.startsWith(`${existing}/`))) {
         throw new Error("That path already exists or contains a file where a directory is needed.");
       }
-      persist(path, "");
+      edits.set(path, "");
     },
     async search(query, caseSensitive) {
       const matches: SearchResult["matches"] = [];
@@ -144,13 +131,6 @@ function previewProject(
   };
 }
 
-export function sampleProject() {
-  return previewProject("orbit", new Map([
-    ["cmd/orbit/main.go", mainGo], ["internal/status/report.go", reportGo],
-    ["internal/status/report_test.go", reportTest], ["go.mod", goMod], ["README.md", readme],
-  ]), true);
-}
-
 export function importedProject(files: FileList) {
   const name = files[0]?.webkitRelativePath.split("/")[0] ?? "Folder";
   const input = new Map<string, File>();
@@ -159,5 +139,5 @@ export function importedProject(files: FileList) {
     const path = file.webkitRelativePath.slice(name.length + 1);
     try { input.set(validateRelative(path), file); } catch { /* Excluded entry. */ }
   }
-  return previewProject(name, input, false, input.size >= MAX_FILES && files.length > input.size);
+  return previewProject(name, input, input.size >= MAX_FILES && files.length > input.size);
 }

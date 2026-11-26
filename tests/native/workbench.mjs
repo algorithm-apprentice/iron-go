@@ -87,7 +87,7 @@ async function processLogged(executable, args, logfile, env) {
 }
 
 try {
-  await cp(path.join(root, "examples/orbit"), fixture, { recursive: true });
+  await cp(path.join(root, "tests/fixtures/orbit"), fixture, { recursive: true });
   await mkdir(home);
   const goTestEnv = { ...process.env, GOTOOLCHAIN: "local", GOENV: "off", GOWORK: "off", GOFLAGS: "" };
   const configuredGoBin = execFileSync("go", ["env", "GOBIN", "GOPATH"], { encoding: "utf8" }).trimEnd().split("\n");
@@ -114,7 +114,7 @@ try {
 
   const source = path.join(fixture, "cmd/orbit/main.go");
   const original = await readFile(source, "utf8");
-  await record("native theme switches both the editor and workbench", async () => {
+  const checkTheme = () => record("native theme switches both the editor and workbench", async () => {
     await eventually("workbench boot", () => js("return !!window.__ironTest && document.body.classList.contains('desktop');"));
     await click("#settings");
     const selectTheme = value => js(`
@@ -136,6 +136,17 @@ try {
     await eventually("native VS Code Dark colors", colors, value => value?.join("/") === "rgb(18, 19, 20)/rgb(25, 26, 27)/rgb(25, 26, 27)");
     await click('[data-dialog-close="settings-dialog"]');
   });
+  await record("native welcome does not open or offer a bundled project", async () => {
+    await eventually("workbench boot", () => js("return !!window.__ironTest && document.body.classList.contains('desktop');"));
+    await eventually("project welcome", () => js("return document.querySelector('#project-welcome')?.hidden === false;"), Boolean, 5000);
+    assert.equal((await current()).path ?? null, null);
+    assert.equal((await current()).root ?? null, null);
+    assert.equal(await js("return document.querySelector('#run').disabled;"), true);
+    assert.equal(await js("return document.querySelector('.titlebar').getBoundingClientRect().height;"), 36);
+    assert.doesNotMatch(await text("#project-welcome"), /orbit/i);
+    assert.match(await text("#project-welcome"), /Open Project/);
+    assert.match(await text("#project-welcome"), /New Project/);
+  });
   await record("native workbench opens a disposable folder", async () => {
     await eventually("workbench boot", () => js("return !!window.__ironTest && document.body.classList.contains('desktop');"));
     await click("#open-folder");
@@ -145,6 +156,7 @@ try {
     await eventually("Go toolchain reported", () => text("#tool-version"), value => /go?\s*\d+\.\d+/i.test(value));
     await eventually("sole executable selected without typing", () => js("return document.querySelector('#run-target')?.value;"), value => value === "./cmd/orbit", 5000);
   });
+  await checkTheme();
 
   await record("formats only the buffer, then saves actual disk bytes", async () => {
     const ugly = original.replace("const version =", "const     version=     ") + "\n// Native acceptance\n";
@@ -254,6 +266,14 @@ try {
       assert.doesNotMatch(result, /PASS: TestAnother/);
     });
   }
+  await record("closing a project returns to welcome", async () => {
+    await click("#workspace-actions");
+    await set("#palette-text", "close project");
+    await click("#palette-options button");
+    await eventually("back at welcome", () => js("return document.querySelector('#project-welcome').hidden === false;"));
+    assert.equal((await current()).root ?? null, null);
+    assert.equal(await js("return document.querySelector('#run').disabled;"), true);
+  });
 } catch (error) {
   report.failure = error.stack;
   if (sid) {

@@ -32,5 +32,6 @@ operations capture the current project or model and ignore stale results.
 Processes and their channels have a single owner and are dropped on switch
 or close. Tool absence degrades capabilities separately from file editing.
 
-The acceptance fixture is `examples/orbit`; automation only edits a copy.
+The acceptance fixture is `tests/fixtures/orbit`; automation only edits a copy.
+It is not bundled into the application.
 See [testing instructions](TESTING.md) for the feedback loop.

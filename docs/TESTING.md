@@ -18,9 +18,10 @@ on `PATH` or in `~/go/bin`. Select a compatible gopls version (for example,
 | `npm run test:ui` | Workbench behavior in headless Chromium with isolated browser storage. |
 | `npm run test:native` | Real WKWebView, IPC, local files, and Go tools. Runs the LSP case if gopls is installed. |
 | `npm run test:feedback` | All three layers; fails if gopls is missing. |
+| `npm run test:picker` | Checks native title-bar placement at the default and minimum widths, then opens and cancels the real macOS project picker. Requires a built `.app` and Accessibility permission for the calling terminal. |
 
 The native suite builds `iron-go-acceptance` and opens a temporary
-copy of `examples/orbit`. No existing IDE instance or manual folder
+copy of `tests/fixtures/orbit`. No existing IDE instance or manual folder
 selection is needed. It requires a working macOS app session. For repeat
 runs with an unchanged test build, use `npm run test:native -- --skip-build`.
 
@@ -34,5 +35,7 @@ when they explain a regression.
 
 GitHub Actions runs the full feedback loop for pushes to `main` and pull
 requests on a macOS runner and attaches available diagnostics to the run.
+The optional picker smoke runs locally after `npm run tauri build -- --bundles app`;
+its disposable process is independent of any currently open Iron Go window.
 
 See [ADR 0002](adr/0002-test-feedback-loop.md) and [the acceptance design](design/test-feedback-loop.md).

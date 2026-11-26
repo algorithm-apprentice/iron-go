@@ -291,7 +291,10 @@ mod tests {
         let Ok(mut go) = command("go") else { return };
         let child = go
             .args(["run", "./cmd/orbit"])
-            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/orbit"))
+            .current_dir(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../tests/fixtures/orbit"
+            ))
             .process_group(0)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

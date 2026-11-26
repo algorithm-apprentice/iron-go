@@ -24,9 +24,9 @@ Decision: [ADR 0001](../adr/0001-macos-go-workbench.md).
 - With `gopls`, provide completion, hover, workspace definition navigation
   and diagnostics. Opening or editing must still work when gopls is absent
   or fails. Destroy the old server/model state on workspace switch.
-- A browser import is a memory copy, not filesystem access; only the
-  bundled sample is saved to browser storage. Preview cannot claim to
-  format, run, or test real Go.
+- Neither app mode opens a default project. A browser import is a memory
+  copy, not write access to the filesystem. Preview cannot claim to format,
+  run, or test real Go.
 
 Non-goals: Windows/Linux delivery, PTY/interactive input, Delve,
 extensions, Git UI, file watching/automatic reload, and workspace restore.
@@ -40,9 +40,23 @@ in its top-right action area. Explorer, Search and Go Tasks live in the left
 activity bar; Problems and Output share the lower panel. Use the selectable
 [VS Code color palettes](vscode-color-themes.md) while retaining Iron Go branding
 and macOS controls. Sidebar and bottom
-panel can be resized and toggled. Primary macOS shortcuts: `⌘O` open folder, `⌘P` quick open,
+panel can be resized and toggled. Primary macOS shortcuts: `⌘O` open project, `⌘P` quick open,
 `⇧⌘P` commands, `⌘S` save, `⇧⌘F` workspace search, `⇧⌥F` format,
 `⌘↵` run, `⌘B` sidebar, `⌘J` bottom panel.
+
+Adjacent controls within a group use a shared 1 CSS-pixel gap, including
+toolbars, tabs, row actions, lists, and dialog buttons. Keep internal padding,
+click targets, and whitespace between unrelated sections. The two resizers
+show a 1 CSS-pixel divider but retain their wider pointer hit area.
+The application title bar is 36 CSS pixels, independent of the system menu
+bar. Following the [VS Code window layout](https://code.visualstudio.com/docs/configure/custom-layout#_customize-layout-control),
+the left is reserved for native macOS buttons and a drag area, the command
+center is centered in the window, and layout controls are on the right. No
+application name or icon appears in this bar. Open Project is an icon-only
+shortcut here and a labeled action on the welcome screen.
+
+Acceptance: assert the actual 1 px bounding-box separation in the browser
+for horizontal and vertical control groups, including the compact breakpoint.
 
 ## 3. Ownership and boundaries
 

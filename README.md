@@ -12,7 +12,7 @@ go install golang.org/x/tools/gopls@v0.20.0
 npm run tauri dev
 ```
 
-用 **Open Folder** 打开 Go 模块或 `go.work` 工作区，或者在 `⇧⌘P` 命令面板选择 **New Go Module**。例如打开 `examples/orbit`，右上角会自动选中唯一的可执行目标 **orbit**。如果有多个目标，请先选一个再运行。**Run and Test** 侧栏默认构建或测试所有本地包，也可选当前包，或在 **Advanced** 手动填写路径。
+启动后，从欢迎页选择 **Open Project** 打开 Go 模块或 `go.work` 工作区，或点 **New Project** 创建 Go 模块。右上角会自动选中项目中唯一的可执行目标；有多个时，请先选择。**Run and Test** 默认构建或测试所有本地包，也可选当前包，或在 **Advanced** 手动填路径。要返回欢迎页，在项目菜单或命令面板选择 **Close Project**。
 
 从 Finder 启动时也会查找 Homebrew、Go 官方安装路径和 `~/go/bin` 等常见位置。在右下角的工具状态中可以重新检测。
 
@@ -23,7 +23,7 @@ npm run tauri dev
 - Dark / Light 配色，可在 **Settings → Color Theme**（`⌘,`）切换并记住选择。
 - `gopls` 补全、悬停文档、工作区内定义跳转及 Problems 面板。`_test.go` 文件中的测试函数旁可以点 **Run Test** 单独运行。
 - `go build` / `go run` / `go test`，真实输出、退出状态和进程停止。仅在显式运行任务时执行项目代码，请只运行可信项目。
-- 快捷键：`⌘O` 打开文件夹，`⌘P` 快速打开，`⇧⌘P` 命令面板，`⌘S` 保存，`⇧⌘F` 搜索，`⇧⌥F` 格式化，`⌘↵` 运行/停止，`⌘B` 侧栏，`⌘J` 底部面板。
+- 快捷键：`⌘O` 打开项目，`⌘P` 快速打开，`⇧⌘P` 命令面板，`⌘S` 保存，`⇧⌘F` 搜索，`⇧⌥F` 格式化，`⌘↵` 运行/停止，`⌘B` 侧栏，`⌘J` 底部面板。
 
 首版没有 Delve 调试、交互式终端、自动文件监控或 Windows 支持。`npm run dev` 仅启动浏览器预览，不能执行本机 Go 工具，也不会写回导入的本地目录。
 

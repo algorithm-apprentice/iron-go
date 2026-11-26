@@ -9,7 +9,7 @@ Decision: [ADR 0002](../adr/0002-test-feedback-loop.md).
 ## 1. Layers and completion criteria
 
 1. Focused: TypeScript checks, pure project/tree/search behavior, Rust file and
-   process tests, and `go test` in `examples/orbit`. Runs without a GUI.
+   process tests, and `go test` in `tests/fixtures/orbit`. Runs without a GUI.
 2. Headless UI: launch a private Vite server on an ephemeral port and exercise
    accessible workbench controls in Playwright. Each test uses fresh browser
    storage. Store a screenshot, trace and browser log on failure.
