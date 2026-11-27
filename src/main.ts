@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { CancellationTokenSource } from "vscode-jsonrpc/lib/browser/main.js";
 import { byId, element, Forms, message, Palette } from "./dialogs";
 import { showDiskComparison } from "./disk-compare";
+import { prepareGoRename, reviewGoRename } from "./go-rename";
 import { applyExactTextEdits, bufferText, defaultEditorFontSize, Documents, editorTypography, exactModelRange, monaco, type DocumentTab } from "./editor";
 import { Feedback } from "./feedback";
 import { fileIcon, icon, prepareIcons, type Icon } from "./icons";
@@ -679,6 +680,67 @@ async function organizeImports() {
   finally { release?.(); }
 }
 
+function renameGoSymbol() {
+  const origin = docs.active;
+  const position = docs.editor.getPosition();
+  const target = project;
+  const folder = target.native;
+  if (!origin || !position || !folder || !lsp || gopls !== "ready" || origin.model.getLanguageId() !== "go") {
+    toast("Open a Go file with gopls running to rename a symbol.");
+    return;
+  }
+  if (fileActionsBlocked() || filesBusy()) return;
+  const sameOrigin = captureTab(origin);
+  forms.show({
+    title: "Rename Go Symbol", description: "Enter a new name to review workspace changes.", submit: "Preview Rename",
+    fields: [{ name: "name", label: "New name" }],
+    async run({ name }) {
+      if (!/^[\p{L}_][\p{L}\p{Nd}_]*$/u.test(name)) throw new Error("Enter a Go identifier.");
+      byId("form-dialog").addEventListener("close", () => { void previewRename(name); }, { once: true });
+    },
+  });
+
+  async function previewRename(name: string) {
+    if (!sameOrigin() || docs.active !== origin) return;
+    const release = reserveFileActivity();
+    if (!release) return;
+    const cancellation = new CancellationTokenSource();
+    let active = true;
+    let service: GoLanguage | undefined;
+    let deadline: number | undefined;
+    const current = () => active && project === target && (!service || lsp === service);
+    try {
+      const preparing = prepareGoRename({
+        project: target, docs, origin: origin!, position: position!, name, current, token: cancellation.token,
+        async start() {
+          navigation?.cancel();
+          lsp?.dispose();
+          service = createGoLanguage(folder!);
+          await service.start();
+          if (lsp !== service || gopls !== "ready") throw new Error("gopls could not initialize for the rename.");
+          return service;
+        },
+      });
+      const load = Promise.race([preparing, new Promise<never>((_, reject) => {
+        deadline = window.setTimeout(() => reject(new Error("gopls did not prepare the rename in time.")), 30_000);
+      })]).finally(() => window.clearTimeout(deadline));
+      const plan = await reviewGoRename(load);
+      if (plan) {
+        const files = await plan.apply();
+        status(`Renamed symbol in ${files} ${files === 1 ? "buffer" : "buffers"}`);
+      }
+    } catch (error) { if (project === target) showError(error); }
+    finally {
+      active = false;
+      window.clearTimeout(deadline);
+      cancellation.cancel();
+      cancellation.dispose();
+      release();
+      if (docs.active === origin && document.activeElement === document.body) docs.editor.focus();
+    }
+  }
+}
+
 function refresh() {
   return snapshots.refresh(project, {
     current: () => project,
@@ -1111,6 +1173,10 @@ function maybeStartLsp() {
   const folder = project.native;
   if (!folder || !tools || lsp) return;
   if (!tools.gopls) { gopls = "missing"; updateTools(); renderProblems(); return; }
+  void createGoLanguage(folder).start();
+}
+
+function createGoLanguage(folder: NativeFolder) {
   gopls = "starting";
   updateTools();
   const service = new GoLanguage(folder, docs, (state, reason) => {
@@ -1124,7 +1190,7 @@ function maybeStartLsp() {
     renderProblems();
   });
   lsp = service;
-  void service.start();
+  return service;
 }
 
 function showSettings() { byId<HTMLDialogElement>("settings-dialog").showModal(); }
@@ -1157,6 +1223,7 @@ function showPalette(command = false, workspaceOnly = false) {
     ...(project.native && docs.active ? [{ label: "Save to a New Path…", icon: "save" as const, run: saveToNewPath }] : []),
     { label: "Format Go File", detail: "⇧⌥F", icon: "format", run: formatActive },
     { label: "Go: Organize Imports", icon: "format", run: organizeImports },
+    { label: "Go: Rename Symbol…", icon: "files", run: renameGoSymbol },
     { label: "Go: Run Selected Target", detail: "⌘↵", icon: "play", run: () => { void runTask("run"); } },
     { label: "Go: Choose Run Target", icon: "package", run: () => runTargets.picker.focus() },
     { label: "Go: Build Packages", icon: "hammer", run: () => { void runTask("build"); } },

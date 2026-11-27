@@ -83,7 +83,9 @@ export function replaceBuffer(model: monaco.editor.ITextModel, text: string) {
   model.pushStackElement();
 }
 
-export function applyExactTextEdits(model: monaco.editor.ITextModel, edits: readonly { range: monaco.IRange; text: string }[]) {
+export type BufferEdit = { range: monaco.IRange; text: string };
+
+export function prepareExactTextEdits(model: monaco.editor.ITextModel, edits: readonly BufferEdit[]) {
   const original = model.getValue();
   const eol = model.getEOL();
   const offsets = edits.map(({ range, text }) => {
@@ -103,18 +105,27 @@ export function applyExactTextEdits(model: monaco.editor.ITextModel, edits: read
     last = edit.end;
   }
   pieces.push(original.slice(last));
-  const updated = pieces.join("");
+  return { original, updated: pieces.join(""), version: model.getVersionId(), operations: offsets.map(({ range, text }) => ({ range, text })) };
+}
+
+export function applyPreparedTextEdits(model: monaco.editor.ITextModel, prepared: ReturnType<typeof prepareExactTextEdits>) {
+  const { original, updated, version, operations } = prepared;
+  if (model.getVersionId() !== version || model.getValue() !== original) throw new Error("The buffer changed before applying the edit.");
   if (updated === original) return false;
   const trimAutoWhitespace = model.getOptions().trimAutoWhitespace;
   model.updateOptions({ trimAutoWhitespace: false });
   try {
     model.pushStackElement();
-    model.pushEditOperations([], offsets.map(({ range, text }) => ({ range, text })), () => null);
+    model.pushEditOperations([], operations, () => null);
     model.pushStackElement();
   }
   finally { model.updateOptions({ trimAutoWhitespace }); }
   if (model.getValue() !== updated) throw new Error("The editor did not apply the exact text. Use Undo to restore the previous buffer.");
   return true;
+}
+
+export function applyExactTextEdits(model: monaco.editor.ITextModel, edits: readonly BufferEdit[]) {
+  return applyPreparedTextEdits(model, prepareExactTextEdits(model, edits));
 }
 
 type Target = monaco.IRange | monaco.IPosition;
@@ -235,7 +246,7 @@ export class Documents {
   }
 
   async open(path: string, options: { focus?: boolean; activate?: boolean; target?: Target; current?: () => boolean;
-    userNavigation?: boolean; validate?: (tab: DocumentTab) => void; beforeActivate?: () => void } = {}) {
+    userNavigation?: boolean; observedText?: string; validate?: (tab: DocumentTab) => void; beforeActivate?: () => void } = {}) {
     const folder = this.folder;
     const { focus = false, activate = true, target, current = () => true } = options;
     if (!folder || !current() || this.destinationReserved(path)) return;
@@ -246,7 +257,8 @@ export class Documents {
     if (!tab) {
       let pending = this.opening.get(path);
       if (!pending) {
-        const load = folder.read(path).finally(() => { if (this.opening.get(path) === load) this.opening.delete(path); });
+        const read = options.observedText === undefined ? folder.read(path) : Promise.resolve(options.observedText);
+        const load = read.finally(() => { if (this.opening.get(path) === load) this.opening.delete(path); });
         this.opening.set(path, load);
         pending = load;
       }

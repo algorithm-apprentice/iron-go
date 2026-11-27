@@ -32,6 +32,7 @@ export const host = {
   tools: () => invoke<ToolStatus>("go_tools"),
   format: (text: string) => invoke<string>("format_go", { text }),
   discoverPackages: (id: number) => invoke<GoPackages>("discover_packages", { id }),
+  goSourceRevision: (id: number) => invoke<string>("go_source_revision", { id }),
   startWatch: (id: number) => invoke<void>("start_workspace_watch", { id }),
   waitWatch: (id: number, revision: number) => invoke<number | null>("wait_workspace_watch", { id, revision }),
   task: (id: number, kind: TaskKind, packages: string[], testName: string | undefined, handle: (event: TaskEvent) => void) =>

@@ -1,4 +1,4 @@
-import type { CodeAction, Command, TextEdit } from "vscode-languageserver-types";
+import type { CodeAction, Command, TextEdit, WorkspaceEdit } from "vscode-languageserver-types";
 
 export function decodeLocalFileUri(uri: string) {
   const rawPath = /^file:\/\/\/(?!\/)[^?#\\\s\u0000-\u001f\u007f-\u009f]+$/u;
@@ -15,38 +15,43 @@ export function organizeImportEdits(actions: (CodeAction | Command)[], uri: stri
   if (!edit) return;
   const path = decodeLocalFileUri(uri);
   if (!path) throw new Error("This editor has no valid local file URI.");
-  const isCapturedFile = (target: string) => decodeLocalFileUri(target) === path;
+  const targets = workspaceTextEdits(edit);
+  if ([...targets.keys()].some(target => target !== path)) throw new Error("An import edit cannot touch another file.");
+  const target = targets.get(path);
+  if (target?.version != null && target.version !== version) throw new Error("The import edit names a different editor version.");
+  return target?.edits ?? [];
+}
+
+export function workspaceTextEdits(edit: WorkspaceEdit) {
   const hasChanges = Object.hasOwn(edit, "changes");
   const hasDocumentChanges = Object.hasOwn(edit, "documentChanges");
-  if (Object.hasOwn(edit, "changeAnnotations") || (hasChanges && hasDocumentChanges)) throw new Error("gopls returned an ambiguous import edit.");
-  let edits: TextEdit[] | undefined;
+  if (Object.hasOwn(edit, "changeAnnotations") || (hasChanges && hasDocumentChanges)) throw new Error("gopls returned an ambiguous edit.");
+  const targets = new Map<string, { version: number | null; edits: TextEdit[] }>();
+  const add = (uri: string, version: number | null, edits: TextEdit[]) => {
+    const path = decodeLocalFileUri(uri);
+    if (!path) throw new Error("The edit names another file or an invalid local URI.");
+    if (targets.has(path)) throw new Error("gopls returned duplicate edits for this file.");
+    if (!Array.isArray(edits) || edits.some(candidate => !candidate || typeof candidate !== "object" ||
+      typeof candidate.newText !== "string" || !candidate.range || "annotationId" in candidate)) {
+      throw new Error("gopls returned an edit that is not plain text.");
+    }
+    targets.set(path, { version, edits });
+  };
   if (hasDocumentChanges) {
     if (!Array.isArray(edit.documentChanges)) throw new Error("gopls returned a malformed import edit.");
     for (const change of edit.documentChanges) {
       if (!change || typeof change !== "object" || "kind" in change || !("textDocument" in change)) {
-        throw new Error("An import edit cannot include a resource operation.");
+        throw new Error("The edit cannot include a resource operation.");
       }
       if (!change.textDocument || typeof change.textDocument.uri !== "string" || !Array.isArray(change.edits)) {
         throw new Error("gopls returned a malformed import edit.");
       }
-      if (!isCapturedFile(change.textDocument.uri)) throw new Error("An import edit cannot touch another file.");
-      if (change.textDocument.version !== null && change.textDocument.version !== version) {
-        throw new Error("The import edit names a different editor version.");
-      }
-      if (edits !== undefined) throw new Error("gopls returned duplicate import edits for this file.");
-      edits = change.edits as TextEdit[];
+      if (change.textDocument.version !== null && !Number.isInteger(change.textDocument.version)) throw new Error("The edit has an invalid document version.");
+      add(change.textDocument.uri, change.textDocument.version, change.edits as TextEdit[]);
     }
   } else if (hasChanges) {
     if (!edit.changes || typeof edit.changes !== "object" || Array.isArray(edit.changes)) throw new Error("gopls returned a malformed import edit.");
-    const targets = Object.entries(edit.changes);
-    if (targets.some(([target]) => !isCapturedFile(target))) throw new Error("An import edit cannot touch another file.");
-    if (targets.length > 1) throw new Error("gopls returned duplicate import edits for this file.");
-    edits = targets[0]?.[1];
+    for (const [uri, edits] of Object.entries(edit.changes)) add(uri, null, edits);
   }
-  if (!edits) return [];
-  if (!Array.isArray(edits) || edits.some(candidate => !candidate || typeof candidate !== "object" ||
-    typeof candidate.newText !== "string" || !candidate.range || "annotationId" in candidate)) {
-    throw new Error("gopls returned an import edit that is not plain text.");
-  }
-  return edits;
+  return targets;
 }

@@ -1295,6 +1295,7 @@ async function goSuite() {
   if (!capabilities.gopls) {
     for (const name of ["gopls publishes/clears real errors and completes a Go symbol", "gopls hover and definition work through Monaco",
       "gopls symbol and reference navigation uses unsaved UTF-16 locations", "Organize Imports updates only the Go buffer as one undoable edit",
+      "Rename previews real cross-file changes and rejects a stale workspace",
       "runs exactly one Go test from its editor action", "whole-line selection highlights the selected number, not its endpoint"]) {
       console.log(`  SKIP ${name} (gopls not installed)`);
       report.cases.push({ name, result: "skip", reason: "gopls not installed" });
@@ -1428,6 +1429,81 @@ async function goSuite() {
       await writeFile(file, corrected);
       await eventually("the valid fixture on disk is adopted", current, state => state?.text === corrected && !state.dirty);
       await click('#tabs [data-path="cmd/orbit/main.go"]');
+    });
+    await record("Rename previews real cross-file changes and rejects a stale workspace", async () => {
+      const source = path.join(fixture, "cmd/orbit/main.go");
+      const latePath = "cmd/orbit/rename_extra.go";
+      const late = path.join(fixture, latePath);
+      const lateText = 'package main\n\nimport "example.com/orbit/internal/status"\n\nvar _ = "🚀"; var _ = status.NewReport\n';
+      const original = await readFile(source, "utf8");
+      const dirty = original + "\n// Unrelated unsaved edit\n";
+      await replace(dirty);
+      await writeFile(late, lateText);
+      const lines = dirty.split("\n");
+      const origin = lines.findIndex(line => line.includes("status.NewReport"));
+      const column = lines[origin].indexOf("NewReport") + 1;
+      const requestRename = async () => {
+        await js("window.__ironTest.position(arguments[0], arguments[1]); return true;", origin + 1, column);
+        await chooseCommand("go rename symbol");
+        await set("#form-name", "BuildReport");
+        await click("#form-submit");
+      };
+      const preview = async () => {
+        await requestRename();
+        await eventually("rename preview includes the closed file", () => js(`
+          return !!document.querySelector('#rename-preview-dialog[open]') &&
+            [...document.querySelector('#rename-preview-file').options].some(file => file.value === arguments[0]);
+        `, latePath));
+      };
+      const overlay = "cmd/orbit/rename_overlay.go";
+      const overlayDisk = path.join(fixture, overlay);
+      const baseline = "package main\n";
+      await writeFile(overlayDisk, baseline);
+      await eventually("the overlay file appears", () => js("return !!document.querySelector('#explorer [data-path=\"cmd/orbit/rename_overlay.go\"]');"));
+      await click(`#explorer [data-path="${overlay}"]`);
+      await eventually("the overlay is open", current, state => state?.path === overlay);
+      await replace(baseline + "// unsaved overlay without references\n");
+      await writeFile(overlayDisk, lateText.replace("var _ =", "var overlayMarker ="));
+      await click('#tabs [data-path="cmd/orbit/main.go"]');
+      await requestRename();
+      await eventually("a stale non-participant overlay cannot mask a disk reference", () => text("#toast"), value => /rename_overlay\.go changed on disk/.test(value));
+      await writeFile(overlayDisk, baseline);
+      await click(`.tab[data-tab-path="${overlay}"] .tab-close`);
+      await eventually("the dirty overlay close is ready", () => js("return document.querySelector('#file-decision-dialog').open;"));
+      await click("#file-decision-discard");
+      await eventually("the overlay is discarded before preparing again", () => js("return !document.querySelector('#tabs [data-path=\"cmd/orbit/rename_overlay.go\"]') && !document.querySelector('#save').disabled;"));
+      await preview();
+      await eventually("the preview renders the old and new names in read-only buffers", () => js(`
+        return document.querySelector('#rename-preview-original .view-lines')?.textContent.includes('NewReport') &&
+          document.querySelector('#rename-preview-modified .view-lines')?.textContent.includes('BuildReport');
+      `));
+      await writeFile(late, lateText + "// disk changed during review\n");
+      await click("#rename-preview-apply");
+      await eventually("stale workspace prevents any rename edits", () => text("#toast"), value => /changed.*rename|rename.*changed/i.test(value));
+      assert.equal((await current()).text, dirty);
+      assert.equal(await readFile(source, "utf8"), original);
+
+      await eventually("the changed candidate is reconciled", () => js("return !document.querySelector('#save').disabled;"));
+      await click(`#tabs [data-path="${latePath}"]`);
+      await eventually("the candidate adopts the newer disk version", current, state => state?.path === latePath && state.text.includes("disk changed during review"));
+      await click('#tabs [data-path="cmd/orbit/main.go"]');
+      await preview();
+      const affected = await js("return [...document.querySelector('#rename-preview-file').options].map(option => option.value);");
+      await click("#rename-preview-apply");
+      await eventually("the originating buffer receives the approved rename", current,
+        state => state?.text.includes("status.BuildReport") && state.text.includes("Unrelated unsaved edit") && state.dirty);
+      assert.equal(await readFile(source, "utf8"), original);
+      assert.equal(await readFile(late, "utf8"), lateText + "// disk changed during review\n");
+      assert.ok(affected.includes(latePath) && affected.includes("internal/status/report.go") && affected.includes("cmd/orbit/main.go"));
+      for (const relative of affected) {
+        const selector = `#tabs [data-path="${relative}"]`;
+        await click(selector);
+        await eventually("the renamed buffer is active", current, state => state?.path === relative && state.text.includes("BuildReport"));
+        await js("window.__ironTest.action('undo', 1, 1); return true;");
+        await eventually("one Undo restores the original name", current, state => state?.text.includes("NewReport") && !state.text.includes("BuildReport"));
+      }
+      await click('#tabs [data-path="cmd/orbit/main.go"]');
+      await replace(original);
     });
     await record("gopls hover and definition work through Monaco", async () => {
       const source = (await current()).text.split("\n");

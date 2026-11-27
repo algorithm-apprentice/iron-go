@@ -151,6 +151,15 @@ impl RootAnchor {
         open_at(&self.open_directory(parents)?, leaf.as_bytes(), FILE)
     }
 
+    pub(super) fn source_version(&self, parts: &[&str]) -> CommandResult<String> {
+        let file = self.open_file(parts).map_err(|error| error.to_string())?;
+        let info = file.metadata().map_err(|error| error.to_string())?;
+        if !info.is_file() {
+            return Err("The source path is not a regular file.".into());
+        }
+        Ok(review_version(&info))
+    }
+
     pub fn create_file(&self, path: &Path, parts: &[&str]) -> CommandResult<()> {
         self.verify(path)?;
         let (leaf, parents) = parts.split_last().expect("validated workspace path");

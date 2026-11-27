@@ -214,6 +214,21 @@
         </div>
       </form>
     </dialog>
+    <dialog id="rename-preview-dialog" class="form-dialog disk-compare-dialog" aria-labelledby="rename-preview-title" aria-describedby="rename-preview-status">
+      <form method="dialog">
+        <div class="dialog-header"><h2 id="rename-preview-title">Review Go Rename</h2></div>
+        <p id="rename-preview-status" class="view-note" role="status"></p>
+        <select id="rename-preview-file" class="text-field" aria-label="Changed file" hidden></select>
+        <div id="rename-preview-view" hidden>
+          <section aria-label="Current Go buffer"><h3>Current</h3><div id="rename-preview-original"></div></section>
+          <section aria-label="Proposed Go buffer"><h3>Proposed</h3><div id="rename-preview-modified"></div></section>
+        </div>
+        <div class="dialog-actions">
+          <button class="button primary" value="cancel" autofocus>Cancel</button>
+          <button id="rename-preview-apply" class="button quiet" value="apply" disabled>Apply Rename</button>
+        </div>
+      </form>
+    </dialog>
     <dialog id="disk-compare-dialog" class="form-dialog disk-compare-dialog" aria-labelledby="disk-compare-title" aria-describedby="disk-compare-path disk-compare-status">
       <form method="dialog">
         <div class="dialog-header"><h2 id="disk-compare-title">Compare with Disk</h2></div>

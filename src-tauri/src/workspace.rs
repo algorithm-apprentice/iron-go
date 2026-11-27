@@ -555,22 +555,70 @@ pub fn excluded_name(name: &str) -> bool {
 }
 
 fn collect(root: &Path) -> CommandResult<Snapshot> {
+    let (entries, truncated, _) = collect_entries(root, None)?;
+    let module = read_text(root, "go.mod", 64 * 1024).ok().and_then(|text| {
+        text.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next()? == "module")
+                .then(|| {
+                    fields
+                        .next()
+                        .map(|value| value.trim_matches('"').to_owned())
+                })
+                .flatten()
+        })
+    });
+    let go_work = entries
+        .iter()
+        .any(|entry| !entry.directory && entry.path == "go.work");
+    Ok(Snapshot {
+        entries,
+        truncated,
+        module,
+        go_work,
+        package_revision: None,
+    })
+}
+
+fn collect_entries(
+    root: &Path,
+    anchor: Option<&RootAnchor>,
+) -> CommandResult<(Vec<Entry>, bool, Vec<(String, String)>)> {
+    let strict = anchor.is_some();
     let mut entries = Vec::new();
+    let mut directories = Vec::new();
     let mut folders = vec![(String::new(), 0)];
     let mut truncated = false;
     'walk: while let Some((folder, depth)) = folders.pop() {
+        if let Some(anchor) = anchor {
+            directories.push((folder.clone(), directory_revision(anchor, &folder)?));
+        }
         let batch = match fs::read_dir(root.join(&folder)) {
             Ok(batch) => batch,
-            Err(_) if !folder.is_empty() => continue,
+            Err(_) if !strict && !folder.is_empty() => continue,
             Err(error) => return Err(fail("List workspace")(error)),
         };
-        for item in batch.flatten() {
+        for item in batch {
+            let item = match item {
+                Ok(item) => item,
+                Err(error) if strict => return Err(fail("Read workspace entry")(error)),
+                Err(_) => continue,
+            };
             let name = item.file_name();
             let Some(name) = name.to_str() else { continue };
             if excluded_name(name) {
                 continue;
             }
-            let Ok(kind) = item.file_type() else { continue };
+            let kind = match item.file_type() {
+                Ok(kind) => kind,
+                Err(error) if strict => return Err(fail("Inspect workspace entry")(error)),
+                Err(_) => continue,
+            };
+            if strict && kind.is_symlink() && source_input(name) {
+                return Err(format!(
+                    "Cannot verify a symbolic link to Go source: {name}"
+                ));
+            }
             if !kind.is_dir() && !kind.is_file() {
                 continue;
             }
@@ -597,28 +645,84 @@ fn collect(root: &Path) -> CommandResult<Snapshot> {
         }
     }
     entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    let module = read_text(root, "go.mod", 64 * 1024).ok().and_then(|text| {
-        text.lines().find_map(|line| {
-            let mut fields = line.split_whitespace();
-            (fields.next()? == "module")
-                .then(|| {
-                    fields
-                        .next()
-                        .map(|value| value.trim_matches('"').to_owned())
-                })
-                .flatten()
-        })
-    });
-    let go_work = entries
-        .iter()
-        .any(|entry| !entry.directory && entry.path == "go.work");
-    Ok(Snapshot {
-        entries,
-        truncated,
-        module,
-        go_work,
-        package_revision: None,
+    Ok((entries, truncated, directories))
+}
+
+fn directory_revision(anchor: &RootAnchor, path: &str) -> CommandResult<String> {
+    let parts = if path.is_empty() {
+        Vec::new()
+    } else {
+        components(path)?
+    };
+    let info = anchor
+        .open_directory(&parts)
+        .and_then(|directory| directory.metadata())
+        .map_err(fail("Verify source directory"))?;
+    Ok(review_version(&info))
+}
+
+fn source_input(path: &str) -> bool {
+    path.ends_with(".go")
+        || matches!(
+            path.rsplit('/').next(),
+            Some("go.mod" | "go.sum" | "go.work" | "go.work.sum")
+        )
+}
+
+#[tauri::command]
+pub async fn go_source_revision(state: State<'_, Core>, id: u64) -> CommandResult<String> {
+    let (root, anchor) = observation_root(&state, id)?;
+    blocking(move || {
+        source_revision(
+            &root,
+            &anchor,
+            #[cfg(test)]
+            || {},
+        )
     })
+    .await
+}
+
+fn source_revision(
+    root: &Path,
+    anchor: &RootAnchor,
+    #[cfg(test)] after_versions: impl FnOnce(),
+) -> CommandResult<String> {
+    anchor.verify(root)?;
+    let (entries, truncated, directories) = collect_entries(root, Some(anchor))?;
+    if truncated {
+        return Err("This workspace is too large to verify a rename.".into());
+    }
+    let mut signature = DefaultHasher::new();
+    let stamp = |path: &str| {
+        anchor
+            .source_version(&components(path)?)
+            .map_err(|error| format!("Verify {path}: {error}"))
+    };
+    let mut versions = Vec::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| !entry.directory && source_input(&entry.path))
+    {
+        entry.path.hash(&mut signature);
+        let version = stamp(&entry.path)?;
+        version.hash(&mut signature);
+        versions.push((&entry.path, version));
+    }
+    #[cfg(test)]
+    after_versions();
+    for (path, previous) in versions {
+        if stamp(path)? != previous {
+            return Err(format!("{path} changed while verifying the rename."));
+        }
+    }
+    for (path, previous) in directories {
+        if directory_revision(anchor, &path)? != previous {
+            return Err("A directory changed while verifying the rename.".into());
+        }
+    }
+    anchor.verify(root)?;
+    Ok(format!("{:016x}", signature.finish()))
 }
 
 fn package_revision(root: &Path, anchor: &RootAnchor, entries: &[Entry]) -> String {
@@ -913,6 +1017,30 @@ mod save_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_revision_rejects_a_file_created_after_enumeration() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = Workspace::open(directory.path()).unwrap();
+        fs::create_dir(project.root.join("pkg")).unwrap();
+        fs::write(project.root.join("pkg/first.go"), "package pkg\n").unwrap();
+        let result = source_revision(&project.root, &project.anchor, || {
+            fs::write(project.root.join("pkg/new.go"), "package pkg\n").unwrap();
+        });
+        assert!(result.unwrap_err().contains("directory changed"));
+    }
+
+    #[test]
+    fn rename_revision_rejects_an_in_place_write_after_the_first_file_stamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = Workspace::open(directory.path()).unwrap();
+        let file = project.root.join("existing.go");
+        fs::write(&file, "package pkg\n").unwrap();
+        let result = source_revision(&project.root, &project.anchor, || {
+            fs::write(&file, "package pkg\n\nvar _ = NewReport\n").unwrap();
+        });
+        assert!(result.unwrap_err().contains("existing.go changed"));
+    }
 
     #[test]
     fn creates_and_saves_without_overwriting_external_edits() {

@@ -187,6 +187,7 @@ fn main() {
             workspace::snapshot,
             workspace::read_file,
             workspace::inspect_file,
+            workspace::go_source_revision,
             workspace_disk::start_workspace_watch,
             workspace_disk::wait_workspace_watch,
             workspace::save_file,

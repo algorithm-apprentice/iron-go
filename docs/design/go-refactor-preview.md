@@ -1,6 +1,6 @@
 # Review Go refactors before applying them
 
-Status: Organize Imports implemented; multi-file Rename proposed. This follows
+Status: Organize Imports and multi-file Rename implemented. This follows
 [Go symbol navigation](go-symbol-navigation.md).
 
 ## Scope
@@ -51,9 +51,12 @@ Status: Organize Imports implemented; multi-file Rename proposed. This follows
   rename preparation. Wait for initialization, replay the open Go models,
   and capture or recheck the signature across initialization and the request.
   Do not rely on language-server watching of closed files or reuse of its
-  old package view. Changes during preparation or a failed restart invalidate
-  the operation before any edits. This restart is not needed for the local
-  Organize Imports request against a synced open model.
+  old package view. Verify every replayed Go overlay against its current disk
+  baseline, including buffers gopls will not later identify as participants.
+  Verify directory membership and source-file versions across the native scan.
+  Changes during preparation or a failed restart invalidate the operation
+  before any edits. This restart is not needed for the local Organize Imports
+  request against a synced open model.
 - Decode and validate the entire edit set before presenting it. Validate
   canonical workspace file URIs, declared document versions when supplied,
   UTF-16 ranges against exact source text, and nonoverlap. Reject an endpoint
@@ -70,10 +73,11 @@ Status: Organize Imports implemented; multi-file Rename proposed. This follows
   lines outside the proposal. Verify the resulting text matches the preview.
   Do not auto-save. If an unexpected model failure causes partial buffer
   application, report the changed paths and preserve access to Undo.
-- Use separate read-only diff models for the preview. Dispose them on cancel,
-  apply, invalidation, or project switch. Keep distinct the proposed editor
-  edits and any external disk conflict; a refactor does not acknowledge the
-  external disk version or bypass a conditional Save.
+- Use separate read-only before-and-after models, with changed lines derived
+  from the validated edit ranges. Dispose them on cancel, apply, invalidation,
+  or project switch. Keep distinct the proposed editor edits and any external
+  disk conflict; a refactor does not acknowledge the external disk version or
+  bypass a conditional Save.
 
 ## Alternatives
 
@@ -120,3 +124,17 @@ Status: Organize Imports implemented; multi-file Rename proposed. This follows
   passed unchanged on a targeted repeat (`test-results/native/1795803007406-62638`)
   and all six native groups passed together on the same build
   (`test-results/native/1795803034172-62728`).
+
+## Rename verification
+
+- The first native regression failed because Rename was missing. The final
+  native Go group passed with required `gopls`
+  (`test-results/native/1795804408540-71110`). It checks a closed file changed
+  before invocation, refusal of a stale overlay that would hide a reference,
+  before-and-after preview text, refusal after a disk change, four-buffer
+  application without writing disk, per-buffer Undo, and subsequent Hover
+  and Go to Definition.
+- Rust regressions inject directory membership changes and in-place source
+  writes during the workspace stamp and verify refusal. The native fixture
+  does not separately exercise the receiver-specific candidate expansion or
+  every form of malformed workspace edit.

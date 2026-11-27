@@ -1,11 +1,11 @@
 import { AbstractMessageReader, AbstractMessageWriter, CancellationToken, CancellationTokenSource, createMessageConnection, type DataCallback, type Message, type MessageConnection } from "vscode-jsonrpc/lib/browser/main.js";
-import { SymbolKind, type CodeAction, type Command, type CompletionItem, type CompletionList, type Diagnostic, type DocumentSymbol, type Hover, type Location, type LocationLink, type MarkedString, type MarkupContent, type Range, type SymbolInformation } from "vscode-languageserver-types";
+import { SymbolKind, type CodeAction, type Command, type CompletionItem, type CompletionList, type Diagnostic, type DocumentSymbol, type Hover, type Location, type LocationLink, type MarkedString, type MarkupContent, type Range, type SymbolInformation, type WorkspaceEdit } from "vscode-languageserver-types";
 import { message } from "./dialogs";
 import { exactModelRange, monaco, type DocumentTab, type Documents } from "./editor";
 import { host, type NativeFolder } from "./workspace";
 import { goTestAt, isGoTestFunction } from "./go-test-target";
 import { validateRelative } from "./project-model";
-import { decodeLocalFileUri, organizeImportEdits } from "./go-import-edits";
+import { decodeLocalFileUri, organizeImportEdits, workspaceTextEdits } from "./go-import-edits";
 
 export type LanguageState = "idle" | "missing" | "starting" | "ready" | "failed";
 const markerOwner = "gopls";
@@ -153,6 +153,7 @@ export class GoLanguage {
               definition: { linkSupport: true },
               documentSymbol: { hierarchicalDocumentSymbolSupport: true },
               codeAction: { codeActionLiteralSupport: { codeActionKind: { valueSet: ["source.organizeImports"] } } },
+              rename: { prepareSupport: true },
               hover: { contentFormat: ["markdown", "plaintext"] },
             },
           },
@@ -208,6 +209,10 @@ export class GoLanguage {
     if (version === sync.version) return;
     sync.version = version;
     this.notify("textDocument/didChange", { textDocument: { uri: model.uri.toString(), version }, contentChanges: [{ text: model.getValue() }] });
+  }
+
+  private flushOpen() {
+    for (const model of this.models.keys()) this.flush(model);
   }
 
   private notify(method: string, params: object) {
@@ -307,7 +312,7 @@ export class GoLanguage {
   }
 
   async references(model: monaco.editor.ITextModel, position: monaco.Position, token: monaco.CancellationToken) {
-    for (const open of this.models.keys()) this.flush(open);
+    this.flushOpen();
     const raw = await this.request<Location[] | null>("textDocument/references", model, position, token,
       { context: { includeDeclaration: true } }) ?? [];
     const results = new Map<string, GoLocation>();
@@ -317,6 +322,25 @@ export class GoLanguage {
     }
     return [...results.values()].sort((first, second) => first.path.localeCompare(second.path) ||
       monaco.Range.compareRangesUsingStarts(first.range, second.range));
+  }
+
+  async prepareRename(model: monaco.editor.ITextModel, position: monaco.Position, token: monaco.CancellationToken) {
+    return !!await this.request("textDocument/prepareRename", model, position, token);
+  }
+
+  async rename(model: monaco.editor.ITextModel, position: monaco.Position, newName: string, token: monaco.CancellationToken) {
+    this.flushOpen();
+    const edit = await this.request<WorkspaceEdit | null>("textDocument/rename", model, position, token, { newName });
+    if (!edit) throw new Error("gopls could not rename this symbol.");
+    return [...workspaceTextEdits(edit)].map(([absolute, target]) => {
+      const path = this.docs.relative(monaco.Uri.file(absolute));
+      if (!path) throw new Error("The rename includes a file outside this workspace.");
+      validateRelative(path);
+      return { path, version: target.version, edits: target.edits.map(edit => {
+        if (!validRange(edit.range)) throw new Error("The rename has an invalid UTF-16 range.");
+        return { range: fromRange(edit.range), text: edit.newText };
+      }) };
+    });
   }
 
   async namedTestAt(model: monaco.editor.ITextModel, position: monaco.Position) {
@@ -340,12 +364,14 @@ export class GoLanguage {
       },
     }), monaco.languages.registerHoverProvider("go", {
       provideHover: async (model, pos, token) => {
+        this.flushOpen();
         const hover = await this.request<Hover | null>("textDocument/hover", model, pos, token);
         if (!hover) return null;
         return { contents: (Array.isArray(hover.contents) ? hover.contents : [hover.contents]).map(markdown), range: hover.range && fromRange(hover.range) };
       },
     }), monaco.languages.registerDefinitionProvider("go", {
       provideDefinition: async (model, pos, token) => {
+        this.flushOpen();
         const location = await this.request<Location | Location[] | LocationLink[] | null>("textDocument/definition", model, pos, token);
         if (!location) return [];
         return (Array.isArray(location) ? location : [location]).flatMap(item => {
