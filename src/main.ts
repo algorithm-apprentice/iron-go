@@ -273,25 +273,27 @@ function closeTab(tab: DocumentTab) {
 async function saveActive() {
   if (busy || !docs.active) return;
   const tab = docs.active;
+  const target = project;
   try {
     if (!tab.dirty) { status(`${basename(tab.path)} is saved`); return; }
-    if (await docs.save(tab)) {
-      status(`Saved ${basename(tab.path)}`);
+    if (await docs.save(tab) && project === target) {
+      if (docs.active === tab) status(`Saved ${basename(tab.path)}`);
       if (/(^|\/)go\.(mod|work)$/.test(tab.path)) {
         await refresh();
-        void runTargets.refresh();
+        if (project === target) void runTargets.refresh();
       }
-      if (view === "search") scheduleSearch();
+      if (project === target && view === "search") scheduleSearch();
     }
-  } catch (error) { showError(error); }
+  } catch (error) { if (project === target && docs.active === tab) showError(error); }
 }
 
 async function reloadActive() {
   const tab = docs.active;
   if (!tab || tab.saving || busy || (tab.dirty && !window.confirm(`Discard unsaved changes and reload ${basename(tab.path)}?`))) return;
+  const target = project;
   fileMutations++;
-  try { if (await docs.reload(tab)) status(`Reloaded ${basename(tab.path)}`); }
-  catch (error) { showError(error); }
+  try { if (await docs.reload(tab) && project === target && docs.active === tab) status(`Reloaded ${basename(tab.path)}`); }
+  catch (error) { if (project === target && docs.active === tab) showError(error); }
   finally { fileMutations--; }
 }
 
@@ -299,15 +301,12 @@ async function formatActive() {
   const tab = docs.active;
   if (!tab?.path.endsWith(".go") || formatting || busy) return;
   if (!desktop) { toast("Go formatting uses gofmt in the macOS desktop app."); return; }
-  const version = tab.model.getVersionId();
+  const target = project;
   formatting = true;
   syncControls();
   try {
-    const formatted = await host.format(tab.model.getValue());
-    if (tab.model.isDisposed() || version !== tab.model.getVersionId()) { status("Skipped outdated gofmt result"); return; }
-    replaceBuffer(tab.model, formatted);
-    status(`Formatted ${basename(tab.path)} with gofmt`);
-  } catch (error) { showError(error); }
+    if (await docs.format(tab, host.format) && project === target && docs.active === tab) status(`Formatted ${basename(tab.path)} with gofmt`);
+  } catch (error) { if (project === target && docs.active === tab) showError(error); }
   finally { formatting = false; syncControls(); }
 }
 

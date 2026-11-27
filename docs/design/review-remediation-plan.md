@@ -161,13 +161,14 @@ comparison and commit. The frontend also needs controlled ordering tests
 for reload/format/save results that come back after later edits or tab changes.
 
 **Proposed design:** Stage locally without changing the destination. Use one
-short OS-backed advisory lock per app profile, on a stable file in the user's
+OS-backed advisory lock per app profile, on a stable file in the user's
 app-local data directory. All cooperating Iron Go processes using that profile
 take the same lock; do not unlink/replace its file on release. Fail the save
-if the lock cannot be acquired; never write unlocked. Under the lock, recheck
-path, bytes and target identity immediately before the same-directory atomic
-replacement. Compare the editor's expected bytes from its last read or save;
-compare destination file identity captured at staging time, not at tab open.
+if the lock cannot be acquired; never stage or write unlocked. Under the lock,
+stage, then recheck path, bytes and target identity immediately before the
+same-directory atomic replacement. Compare the editor's expected bytes from
+its last read or save; compare destination file identity captured for this
+transaction before staging, not at tab open.
 
 Under a small frontend operation guard, validate workspace/model identity and
 buffer version before applying asynchronous results. A successful save updates
@@ -177,8 +178,9 @@ a save changes it. A refused save leaves the buffer dirty and reports the
 conflict.
 
 **Guarantee for review:** Concurrent Iron Go saves of the same baseline
-within a profile cannot both commit different content. Edits from another
-program before the final validation are rejected. Arbitrary external editors
+within a profile cannot both commit different content. Differences from the
+staged identity or expected bytes observable at final validation are rejected.
+Arbitrary external editors
 do not acquire the cooperative lock: a write after the final check still cannot
 be ruled out by a portable compare-and-rename. This batch narrows that window
 and documents the limit; it does not promise a filesystem compare-and-swap.
@@ -186,7 +188,7 @@ A macOS exchange/recovery scheme would be a separate design if preserving an
 arbitrary last-moment external write is required. Do not silently restore a
 backup over potentially newer bytes written by another process.
 
-**Tests:** Use barriers or an internal test seam, not repeated sleeps. Stage
+**Tests:** Use barriers or an internal test seam, not repeated sleeps. Start
 two distinct saves from one baseline in **two processes** using the production
 lock path in one disposable profile. Assert exactly one commits, the other
 reports conflict, and disk contains the winner's bytes. Test lock acquisition
@@ -198,6 +200,115 @@ tab or workspace before an operation resolves. Re-run native conflict smoke.
 Hold one writer after its final check and prove the other cannot enter its
 commit section before release; a simultaneous start alone can pass without
 working serialization.
+
+**Batch 2 implementation design (independently approved):** Resolve the application
+local-data directory with Tauri on the native side; no path comes through
+renderer IPC. Open one stable lockfile under it with private mode on creation,
+no symlink following, nonblocking I/O, and no truncation. Require a regular
+file from the opened handle. Use Rust's OS-backed `File` locking on the
+blocking worker. The lockfile is never renamed or removed when unlocked.
+Fail closed for a profile-directory or lock open/acquire error. A workspace
+can enclose the app-local data directory. At the native save boundary,
+compare the staged and final candidate's device/inode with the opened lock
+file's identity and reject a match. This protects the reserved lock from
+Iron Go's own saves even through case aliases or hard links, without relying
+on path spelling or tree filtering. External removal or replacement of the
+profile's lock file is outside the cooperative guarantee.
+
+Capture the destination device/inode and permissions from a regular-file
+handle before staging. Keep the existing same-directory `NamedTempFile`.
+Code review found that an ordinary Iron Go save could target another
+writer's staged pathname while it waits for the profile lock. Reserve a
+private staging basename prefix with no case-folded characters. Reject
+paths containing such a component at the native workspace boundary and
+omit them from scans, rather than relying on UI filtering. String spelling
+alone is not a filesystem identity check (e.g. HFS+ ignores some Unicode
+characters), so acquire the profile lock before creating the staging file.
+This adds a bounded 2 MiB staging write to the critical section but removes
+the window in which another cooperating process can commit to the new
+staged pathname. A regression must attempt a second cooperating save to the
+reserved name from the first save's `Staged` seam and check refusal before
+lock acquisition and the correct outer bytes. Under the lock, also verify
+the staging pathname's identity against the open temporary file before
+replacement. On all errors, remove the staging pathname only if it still
+names the owned file. Test a pathname replacement at the staging seam:
+neither commit the wrong file nor remove the replacement. This does not
+protect against arbitrary external writers changing a temporary file in
+place or racing after the staging identity/cleanup check.
+For both destination opens (staging and final validation), do not follow a
+final symlink, open nonblocking, and verify a regular file from the handle
+before reads. This prevents a swapped FIFO from waiting for a peer while
+the profile is locked. Under the lock, re-resolve the workspace path and
+compare the final handle's identity and bounded bytes with the staged identity
+and editor baseline. Recheck the path identity
+before replacing it. The lock remains held through replacement and best-effort
+cleanup of the owned staging file; a failure does not advance the editor
+baseline. This is not a durability guarantee across power loss and does not
+extend the existing workspace path model to race-proof directory traversal.
+The guarantee is about staged identity and observable bytes, not complete
+disk history: replacement before staging with the same bytes and changes
+undone before observation cannot be detected.
+
+Use a private worker mode in the Rust test binary, not a shipped command. In
+the two-process test, A stops after validation under the real lock. B starts
+from the same baseline and reports the production lock attempt's actual OS
+`WouldBlock` result before blocking. Allow A to commit only after observing
+that result. Assert no B commit entry while A holds the lock, then require
+A success, B conflict, winner bytes, and staging cleanup. A bounded parent
+owns both workers and releases or reaps them on failure. In-process seams
+cover an external edit, same-byte inode replacement, lock and stage/replace
+failure. A bounded subprocess test swaps the destination for a FIFO between
+staging and validation, requires refusal, then proves a later save can acquire
+the lock. A disposable enclosing workspace attempts to save over the lockfile
+and verifies the identity and bytes remain unchanged; exercise a case alias
+where the test filesystem resolves one. Synchronization seams are absent from
+normal builds.
+
+At the document boundary, capture the project and exact live tab, not just a
+relative path. Reload captures buffer version and a monotonic per-tab reload
+revision; a newer reload or save start invalidates an older reload, and reload
+does not start while saving. An accepted reload updates text and baseline
+together. A fulfilled save advances the captured live tab's baseline even if
+the buffer version changed while the write was pending; recompute dirty from
+current text. Format can only update its captured live tab at the captured
+model version; opening another tab does not retarget any in-flight result.
+Close/reopen or workspace reset invalidates that tab even at the same path.
+Apply the same applicability checks to fulfilled and rejected results: a
+superseded reload/format or disposed tab cannot report a status or error.
+Current results may update their captured, live tab, but operation feedback
+belongs only to the active tab in the current project. A current save error
+still reports its conflict and keeps the editor dirty; subsequent edits do
+not make a committed save's baseline update stale. Check delayed rejection
+after a tab or project is replaced and after save supersedes reload. Exercise
+the real document methods with controllable adapter promises and Monaco in
+browser tests; keep the existing native external-conflict acceptance as an
+end-to-end check of the actual IPC and disk boundary.
+
+**Batch 2 regression evidence:** Before changing behavior, the Chromium/Monaco
+test observed an older reload replacing both the committed buffer and disk
+baseline. A Rust staging seam separately reproduced overwriting an external
+edit placed after staging. Both focused regressions pass with the respective
+guards. The Rust worker regression waits for an actual OS `WouldBlock` while
+the first writer is paused after validation; resuming it yields one commit and
+one conflict. The subprocess-only worker entry is invoked by its parent tests;
+the top-level test runner intentionally does not run that entry standalone.
+`npm run test:feedback` passed (10 TS, 17 Rust tests, Go fixture, 11 browser
+scenarios, 17 native cases with gopls and Delve, and the standalone Quit
+probe). The native file cases verify that the lock inode is created in the
+disposable profile and retained after a refused write. Native artifacts:
+`1795739366294-16386` and `1795739408886-17770`. Strict Clippy with `e2e`
+also passed for that revision. Review then found the staging pathname gap.
+Two added Rust regressions failed before the fix: the cooperating nested
+save caused the successful outer save to commit `wrong bytes`, and a swapped
+staging pathname could be committed. Both now pass, including the case where
+a destination conflict takes the cleanup path and must preserve the replaced
+staging file.
+Final full feedback passed (10 TS, 19 Rust tests, Go fixture, 11 browser
+scenarios, 17 native cases with gopls and Delve, and the separate Quit probe).
+Final native artifacts: `1795739659941-18897` and `1795739956770-20575`.
+Strict Clippy with `e2e` and the release `.app` build passed; test-only save
+worker and document fixture markers were absent from the shipped artifacts.
+Independent code re-review approved this batch.
 
 ## 3. Simplify the workbench with behavior pinned
 

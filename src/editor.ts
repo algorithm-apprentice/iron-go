@@ -26,6 +26,7 @@ export interface DocumentTab {
   clean: string;
   dirty: boolean;
   saving: boolean;
+  reloadRevision: number;
   viewState: monaco.editor.ICodeEditorViewState | null;
   subscription: monaco.IDisposable;
 }
@@ -168,7 +169,7 @@ export class Documents {
           const model = monaco.editor.createModel(disk, language, uri);
           model.updateOptions({ insertSpaces: language !== "go", tabSize: 4, indentSize: 4, trimAutoWhitespace: true });
           const created: DocumentTab = {
-            path, model, disk, clean: bufferText(model), dirty: false, saving: false, viewState: null,
+            path, model, disk, clean: bufferText(model), dirty: false, saving: false, reloadRevision: 0, viewState: null,
             subscription: model.onDidChangeContent(() => {
               const dirty = bufferText(model) !== created.clean;
               if (dirty !== created.dirty) {
@@ -236,37 +237,66 @@ export class Documents {
     this.events.changed();
   }
 
+  private isLive(folder: Project, tab: DocumentTab) {
+    return this.folder === folder && this.tabs.get(tab.path) === tab && !tab.model.isDisposed();
+  }
+
   async save(tab: DocumentTab) {
     const folder = this.folder;
-    if (!folder || !tab.dirty || tab.saving) return false;
+    if (!folder || !this.isLive(folder, tab) || !tab.dirty || tab.saving) return false;
     const text = bufferText(tab.model);
+    tab.reloadRevision++;
     tab.saving = true;
     this.events.changed();
     try {
       await folder.save(tab.path, tab.disk, text);
-      if (this.folder !== folder || tab.model.isDisposed()) return false;
+      if (!this.isLive(folder, tab)) return false;
       tab.disk = text;
       tab.clean = text;
       tab.dirty = bufferText(tab.model) !== text;
       this.events.saved(tab);
       return true;
+    } catch (error) {
+      if (!this.isLive(folder, tab)) return false;
+      throw error;
     } finally {
       tab.saving = false;
-      this.events.changed();
+      if (this.isLive(folder, tab)) this.events.changed();
     }
   }
 
-  async reload(tab: DocumentTab) {
+  private async applyFileResult(tab: DocumentTab, folder: Project, read: () => Promise<string>, apply: (text: string) => void, current = () => true) {
     const version = tab.model.getVersionId();
-    const disk = await this.folder?.read(tab.path);
-    if (disk === undefined || tab.model.isDisposed() || version !== tab.model.getVersionId()) return false;
-    tab.model.setValue(disk);
-    tab.disk = disk;
-    tab.clean = bufferText(tab.model);
-    tab.dirty = false;
-    this.events.changed();
-    this.events.saved(tab);
+    const applicable = () => this.isLive(folder, tab) && version === tab.model.getVersionId() && current();
+    let text: string;
+    try { text = await read(); }
+    catch (error) {
+      if (!applicable()) return false;
+      throw error;
+    }
+    if (!applicable()) return false;
+    apply(text);
     return true;
+  }
+
+  async reload(tab: DocumentTab) {
+    const folder = this.folder;
+    if (!folder || !this.isLive(folder, tab) || tab.saving) return false;
+    const revision = ++tab.reloadRevision;
+    return this.applyFileResult(tab, folder, () => folder.read(tab.path), disk => {
+      tab.model.setValue(disk);
+      tab.disk = disk;
+      tab.clean = bufferText(tab.model);
+      tab.dirty = false;
+      this.events.changed();
+      this.events.saved(tab);
+    }, () => revision === tab.reloadRevision);
+  }
+
+  async format(tab: DocumentTab, format: (text: string) => Promise<string>) {
+    const folder = this.folder;
+    if (!folder || !this.isLive(folder, tab)) return false;
+    return this.applyFileResult(tab, folder, () => format(tab.model.getValue()), text => replaceBuffer(tab.model, text));
   }
 
   get dirty() { return [...this.tabs.values()].some(tab => tab.dirty); }

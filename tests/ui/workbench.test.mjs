@@ -9,9 +9,12 @@ import { build, preview } from "vite";
 
 let server, browser, url, assets;
 const fixture = fileURLToPath(new URL("../fixtures/orbit", import.meta.url));
+const documentsFixture = new URL("./fixtures/documents.html", import.meta.url);
 before(async () => {
   assets = await mkdtemp(join(tmpdir(), "iron-go-ui-"));
-  await build({ build: { outDir: assets, emptyOutDir: true }, logLevel: "warn" });
+  await build({ build: { outDir: assets, emptyOutDir: true, rolldownOptions: {
+    input: ["index.html", fileURLToPath(documentsFixture)],
+  } }, logLevel: "warn" });
   server = await preview({ build: { outDir: assets }, preview: { port: 0, host: "127.0.0.1" } });
   url = server.resolvedUrls.local[0];
   browser = await chromium.launch();
@@ -27,7 +30,7 @@ async function openFixture(page) {
   await page.getByRole("tab", { name: "main.go", exact: true, selected: true }).waitFor({ timeout: 8000 });
 }
 
-async function scenario(name, run, withProject = true) {
+async function scenario(name, run, withProject = true, entry = "") {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   let page;
   const logs = [];
@@ -36,8 +39,8 @@ async function scenario(name, run, withProject = true) {
     page = await context.newPage();
     page.on("pageerror", error => logs.push(error.stack));
     page.on("console", message => { if (message.type() === "error") logs.push(message.text()); });
-    await page.goto(url);
-    await page.locator("#project-welcome").waitFor({ timeout: 8000 });
+    await page.goto(new URL(entry, url).href);
+    if (!entry) await page.locator("#project-welcome").waitFor({ timeout: 8000 });
     if (withProject) await openFixture(page);
     await run(page);
     assert.deepEqual(logs, []);
@@ -52,6 +55,123 @@ async function scenario(name, run, withProject = true) {
     await context.close();
   }
 }
+
+function documentScenario(name, run) {
+  return scenario(name, async page => {
+    await page.waitForFunction(() => !!window.documents);
+    await run(page);
+  }, false, "tests/ui/fixtures/documents.html");
+}
+
+test("a delayed reload cannot replace a committed save's text or baseline", async () => {
+  await documentScenario("reload-after-save", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs, documentState } = window;
+      const read = Promise.withResolvers();
+      const write = Promise.withResolvers();
+      let firstRead = true;
+      let sent;
+      docs.reset({
+        read: () => { if (!firstRead) return read.promise; firstRead = false; return Promise.resolve("original"); },
+        save: (_path, expected, text) => { sent = { expected, text }; return write.promise; },
+      });
+      const tab = await docs.open("data.txt");
+      tab.model.setValue("committed");
+      const reload = docs.reload(tab);
+      const save = docs.save(tab);
+      write.resolve();
+      const saved = await save;
+      read.resolve("original");
+      return { saved, reloaded: await reload, sent, ...documentState(tab) };
+    });
+    assert.deepEqual(outcome, {
+      saved: true, reloaded: false, sent: { expected: "original", text: "committed" },
+      text: "committed", disk: "committed", dirty: false,
+    });
+  });
+});
+
+test("save advances the baseline without discarding typing or reporting an invalidated reload error", async () => {
+  await documentScenario("typed-while-saving", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs, documentState } = window;
+      const read = Promise.withResolvers();
+      const write = Promise.withResolvers();
+      const sent = [];
+      let firstRead = true;
+      docs.reset({
+        read: () => { if (!firstRead) return read.promise; firstRead = false; return Promise.resolve("original"); },
+        save: (_path, expected, text) => {
+          sent.push({ expected, text });
+          return sent.length === 1 ? write.promise : Promise.reject(new Error("disk conflict"));
+        },
+      });
+      const tab = await docs.open("data.txt");
+      tab.model.setValue("committed");
+      const reload = docs.reload(tab);
+      const save = docs.save(tab);
+      // Rejection without a text version change must still be stale.
+      read.reject(new Error("old reload failure"));
+      const reloaded = await reload;
+      tab.model.setValue("typed meanwhile");
+      write.resolve();
+      const saved = await save;
+      const conflict = await docs.save(tab).catch(error => error.message);
+      return { saved, reloaded, conflict, sent, ...documentState(tab) };
+    });
+    assert.deepEqual(outcome, {
+      saved: true, reloaded: false, conflict: "disk conflict", sent: [
+        { expected: "original", text: "committed" },
+        { expected: "committed", text: "typed meanwhile" },
+      ], text: "typed meanwhile", disk: "committed", dirty: true,
+    });
+  });
+});
+
+test("a delayed error cannot leak after closing a tab or replacing a project", async () => {
+  await documentScenario("obsolete-file-errors", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs, documentState } = window;
+      const read = Promise.withResolvers();
+      const format = Promise.withResolvers();
+      let reads = 0;
+      docs.reset({ read: () => ++reads === 2 ? read.promise : Promise.resolve("original") });
+      const tab = await docs.open("main.go");
+      const reload = docs.reload(tab);
+      docs.close(tab);
+      const reopened = await docs.open("main.go");
+      read.reject(new Error("closed reload"));
+      const reloaded = await reload;
+      const formatting = docs.format(reopened, () => format.promise);
+      docs.reset({ read: () => Promise.resolve("new project") });
+      const active = await docs.open("main.go");
+      format.reject(new Error("old project format"));
+      return { reloaded, formatted: await formatting, ...documentState(active) };
+    });
+    assert.deepEqual(outcome, { reloaded: false, formatted: false, text: "new project", disk: "new project", dirty: false });
+  });
+});
+
+test("a delayed format cannot replace newer edits or write to the newly active tab", async () => {
+  await documentScenario("obsolete-format", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs, documentState } = window;
+      const format = Promise.withResolvers();
+      docs.reset({ read: path => Promise.resolve(path) });
+      const original = await docs.open("original.go");
+      const formatting = docs.format(original, () => format.promise);
+      original.model.setValue("new edit");
+      const active = await docs.open("active.go");
+      format.resolve("formatted");
+      return { formatted: await formatting, original: documentState(original), active: documentState(active) };
+    });
+    assert.deepEqual(outcome, {
+      formatted: false,
+      original: { text: "new edit", disk: "original.go", dirty: true },
+      active: { text: "active.go", disk: "active.go", dirty: false },
+    });
+  });
+});
 
 test("an imported test fixture uses the real workbench and quick open", async () => {
   await scenario("navigation", async page => {

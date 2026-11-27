@@ -1,12 +1,13 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File, Metadata, OpenOptions, TryLockError},
     io::{self, Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
 use regex::RegexBuilder;
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::{blocking, CommandResult, Core};
 
@@ -16,6 +17,9 @@ const MAX_DEPTH: usize = 40;
 const MAX_RESULTS: usize = 200;
 const MAX_SEARCH_BYTES: usize = 32 * 1024 * 1024;
 const HIDDEN: &[&str] = &[".git", ".DS_Store", "node_modules"];
+// Private save names use only ASCII punctuation and digits. The profile
+// lock and inode checks, not this string filter, protect stage ownership.
+const SAVE_STAGE_PREFIX: &str = ".~73827978-";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +69,9 @@ fn components(relative: &str) -> CommandResult<Vec<&str>> {
     {
         return Err("Use a relative workspace path without '.' or '..' segments.".into());
     }
+    if parts.iter().any(|part| part.starts_with(SAVE_STAGE_PREFIX)) {
+        return Err("This path is reserved for temporary saves.".into());
+    }
     Ok(parts)
 }
 
@@ -98,27 +105,190 @@ fn read_text(root: &Path, relative: &str, limit: u64) -> CommandResult<String> {
     Ok(text)
 }
 
-fn persist_text(root: &Path, relative: &str, expected: &str, text: &str) -> CommandResult<()> {
+const SAVE_LOCK: &str = "save.lock";
+const OPEN_REGULAR: libc::c_int = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+const SAVE_CONFLICT: &str = "The file changed on disk. Reload the tab before saving.";
+
+fn file_identity(info: &Metadata) -> (u64, u64) {
+    (info.dev(), info.ino())
+}
+
+fn regular_file(file: &File, action: &'static str) -> CommandResult<Metadata> {
+    let info = file.metadata().map_err(fail(action))?;
+    if !info.is_file() {
+        return Err(format!("{action}: expected a regular file."));
+    }
+    Ok(info)
+}
+
+fn open_save_target(path: &Path) -> CommandResult<(File, Metadata)> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_REGULAR)
+        .open(path)
+        .map_err(fail("Open save target"))?;
+    let info = regular_file(&file, "Read save target")?;
+    Ok((file, info))
+}
+
+fn distinct_from_lock(info: &Metadata, lock_info: &Metadata) -> CommandResult<()> {
+    if file_identity(info) == file_identity(lock_info) {
+        return Err("The app profile's save lock is reserved.".into());
+    }
+    Ok(())
+}
+
+struct SaveStage(Option<tempfile::NamedTempFile>);
+
+impl SaveStage {
+    fn new(parent: &Path) -> CommandResult<Self> {
+        let temp = tempfile::Builder::new()
+            .prefix(SAVE_STAGE_PREFIX)
+            // Only our identity-aware guard may remove this name.
+            .disable_cleanup(true)
+            .tempfile_in(parent)
+            .map_err(fail("Prepare save"))?;
+        Ok(Self(Some(temp)))
+    }
+
+    fn owns_path(temp: &tempfile::NamedTempFile) -> bool {
+        let Ok(opened) = temp.as_file().metadata() else {
+            return false;
+        };
+        fs::symlink_metadata(temp.path()).is_ok_and(|at_path| {
+            at_path.is_file() && file_identity(&opened) == file_identity(&at_path)
+        })
+    }
+
+    fn verify(&self) -> CommandResult<()> {
+        if Self::owns_path(self.0.as_ref().unwrap()) {
+            Ok(())
+        } else {
+            Err("The temporary save file was replaced. No changes were saved.".into())
+        }
+    }
+
+    fn persist(mut self, path: &Path) -> CommandResult<()> {
+        match self.0.take().unwrap().persist(path) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.0 = Some(error.file);
+                Err(fail("Save file")(error.error))
+            }
+        }
+    }
+}
+
+impl Drop for SaveStage {
+    fn drop(&mut self) {
+        if let Some(temp) = self.0.as_ref().filter(|temp| Self::owns_path(temp)) {
+            let _ = fs::remove_file(temp.path());
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SavePoint {
+    BeforeStage,
+    Staged,
+    Contended,
+    Validated,
+}
+
+fn persist_text(
+    root: &Path,
+    data_dir: &Path,
+    relative: &str,
+    expected: &str,
+    text: &str,
+) -> CommandResult<()> {
+    persist_text_impl(
+        root,
+        data_dir,
+        relative,
+        expected,
+        text,
+        #[cfg(test)]
+        &mut |_| Ok(()),
+    )
+}
+
+fn persist_text_impl(
+    root: &Path,
+    data_dir: &Path,
+    relative: &str,
+    expected: &str,
+    text: &str,
+    #[cfg(test)] observe: &mut impl FnMut(SavePoint) -> CommandResult<()>,
+) -> CommandResult<()> {
     if text.len() as u64 > MAX_FILE_BYTES || text.as_bytes().contains(&0) {
         return Err("Save a UTF-8 text file smaller than 2 MB.".into());
     }
-    let path = direct_path(root, &components(relative)?)?;
-    if read_text(root, relative, MAX_FILE_BYTES)? != expected {
-        return Err("The file changed on disk. Reload the tab before saving.".into());
+    let parts = components(relative)?;
+    let path = direct_path(root, &parts)?;
+    fs::create_dir_all(data_dir).map_err(fail("Prepare save lock directory"))?;
+    // Keep this file and inode stable for all cooperating writers in the
+    // profile, including when a workspace encloses the data directory.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(OPEN_REGULAR)
+        .open(data_dir.join(SAVE_LOCK))
+        .map_err(fail("Open save lock"))?;
+    let lock_info = regular_file(&lock, "Read save lock")?;
+    // Keep the original handle alive so its inode cannot be reused during
+    // this transaction, even if the destination is replaced while waiting.
+    let (_initial, staged_info) = open_save_target(&path)?;
+    distinct_from_lock(&staged_info, &lock_info)?;
+    match lock.try_lock() {
+        Ok(()) => (),
+        Err(TryLockError::WouldBlock) => {
+            #[cfg(test)]
+            observe(SavePoint::Contended)?;
+            lock.lock().map_err(fail("Acquire save lock"))?;
+        }
+        Err(TryLockError::Error(error)) => return Err(fail("Acquire save lock")(error)),
     }
-    let permissions = fs::metadata(&path)
-        .map_err(fail("Read permissions"))?
-        .permissions();
-    let mut temp =
-        tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(fail("Prepare save"))?;
+    #[cfg(test)]
+    observe(SavePoint::BeforeStage)?;
+    let mut stage = SaveStage::new(path.parent().unwrap())?;
+    let temp = stage.0.as_mut().unwrap();
     temp.write_all(text.as_bytes())
         .map_err(fail("Write file"))?;
     temp.as_file()
-        .set_permissions(permissions)
+        .set_permissions(staged_info.permissions())
         .map_err(fail("Set file permissions"))?;
-    temp.persist(&path)
-        .map_err(|error| fail("Save file")(error.error))?;
-    Ok(())
+    #[cfg(test)]
+    observe(SavePoint::Staged)?;
+    let (destination, final_info) = open_save_target(&direct_path(root, &parts)?)?;
+    distinct_from_lock(&final_info, &lock_info)?;
+    if file_identity(&final_info) != file_identity(&staged_info)
+        || final_info.len() > MAX_FILE_BYTES
+    {
+        return Err(SAVE_CONFLICT.into());
+    }
+    let mut bytes = Vec::new();
+    destination
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(fail("Read save target"))?;
+    if bytes != expected.as_bytes() || bytes.len() as u64 > MAX_FILE_BYTES || bytes.contains(&0) {
+        return Err(SAVE_CONFLICT.into());
+    }
+    let current =
+        fs::symlink_metadata(direct_path(root, &parts)?).map_err(fail("Read save target"))?;
+    distinct_from_lock(&current, &lock_info)?;
+    if !current.is_file() || file_identity(&current) != file_identity(&final_info) {
+        return Err(SAVE_CONFLICT.into());
+    }
+    stage.verify()?;
+    #[cfg(test)]
+    observe(SavePoint::Validated)?;
+    stage.persist(&path)
 }
 
 fn new_file(root: &Path, relative: &str) -> CommandResult<()> {
@@ -219,7 +389,8 @@ fn collect(root: &Path) -> CommandResult<Snapshot> {
         for item in batch.flatten() {
             let name = item.file_name();
             let Some(name) = name.to_str() else { continue };
-            if HIDDEN.contains(&name) || name.contains('\\') {
+            if HIDDEN.contains(&name) || name.contains('\\') || name.starts_with(SAVE_STAGE_PREFIX)
+            {
                 continue;
             }
             let Ok(kind) = item.file_type() else { continue };
@@ -368,6 +539,7 @@ pub async fn read_file(state: State<'_, Core>, id: u64, path: String) -> Command
 
 #[tauri::command]
 pub async fn save_file(
+    app: AppHandle,
     state: State<'_, Core>,
     id: u64,
     path: String,
@@ -375,9 +547,13 @@ pub async fn save_file(
     text: String,
 ) -> CommandResult<()> {
     let root = state.0.lock().unwrap().root(id)?.to_path_buf();
+    let data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("Resolve save lock directory: {error}"))?;
     #[cfg(feature = "e2e")]
     state.1.wait().await?;
-    blocking(move || persist_text(&root, &path, &expected, &text)).await
+    blocking(move || persist_text(&root, &data_dir, &path, &expected, &text)).await
 }
 
 #[cfg(feature = "e2e")]
@@ -445,6 +621,9 @@ pub async fn search_files(
 }
 
 #[cfg(test)]
+mod save_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -459,11 +638,40 @@ mod tests {
         );
         new_file(&project.root, "sub/file.go").unwrap();
         assert!(new_file(&project.root, "sub/file.go").is_err());
-        persist_text(&project.root, "sub/file.go", "", "package sub\n").unwrap();
-        assert!(persist_text(&project.root, "sub/file.go", "", "oops").is_err());
+        let profile = dir.path().join("profile");
+        persist_text(&project.root, &profile, "sub/file.go", "", "package sub\n").unwrap();
+        assert!(persist_text(&project.root, &profile, "sub/file.go", "", "oops").is_err());
         assert_eq!(
             read_text(&project.root, "sub/file.go", 1024).unwrap(),
             "package sub\n"
+        );
+    }
+
+    #[test]
+    fn refuses_an_external_edit_after_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("file.txt");
+        fs::write(&target, "original").unwrap();
+        let profile = tempfile::tempdir().unwrap();
+        let result = persist_text_impl(
+            dir.path(),
+            profile.path(),
+            "file.txt",
+            "original",
+            "editor",
+            &mut |point| {
+                if point == SavePoint::Staged {
+                    fs::write(&target, "external").unwrap();
+                }
+                Ok(())
+            },
+        );
+        assert!(result.is_err(), "must reject a change after staging");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "external");
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "discard the staging file"
         );
     }
 

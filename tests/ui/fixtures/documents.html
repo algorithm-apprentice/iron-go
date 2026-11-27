@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Document operation fixture</title>
+<div id="editor" style="width: 800px; height: 600px"></div>
+<script type="module">
+  import { Documents, bufferText } from "../../../src/editor.ts";
+
+  const notify = () => {};
+  window.documents = new Documents(document.querySelector("#editor"), {
+    changed: notify, opened: notify, closed: notify, edited: notify, saved: notify,
+  });
+  window.documentState = tab => ({ text: bufferText(tab.model), disk: tab.disk, dirty: tab.dirty });
+</script>

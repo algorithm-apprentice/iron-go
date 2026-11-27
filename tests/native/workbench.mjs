@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { cp, mkdir, mkdtemp, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -449,6 +449,8 @@ async function nativeQuitSmoke() {
 async function standardWorkbenchSmoke() {
   const source = path.join(fixture, "cmd/orbit/main.go");
   const original = await readFile(source, "utf8");
+  const profileLock = path.join(home, "Library/Application Support/dev.irongo.e2e/save.lock");
+  let lockInode;
   const checkTheme = () => record("native theme switches both the editor and workbench", async () => {
     await eventually("workbench boot", () => js("return !!window.__ironTest && document.body.classList.contains('desktop');"));
     await click("#settings");
@@ -521,6 +523,9 @@ async function standardWorkbenchSmoke() {
     await click("#save");
     await eventually("real disk write", () => readFile(source, "utf8"), value => value === formatted.text);
     await eventually("tab clean after save", current, state => !state.dirty);
+    const lock = await stat(profileLock, { bigint: true });
+    assert.ok(lock.isFile(), "the save lock belongs to the disposable app profile");
+    lockInode = lock.ino;
   });
 
   await record("protects externally edited files from overwrite", async () => {
@@ -531,6 +536,7 @@ async function standardWorkbenchSmoke() {
     await click("#save");
     await eventually("save conflict message", () => text("#toast"), value => value.includes("changed on disk"));
     assert.equal(await readFile(source, "utf8"), external);
+    assert.equal((await stat(profileLock, { bigint: true })).ino, lockInode, "save attempts must retain the profile lock inode");
     // The test controls the confirmation answer, not the reload or its disk I/O.
     await js("window.__realConfirm = window.confirm; window.confirm = () => false; return true;");
     try {
