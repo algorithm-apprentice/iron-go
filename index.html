@@ -146,6 +146,7 @@
         </button>
         <span class="status-notice" id="status" role="status">Ready</span>
         <span class="status-detail" id="disk-change" role="status" hidden></span>
+        <button id="compare-disk" class="status-button" type="button" hidden>Compare with Disk</button>
         <div class="spacer"></div>
         <span id="cursor" class="status-detail mono">Ln 1, Col 1</span>
         <span id="indent" class="status-detail">Tab Size: 4</span>
@@ -190,6 +191,22 @@
       <label class="settings-row"><div><strong>Minimap</strong><small>Show a compact overview of the file.</small></div><input id="minimap-setting" type="checkbox" /></label>
       <label class="settings-row"><div><strong>Word wrap</strong><small>Wrap long lines to the editor width.</small></div><input id="wrap-setting" type="checkbox" /></label>
       <div class="settings-tools"><h3>Go Toolchain</h3><div id="settings-tools-info" class="view-note"></div><button id="probe-tools" class="button quiet"><span data-icon="refresh"></span>Check tools</button></div>
+    </dialog>
+    <dialog id="disk-compare-dialog" class="form-dialog disk-compare-dialog" aria-labelledby="disk-compare-title" aria-describedby="disk-compare-path disk-compare-status">
+      <form method="dialog">
+        <div class="dialog-header"><h2 id="disk-compare-title">Compare with Disk</h2></div>
+        <p id="disk-compare-path" class="mono"></p>
+        <p id="disk-compare-status" class="view-note" role="status"></p>
+        <div id="disk-compare-headings" class="disk-compare-headings" hidden>
+          <strong id="disk-compare-original"></strong><strong id="disk-compare-modified"></strong>
+        </div>
+        <div id="disk-compare-view" hidden></div>
+        <div class="dialog-actions">
+          <button id="disk-compare-cancel" class="button primary" value="cancel" autofocus>Keep Editing</button>
+          <button id="disk-compare-reload" class="button quiet" value="reload">Reload Reviewed Disk Version</button>
+          <button id="disk-compare-save" class="button quiet" value="save">Save Over Reviewed Disk Version</button>
+        </div>
+      </form>
     </dialog>
     <dialog id="project-transition-dialog" class="form-dialog" aria-labelledby="project-transition-title" aria-describedby="project-transition-description">
       <form method="dialog">

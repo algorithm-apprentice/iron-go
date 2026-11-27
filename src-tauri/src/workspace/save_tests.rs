@@ -42,6 +42,7 @@ impl Fixture {
             "file.txt",
             "original",
             "editor",
+            None,
             &mut |point| {
                 if point == SavePoint::Staged {
                     hook.take().unwrap()();
@@ -159,6 +160,83 @@ fn refuses_a_same_byte_replacement_after_staging() {
 }
 
 #[test]
+fn reviewed_save_rechecks_identity_and_metadata_under_the_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    for move_parent in [false, true] {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.root.join("nested")).unwrap();
+        let target = fixture.root.join("nested/file.txt");
+        fs::write(&target, "original").unwrap();
+        let workspace = Workspace::open(&fixture.root).unwrap();
+        let version = review_version(&target.metadata().unwrap());
+        let retired = fixture.root.join("retired");
+        let result = persist_text_impl(
+            &workspace.root,
+            &fixture.profile,
+            "nested/file.txt",
+            "original",
+            "editor",
+            Some((&workspace.anchor, Some(&version))),
+            &mut |point| {
+                if move_parent && point == SavePoint::BeforeStage {
+                    fs::rename(fixture.root.join("nested"), &retired).unwrap();
+                    fs::create_dir(fixture.root.join("nested")).unwrap();
+                    fs::hard_link(retired.join("file.txt"), &target).unwrap();
+                }
+                if !move_parent && point == SavePoint::Staged {
+                    let mut permissions = target.metadata().unwrap().permissions();
+                    permissions.set_mode(permissions.mode() ^ 0o100);
+                    fs::set_permissions(&target, permissions).unwrap();
+                }
+                Ok(())
+            },
+        );
+        let error = result.unwrap_err();
+        assert!(
+            error.contains(if move_parent {
+                "directory has been replaced"
+            } else {
+                "Compare again"
+            }),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert_eq!(
+            fs::read_dir(fixture.root.join("nested")).unwrap().count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn staging_identity_does_not_depend_on_read_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    for conflicting in [false, true] {
+        let fixture = Fixture::new();
+        let result = fixture.staged(|| {
+            let stage = fs::read_dir(&fixture.root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path != &fixture.target)
+                .unwrap();
+            fs::set_permissions(stage, fs::Permissions::from_mode(0)).unwrap();
+            if conflicting {
+                fs::write(&fixture.target, "external").unwrap();
+            }
+        });
+        if conflicting {
+            assert_eq!(result.unwrap_err(), SAVE_CONFLICT);
+            assert_eq!(fs::read_to_string(&fixture.target).unwrap(), "external");
+        } else {
+            result.unwrap();
+            fs::set_permissions(&fixture.target, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(fs::read_to_string(&fixture.target).unwrap(), "editor");
+        }
+        fixture.only_target();
+    }
+}
+
+#[test]
 fn lock_and_replace_errors_leave_original_bytes() {
     let fixture = Fixture::new();
     // A non-directory in place of the profile makes lock creation fail.
@@ -174,6 +252,7 @@ fn lock_and_replace_errors_leave_original_bytes() {
         "file.txt",
         "original",
         "editor",
+        None,
         &mut |point| {
             if point == SavePoint::Validated {
                 let staged = fs::read_dir(&fixture.root)
@@ -201,6 +280,7 @@ fn staging_failure_does_not_change_the_destination() {
         "file.txt",
         "original",
         "editor",
+        None,
         &mut |point| {
             if point == SavePoint::BeforeStage {
                 fs::rename(&fixture.root, &moved).unwrap();
@@ -327,6 +407,7 @@ fn save_worker() {
         "file.txt",
         "original",
         &role,
+        None,
         &mut |point| {
             match (role.as_str(), point) {
                 ("first", SavePoint::Validated) => {

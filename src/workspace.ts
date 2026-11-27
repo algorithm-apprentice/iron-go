@@ -14,7 +14,8 @@ export interface NativeFolder { id: number; name: string; path: string }
 export interface RunTarget { package: string; importPath: string }
 export interface GoPackages { targets: RunTarget[]; allScopes: string[] }
 export type ServerEvent = { type: "message"; message: unknown } | { type: "closed"; reason: string };
-export type DiskObservation = { kind: "text"; text: string } | { kind: "missing" | "unavailable" | "retry" };
+export type ReadableDisk = { kind: "text"; text: string; version: string };
+export type DiskObservation = ReadableDisk | { kind: "missing" | "unavailable" | "retry" };
 
 function channel<T>(handler: (event: T) => void) {
   const stream = new Channel<T>();
@@ -52,7 +53,7 @@ export interface Project {
   snapshot(): Promise<ProjectSnapshot>;
   read(path: string): Promise<string>;
   inspect?(path: string): Promise<DiskObservation>;
-  save(path: string, expected: string, text: string): Promise<void>;
+  save(path: string, expected: string, text: string, reviewedVersion?: string): Promise<void>;
   createFile(path: string): Promise<void>;
   search(query: string, caseSensitive: boolean): Promise<SearchResult>;
 }
@@ -64,7 +65,7 @@ export function nativeProject(native: NativeFolder): Project {
     snapshot: () => invoke<ProjectSnapshot>("snapshot", { id }),
     read: (path) => invoke<string>("read_file", { id, path }),
     inspect: (path) => invoke<DiskObservation>("inspect_file", { id, path }),
-    save: (path, expected, text) => invoke<void>("save_file", { id, path, expected, text }),
+    save: (path, expected, text, reviewedVersion) => invoke<void>("save_file", { id, path, expected, text, reviewedVersion }),
     createFile: (path) => invoke<void>("create_file", { id, path }),
     search: (query, caseSensitive) => invoke<SearchResult>("search_files", { id, query, caseSensitive }),
   };

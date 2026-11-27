@@ -161,6 +161,35 @@ test("clean external reload is undoable against the new baseline and adopts a ne
   });
 });
 
+test("Escape cancels a loading disk comparison and mixed endings cannot authorize a write", async () => {
+  await documentScenario("cancel-disk-comparison", async page => {
+    await page.evaluate(() => {
+      const disk = Promise.withResolvers();
+      const details = { path: "data.txt", language: "plaintext", buffer: "editor\n", dirty: true, current: () => true };
+      window.pendingDiskReview = { details, disk, result: window.diskComparison({ ...details, load: () => disk.promise }) };
+    });
+    const dialog = page.getByRole("dialog", { name: "Compare with Disk" });
+    await dialog.waitFor();
+    assert.match(await dialog.innerText(), /Reading the disk version/);
+    await page.keyboard.press("Escape");
+    await dialog.waitFor({ state: "hidden" });
+    await page.evaluate(async () => {
+      const { details, disk, result } = window.pendingDiskReview;
+      if (await result !== undefined) throw new Error("Escape authorized an action");
+      disk.resolve({ kind: "text", text: "late disk read", version: "late" });
+      window.mixedDiskReview = window.diskComparison({ ...details,
+        load: async () => ({ kind: "text", text: "\ufeffdisk\r\nline\n", version: "mixed" }) });
+    });
+    await dialog.getByText(/Mixed line endings/).waitFor();
+    assert.match(await dialog.locator("#disk-compare-original").innerText(), /UTF-8 BOM · CRLF \/ LF/);
+    assert.equal(await dialog.getByRole("button", { name: "Reload Reviewed Disk Version" }).isDisabled(), true);
+    assert.equal(await dialog.getByRole("button", { name: "Save Over Reviewed Disk Version" }).isDisabled(), true);
+    await dialog.getByRole("button", { name: "Keep Editing" }).click();
+    assert.equal(await page.evaluate(async () => (await window.mixedDiskReview) === undefined), true);
+    assert.equal(await page.locator("#disk-compare-view .monaco-diff-editor").count(), 0);
+  });
+});
+
 test("save advances the baseline without discarding typing or reporting an invalidated reload error", async () => {
   await documentScenario("typed-while-saving", async page => {
     const outcome = await page.evaluate(async () => {

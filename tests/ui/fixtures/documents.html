@@ -8,6 +8,12 @@
   import { DebugSession } from "../../../src/debugger.ts";
   import { ExecutionLane } from "../../../src/execution.ts";
   import { createCursorTestWorkflow } from "../../../src/cursor-test-workflow.ts";
+  import { showDiskComparison } from "../../../src/disk-compare.ts";
+  import workbenchMarkup from "../../../index.html?raw";
+
+  const shell = new DOMParser().parseFromString(workbenchMarkup, "text/html");
+  document.body.append(shell.getElementById("disk-compare-dialog"));
+  window.diskComparison = showDiskComparison;
 
   const notify = () => {};
   window.documents = new Documents(document.querySelector("#editor"), {

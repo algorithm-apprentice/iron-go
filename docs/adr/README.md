@@ -20,3 +20,4 @@ record detailed behavior, alternatives, implementation order, and acceptance.
 | [0013](0013-go-syntax-colors.md) | Give Go tokens their own color rules | Accepted |
 | [0014](0014-editor-typography.md) | Bundle JetBrains Mono as the editor default | Accepted |
 | [0015](0015-external-file-reconciliation.md) | Reconcile native filesystem changes against document baselines | Accepted design |
+| [0016](0016-reviewed-disk-conflicts.md) | Bind a disk conflict decision to the version shown to the user | Accepted design |

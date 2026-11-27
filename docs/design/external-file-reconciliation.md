@@ -117,3 +117,5 @@ decisions and are not shortcuts around this slice's guarantees.
   deterministic injection of FSEvents overflow and a first-open IPC delay
   are not part of this verification. Conflict comparison and resolution are
   follow-up work; this slice marks the condition and preserves both versions.
+
+See [reviewed disk conflicts](reviewed-disk-conflicts.md) for the next slice.

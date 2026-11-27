@@ -798,6 +798,101 @@ async function fileSuite() {
       await diskState(readmePath, "");
     } finally { await select(goPath, "cmd/orbit/main.go"); }
   });
+  await record("native disk comparison authorizes only the versions the user reviewed", async () => {
+    const saved = await readFile(source, "utf8");
+    const edited = saved + "\n// Reviewed editor version\n";
+    const incoming = saved + "\n// Reviewed disk version\n";
+    const visible = () => js("return document.querySelector('#disk-compare-dialog')?.open === true;");
+    const compare = async () => {
+      await click("#compare-disk");
+      await eventually("the disk comparison captured a version and enabled its actions", () => js(`
+        return document.querySelector('#disk-compare-dialog')?.open && !document.querySelector('#disk-compare-reload').disabled;
+      `));
+    };
+    const settled = () => eventually("the file decision has settled", () => js("return !document.querySelector('#disk-compare-dialog')?.open && !document.querySelector('#save').disabled;"));
+    const ready = () => eventually("the disk conflict is visible", () => text("#disk-change"), value => /changed on disk/i.test(value));
+    await replace(edited);
+    await writeFile(source, incoming);
+    await ready();
+    await compare();
+    const sides = () => js(`return ['.editor.original', '.editor.modified'].map(selector =>
+      document.querySelector('#disk-compare-view ' + selector + ' .view-lines')?.textContent ?? '');`);
+    await eventually("the diff shows disk on the left and the captured editor on the right", sides,
+      ([disk, buffer]) => /disk\s+version/.test(disk) && /editor\s+version/.test(buffer));
+    await click("#disk-compare-cancel");
+    await eventually("comparison closes without edits", visible, open => !open);
+    await settled();
+    assert.equal((await current()).text, edited);
+    assert.equal(await readFile(source, "utf8"), incoming);
+
+    await compare();
+    const replacement = `${source}.replacement`;
+    await writeFile(replacement, incoming);
+    await rename(replacement, source);
+    await click("#disk-compare-save");
+    await eventually("same-byte replacement invalidates the reviewed save", () => text("#toast"), value => /compare again/i.test(value));
+    await settled();
+    assert.equal((await current()).text, edited);
+    assert.equal(await readFile(source, "utf8"), incoming);
+
+    await compare();
+    const newerDisk = incoming + "// Newer disk write\n";
+    await writeFile(source, newerDisk);
+    await click("#disk-compare-reload");
+    await eventually("a newer write invalidates the reviewed reload", () => text("#toast"), value => /before reloading/i.test(value));
+    await settled();
+    assert.equal((await current()).text, edited);
+    await compare();
+    const newerEdit = edited + "// Newer buffer edit\n";
+    await replace(newerEdit);
+    await click("#disk-compare-reload");
+    await eventually("old review cannot discard a newer buffer", () => text("#toast"), value => /editor.*changed/i.test(value));
+    await settled();
+    assert.equal((await current()).text, newerEdit);
+    await compare();
+    await click("#disk-compare-reload");
+    await eventually("a current review can adopt the observed disk bytes", current, state => state?.text === newerDisk && !state.dirty);
+
+    await replace(edited);
+    await writeFile(source, incoming);
+    await ready();
+    await compare();
+    await click("#disk-compare-save");
+    await eventually("a current review can save the editor bytes", () => readFile(source, "utf8"), value => value === edited);
+    await eventually("the reviewed save advances the baseline", current, state => state?.text === edited && !state.dirty);
+
+    const intendedSave = edited + "// Captured before the held save\n";
+    const typedDuringSave = intendedSave + "// Typed during save\n";
+    const crlf = edited.replaceAll("\n", "\r\n");
+    await replace(intendedSave);
+    await writeFile(source, crlf);
+    await ready();
+    await compare();
+    await eventually("the review identifies line-ending-only disk changes", () => text("#disk-compare-original"), value => value.includes("CRLF"));
+    assert.match(await text("#disk-compare-modified"), /· LF$/);
+    await js("window.__reviewHoldReady = false; void window.__ironTest.holdSave(true).then(() => window.__reviewHoldReady = true); return true;");
+    await eventually("reviewed save barrier enabled", () => js("return window.__reviewHoldReady;"));
+    try {
+      await click("#disk-compare-save");
+      await eventually("reviewed save is waiting at the native barrier", () => js(`
+        if (!window.__reviewAtBarrier) void window.__ironTest.holdSave().then(waiting => window.__reviewAtBarrier = waiting);
+        return !!window.__reviewAtBarrier;
+      `));
+      const before = await js("return window.__ironTest.quitRequests();");
+      await js("void window.__ironTest.quitMenu(); return true;");
+      await eventually("native Quit reaches the workbench during reviewed save", () => js("return window.__ironTest.quitRequests();"), count => count === before + 1);
+      assert.equal(await js("return document.querySelector('#quit-dialog').open;"), false);
+      await js("window.__ironTest.revealLine(arguments[0]); window.__ironTest.tryType(arguments[1]); return true;",
+        intendedSave.split("\n").length, "// Typed during save\n");
+      await eventually("the live editor accepts typing during reviewed save", current, state => state?.text === typedDuringSave && state.dirty);
+    } finally { await js("void window.__ironTest.holdSave(false); return true;"); }
+    await eventually("reviewed save writes only its captured buffer", () => readFile(source, "utf8"), value => value === intendedSave);
+    await eventually("later typing stays dirty", current, state => state?.text === typedDuringSave && state.dirty);
+    await eventually("reviewed save settles without exiting", () => js("return !window.__ironTest.saving() && !document.querySelector('#save').disabled;"));
+    await click("#save");
+    await eventually("ordinary save can use that new baseline", () => readFile(source, "utf8"), value => value === typedDuringSave);
+    await eventually("the newer buffer is saved", current, state => !state.dirty);
+  });
   await record("changing only go.work contents refreshes native run targets", async () => {
     const nested = path.join(fixture, "nested-watch-module");
     const workfile = path.join(fixture, "go.work");

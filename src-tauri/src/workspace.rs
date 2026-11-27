@@ -1,9 +1,17 @@
 use std::{
     collections::hash_map::DefaultHasher,
+    ffi::CString,
     fs::{self, File, Metadata, OpenOptions, TryLockError},
     hash::{Hash, Hasher},
     io::{self, Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    mem::MaybeUninit,
+    os::{
+        fd::AsRawFd,
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt},
+        },
+    },
     path::{Path, PathBuf},
 };
 
@@ -11,7 +19,7 @@ use regex::RegexBuilder;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
-use crate::workspace_disk::{DiskObservation, RootAnchor};
+use crate::workspace_disk::{create_at, open_at, review_version, DiskObservation, RootAnchor};
 use crate::{blocking, CommandResult, Core};
 
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -130,16 +138,6 @@ fn regular_file(file: &File, action: &'static str) -> CommandResult<Metadata> {
     Ok(info)
 }
 
-fn open_save_target(path: &Path) -> CommandResult<(File, Metadata)> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(OPEN_REGULAR)
-        .open(path)
-        .map_err(fail("Open save target"))?;
-    let info = regular_file(&file, "Read save target")?;
-    Ok((file, info))
-}
-
 fn distinct_from_lock(info: &Metadata, lock_info: &Metadata) -> CommandResult<()> {
     if file_identity(info) == file_identity(lock_info) {
         return Err("The app profile's save lock is reserved.".into());
@@ -147,51 +145,83 @@ fn distinct_from_lock(info: &Metadata, lock_info: &Metadata) -> CommandResult<()
     Ok(())
 }
 
-struct SaveStage(Option<tempfile::NamedTempFile>);
+struct SaveStage {
+    parent: File,
+    temporary: tempfile::NamedTempFile,
+    name: CString,
+    committed: bool,
+}
 
 impl SaveStage {
-    fn new(parent: &Path) -> CommandResult<Self> {
-        let temp = tempfile::Builder::new()
+    fn new(parent: &File, path: &Path) -> CommandResult<Self> {
+        let parent = parent.try_clone().map_err(fail("Prepare save"))?;
+        let temporary = tempfile::Builder::new()
             .prefix(SAVE_STAGE_PREFIX)
             // Only our identity-aware guard may remove this name.
             .disable_cleanup(true)
-            .tempfile_in(parent)
+            .make_in(path, |candidate| {
+                create_at(&parent, candidate.file_name().unwrap().as_bytes(), 0o600)
+            })
             .map_err(fail("Prepare save"))?;
-        Ok(Self(Some(temp)))
-    }
-
-    fn owns_path(temp: &tempfile::NamedTempFile) -> bool {
-        let Ok(opened) = temp.as_file().metadata() else {
-            return false;
-        };
-        fs::symlink_metadata(temp.path()).is_ok_and(|at_path| {
-            at_path.is_file() && file_identity(&opened) == file_identity(&at_path)
+        let name = CString::new(temporary.path().file_name().unwrap().as_bytes())
+            .expect("generated staging name");
+        Ok(Self {
+            parent,
+            temporary,
+            name,
+            committed: false,
         })
     }
 
+    fn owns_path(&self) -> bool {
+        let Ok(opened) = self.temporary.as_file().metadata() else {
+            return false;
+        };
+        let mut at_path = MaybeUninit::<libc::stat>::uninit();
+        // Check the name without reopening it for read access. The temporary
+        // file may already have the destination's restrictive permissions.
+        if unsafe {
+            libc::fstatat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                at_path.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return false;
+        }
+        let at_path = unsafe { at_path.assume_init() };
+        at_path.st_mode & libc::S_IFMT == libc::S_IFREG
+            && file_identity(&opened) == (at_path.st_dev as u64, at_path.st_ino)
+    }
+
     fn verify(&self) -> CommandResult<()> {
-        if Self::owns_path(self.0.as_ref().unwrap()) {
+        if self.owns_path() {
             Ok(())
         } else {
             Err("The temporary save file was replaced. No changes were saved.".into())
         }
     }
 
-    fn persist(mut self, path: &Path) -> CommandResult<()> {
-        match self.0.take().unwrap().persist(path) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                self.0 = Some(error.file);
-                Err(fail("Save file")(error.error))
-            }
+    fn persist(mut self, leaf: &str) -> CommandResult<()> {
+        let leaf = CString::new(leaf).expect("validated destination name");
+        let parent = self.parent.as_raw_fd();
+        // Both names are resolved inside the same open destination directory.
+        if unsafe { libc::renameat(parent, self.name.as_ptr(), parent, leaf.as_ptr()) } == 0 {
+            self.committed = true;
+            Ok(())
+        } else {
+            Err(fail("Save file")(io::Error::last_os_error()))
         }
     }
 }
 
 impl Drop for SaveStage {
     fn drop(&mut self) {
-        if let Some(temp) = self.0.as_ref().filter(|temp| Self::owns_path(temp)) {
-            let _ = fs::remove_file(temp.path());
+        if !self.committed && self.owns_path() {
+            // The owned staging name has been verified against its open file.
+            unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0) };
         }
     }
 }
@@ -205,6 +235,7 @@ enum SavePoint {
     Validated,
 }
 
+#[cfg(test)]
 fn persist_text(
     root: &Path,
     data_dir: &Path,
@@ -212,15 +243,9 @@ fn persist_text(
     expected: &str,
     text: &str,
 ) -> CommandResult<()> {
-    persist_text_impl(
-        root,
-        data_dir,
-        relative,
-        expected,
-        text,
-        #[cfg(test)]
-        &mut |_| Ok(()),
-    )
+    persist_text_impl(root, data_dir, relative, expected, text, None, &mut |_| {
+        Ok(())
+    })
 }
 
 fn persist_text_impl(
@@ -229,13 +254,53 @@ fn persist_text_impl(
     relative: &str,
     expected: &str,
     text: &str,
+    bound: Option<(&RootAnchor, Option<&str>)>,
     #[cfg(test)] observe: &mut impl FnMut(SavePoint) -> CommandResult<()>,
 ) -> CommandResult<()> {
     if text.len() as u64 > MAX_FILE_BYTES || text.as_bytes().contains(&0) {
         return Err("Save a UTF-8 text file smaller than 2 MB.".into());
     }
     let parts = components(relative)?;
-    let path = direct_path(root, &parts)?;
+    let (leaf, parents) = parts.split_last().unwrap();
+    let canonical;
+    let local_anchor;
+    let (root, anchor, reviewed) = match bound {
+        Some((anchor, reviewed)) => (root, anchor, reviewed),
+        None => {
+            canonical = root
+                .canonicalize()
+                .map_err(fail("Open workspace directory"))?;
+            local_anchor = RootAnchor::new(&canonical).map_err(fail("Open workspace directory"))?;
+            (canonical.as_path(), &local_anchor, None)
+        }
+    };
+    anchor.verify(root)?;
+    let parent = anchor
+        .open_directory(parents)
+        .map_err(fail("Open save directory"))?;
+    let parent_identity = file_identity(&parent.metadata().map_err(fail("Read save directory"))?);
+    let verify_parent = || -> CommandResult<()> {
+        anchor.verify(root)?;
+        let current = anchor
+            .open_directory(parents)
+            .and_then(|dir| dir.metadata())
+            .map_err(fail("Read save directory"))?;
+        if file_identity(&current) != parent_identity {
+            return Err("The save directory has been replaced.".into());
+        }
+        Ok(())
+    };
+    let open_target = || {
+        let file = open_at(&parent, leaf.as_bytes(), libc::O_NONBLOCK)
+            .map_err(fail("Open save target"))?;
+        let info = regular_file(&file, "Read save target")?;
+        Ok::<_, String>((file, info))
+    };
+    let conflict = if reviewed.is_some() {
+        "The reviewed disk version changed. Compare again before saving."
+    } else {
+        SAVE_CONFLICT
+    };
     fs::create_dir_all(data_dir).map_err(fail("Prepare save lock directory"))?;
     // Keep this file and inode stable for all cooperating writers in the
     // profile, including when a workspace encloses the data directory.
@@ -251,7 +316,7 @@ fn persist_text_impl(
     let lock_info = regular_file(&lock, "Read save lock")?;
     // Keep the original handle alive so its inode cannot be reused during
     // this transaction, even if the destination is replaced while waiting.
-    let (_initial, staged_info) = open_save_target(&path)?;
+    let (_initial, staged_info) = open_target()?;
     distinct_from_lock(&staged_info, &lock_info)?;
     match lock.try_lock() {
         Ok(()) => (),
@@ -264,8 +329,10 @@ fn persist_text_impl(
     }
     #[cfg(test)]
     observe(SavePoint::BeforeStage)?;
-    let mut stage = SaveStage::new(path.parent().unwrap())?;
-    let temp = stage.0.as_mut().unwrap();
+    verify_parent().map_err(|error| format!("Prepare save: {error}"))?;
+    let path = root.join(relative);
+    let mut stage = SaveStage::new(&parent, path.parent().unwrap())?;
+    let temp = &mut stage.temporary;
     temp.write_all(text.as_bytes())
         .map_err(fail("Write file"))?;
     temp.as_file()
@@ -273,12 +340,12 @@ fn persist_text_impl(
         .map_err(fail("Set file permissions"))?;
     #[cfg(test)]
     observe(SavePoint::Staged)?;
-    let (destination, final_info) = open_save_target(&direct_path(root, &parts)?)?;
+    let (destination, final_info) = open_target()?;
     distinct_from_lock(&final_info, &lock_info)?;
     if file_identity(&final_info) != file_identity(&staged_info)
         || final_info.len() > MAX_FILE_BYTES
     {
-        return Err(SAVE_CONFLICT.into());
+        return Err(conflict.into());
     }
     let mut bytes = Vec::new();
     destination
@@ -286,18 +353,22 @@ fn persist_text_impl(
         .read_to_end(&mut bytes)
         .map_err(fail("Read save target"))?;
     if bytes != expected.as_bytes() || bytes.len() as u64 > MAX_FILE_BYTES || bytes.contains(&0) {
-        return Err(SAVE_CONFLICT.into());
+        return Err(conflict.into());
     }
-    let current =
-        fs::symlink_metadata(direct_path(root, &parts)?).map_err(fail("Read save target"))?;
+    verify_parent()?;
+    let (_current, current) = open_target()?;
     distinct_from_lock(&current, &lock_info)?;
-    if !current.is_file() || file_identity(&current) != file_identity(&final_info) {
-        return Err(SAVE_CONFLICT.into());
+    if file_identity(&current) != file_identity(&final_info)
+        || reviewed.is_some_and(|version| {
+            review_version(&final_info) != version || review_version(&current) != version
+        })
+    {
+        return Err(conflict.into());
     }
     stage.verify()?;
     #[cfg(test)]
     observe(SavePoint::Validated)?;
-    stage.persist(&path)
+    stage.persist(leaf)
 }
 
 fn new_file(root: &Path, anchor: &RootAnchor, relative: &str) -> CommandResult<()> {
@@ -436,8 +507,14 @@ fn collect(root: &Path) -> CommandResult<Snapshot> {
 
 fn package_revision(root: &Path, anchor: &RootAnchor, entries: &[Entry]) -> String {
     let mut revision = DefaultHasher::new();
+    let hash_manifest =
+        |parts: &[&str], revision: &mut DefaultHasher| match anchor.inspect(root, parts, 64 * 1024)
+        {
+            DiskObservation::Text { text, .. } => text.hash(revision),
+            unreadable => unreadable.hash(revision),
+        };
     for name in ["go.mod", "go.work"] {
-        anchor.inspect(root, &[name], 64 * 1024).hash(&mut revision);
+        hash_manifest(&[name], &mut revision);
     }
     let mut modules = 0;
     for entry in entries.iter().filter(|entry| !entry.directory) {
@@ -446,7 +523,7 @@ fn package_revision(root: &Path, anchor: &RootAnchor, entries: &[Entry]) -> Stri
             entry.path.hash(&mut revision);
             if modules < 128 {
                 if let Ok(parts) = components(&entry.path) {
-                    anchor.inspect(root, &parts, 64 * 1024).hash(&mut revision);
+                    hash_manifest(&parts, &mut revision);
                 }
                 modules += 1;
             }
@@ -573,7 +650,7 @@ pub async fn inspect_file(
 pub async fn read_file(state: State<'_, Core>, id: u64, path: String) -> CommandResult<String> {
     use DiskObservation::*;
     match inspect_file(state, id, path).await? {
-        Text { text } => Ok(text),
+        Text { text, .. } => Ok(text),
         Missing => Err("The file no longer exists.".into()),
         Unavailable => {
             Err("The file is unavailable. Open a regular UTF-8 text file smaller than 2 MB.".into())
@@ -590,6 +667,7 @@ pub async fn save_file(
     path: String,
     expected: String,
     text: String,
+    reviewed_version: Option<String>,
 ) -> CommandResult<()> {
     let (root, anchor) = observation_root(&state, id)?;
     let data_dir = app
@@ -599,8 +677,16 @@ pub async fn save_file(
     #[cfg(feature = "e2e")]
     state.1.wait().await?;
     blocking(move || {
-        anchor.verify(&root)?;
-        persist_text(&root, &data_dir, &path, &expected, &text)
+        persist_text_impl(
+            &root,
+            &data_dir,
+            &path,
+            &expected,
+            &text,
+            Some((&anchor, reviewed_version.as_deref())),
+            #[cfg(test)]
+            &mut |_| Ok(()),
+        )
     })
     .await
 }
@@ -708,6 +794,7 @@ mod tests {
             "file.txt",
             "original",
             "editor",
+            None,
             &mut |point| {
                 if point == SavePoint::Staged {
                     fs::write(&target, "external").unwrap();

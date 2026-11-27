@@ -1,6 +1,7 @@
 import "./styles.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { byId, element, Forms, message, Palette } from "./dialogs";
+import { showDiskComparison } from "./disk-compare";
 import { bufferText, defaultEditorFontSize, Documents, editorTypography, monaco, type DocumentTab } from "./editor";
 import { Feedback } from "./feedback";
 import { fileIcon, icon, prepareIcons, type Icon } from "./icons";
@@ -14,7 +15,7 @@ import { ExecutionLane } from "./execution";
 import { ProjectSnapshots } from "./project-workflow";
 import { createCursorTestWorkflow } from "./cursor-test-workflow";
 import { handleEditorCycle } from "./editor-shortcuts";
-import { desktop, host, importedProject, nativeProject, welcomeProject, type NativeFolder, type Project, type TaskKind, type ToolStatus } from "./workspace";
+import { desktop, host, importedProject, nativeProject, welcomeProject, type NativeFolder, type Project, type ReadableDisk, type TaskKind, type ToolStatus } from "./workspace";
 
 type View = "explorer" | "search" | "tasks";
 
@@ -43,6 +44,7 @@ const breakpoints = new Breakpoints();
 let executionLine: { model: monaco.editor.ITextModel; ids: string[] } | undefined;
 let formatting = false;
 let fileMutations = 0;
+let reviewingDisk = false;
 let testQuitRequests = 0;
 let quitDialogTicket: number | undefined;
 let lastExpiredQuitTicket = 0;
@@ -84,7 +86,7 @@ function cycleEditor(direction: 1 | -1) {
 }
 
 const filesBusy = () => docs.saving || formatting || fileMutations !== 0;
-const fileActionsBlocked = () => projectWorkflow.busy || execution.preparing;
+const fileActionsBlocked = () => projectWorkflow.busy || execution.preparing || reviewingDisk;
 const saveBarrier = {
   revision: () => docs.editRevision,
   dirty: () => docs.dirty,
@@ -241,6 +243,7 @@ function renderDocuments() {
   const disk = byId("disk-change");
   disk.textContent = active?.diskChange ? diskMessage[active.diskChange] : "";
   disk.hidden = !disk.textContent;
+  byId("compare-disk").hidden = !project.native || active?.diskChange !== "changed";
   updateCursor();
   syncControls();
 }
@@ -315,15 +318,56 @@ async function saveActive() {
   const target = project;
   try {
     if (!tab.dirty) { status(`${basename(tab.path)} is saved`); return; }
-    if (await docs.save(tab) && project === target) {
-      if (docs.active === tab) status(`Saved ${basename(tab.path)}`);
-      if (/(^|\/)go\.(mod|work)$/.test(tab.path)) {
-        await refresh();
-        if (project === target) void runTargets.refresh();
-      }
-      if (project === target && view === "search") scheduleSearch();
-    }
+    await saveDocument(tab);
   } catch (error) { if (project === target && docs.active === tab) showError(error); }
+}
+
+async function saveDocument(tab: DocumentTab, reviewed?: ReadableDisk) {
+  const target = project;
+  if (!await docs.save(tab, reviewed) || project !== target) return;
+  if (docs.active === tab) status(`Saved ${basename(tab.path)}`);
+  if (/(^|\/)go\.(mod|work)$/.test(tab.path)) {
+    await refresh();
+    if (project === target) void runTargets.refresh();
+  }
+  if (project === target && view === "search") scheduleSearch();
+}
+
+async function compareWithDisk() {
+  const tab = docs.active;
+  const target = project;
+  const inspect = target.inspect;
+  if (!tab || !inspect || tab.saving || tab.reloading !== undefined || fileActionsBlocked() || document.querySelector("dialog[open]")) return;
+  const release = docs.holdDiskReview(tab);
+  const version = tab.model.getVersionId();
+  const revision = tab.reloadRevision;
+  const current = () => project === target && docs.tabs.get(tab.path) === tab &&
+    version === tab.model.getVersionId() && revision === tab.reloadRevision;
+  const staleEditor = () => new Error("This editor has changed. Compare again to review the current buffer.");
+  reviewingDisk = true;
+  fileMutations++;
+  syncControls();
+  try {
+    const decision = await showDiskComparison({
+      path: tab.path, language: tab.model.getLanguageId(), buffer: bufferText(tab.model),
+      dirty: tab.dirty, current, load: () => inspect(tab.path),
+    });
+    if (!decision) return;
+    if (!current()) throw staleEditor();
+    if (decision.action === "save") await saveDocument(tab, decision.observed);
+    else {
+      if (!await docs.reload(tab, decision.observed)) throw staleEditor();
+      if (docs.active === tab) status(`Reloaded ${basename(tab.path)}`);
+    }
+  } catch (error) { if (project === target) showError(error); }
+  finally {
+    release();
+    reviewingDisk = false;
+    fileMutations--;
+    syncControls();
+    if (document.activeElement === document.body && docs.active === tab) docs.editor.focus();
+    void refreshDisk?.();
+  }
 }
 
 async function reloadActive() {
@@ -815,6 +859,7 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Search Saved Files", detail: "⇧⌘F", icon: "search", run: () => chooseView("search") },
     { label: "Save File", detail: "⌘S", icon: "save", run: saveActive },
     { label: "Reload File from Disk", icon: "refresh", run: reloadActive },
+    ...(project.native && docs.active ? [{ label: "Compare with Disk", icon: "files" as const, run: compareWithDisk }] : []),
     { label: "Format Go File", detail: "⇧⌥F", icon: "format", run: formatActive },
     { label: "Go: Run Selected Target", detail: "⌘↵", icon: "play", run: () => { void runTask("run"); } },
     { label: "Go: Choose Run Target", icon: "package", run: () => runTargets.picker.focus() },
@@ -942,6 +987,7 @@ byId("toggle-sidebar").addEventListener("click", toggleSidebar);
 byId("new-file").addEventListener("click", newFile);
 byId("format").addEventListener("click", formatActive);
 byId("save").addEventListener("click", saveActive);
+byId("compare-disk").addEventListener("click", compareWithDisk);
 const runOrStop = () => execution.task ? stopTask() : runTask(runTargets.primaryAction());
 byId("run").addEventListener("click", runOrStop);
 byId("panel-stop").addEventListener("click", stopTask);

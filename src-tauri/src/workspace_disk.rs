@@ -25,7 +25,25 @@ use crate::{
 const DIRECTORY: libc::c_int = libc::O_DIRECTORY;
 const FILE: libc::c_int = libc::O_NONBLOCK;
 
-fn open_at(parent: &File, name: &[u8], flags: libc::c_int) -> io::Result<File> {
+pub(super) fn open_at(parent: &File, name: &[u8], flags: libc::c_int) -> io::Result<File> {
+    open_at_mode(parent, name, flags, 0)
+}
+
+pub(super) fn create_at(parent: &File, name: &[u8], mode: libc::c_uint) -> io::Result<File> {
+    open_at_mode(
+        parent,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | FILE,
+        mode,
+    )
+}
+
+fn open_at_mode(
+    parent: &File,
+    name: &[u8],
+    flags: libc::c_int,
+    mode: libc::c_uint,
+) -> io::Result<File> {
     let name = CString::new(name)?;
     // The parent descriptor stays open across the call. A successful open
     // transfers the newly allocated descriptor to File.
@@ -34,7 +52,7 @@ fn open_at(parent: &File, name: &[u8], flags: libc::c_int) -> io::Result<File> {
             parent.as_raw_fd(),
             name.as_ptr(),
             libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | flags,
-            0o666 as libc::c_uint,
+            mode,
         )
     };
     if fd < 0 {
@@ -68,10 +86,11 @@ fn identity(info: &Metadata) -> (u64, u64) {
     (info.dev(), info.ino())
 }
 
-fn version(info: &Metadata) -> ((u64, u64), u64, i64, i64, i64, i64) {
+fn version(info: &Metadata) -> ((u64, u64), u64, u32, i64, i64, i64, i64) {
     (
         identity(info),
         info.len(),
+        info.mode(),
         info.mtime(),
         info.mtime_nsec(),
         info.ctime(),
@@ -79,10 +98,15 @@ fn version(info: &Metadata) -> ((u64, u64), u64, i64, i64, i64, i64) {
     )
 }
 
+pub(super) fn review_version(info: &Metadata) -> String {
+    let ((device, inode), size, mode, modified, modified_ns, changed, changed_ns) = version(info);
+    format!("{device:x}:{inode:x}:{size:x}:{mode:x}:{modified:x}:{modified_ns:x}:{changed:x}:{changed_ns:x}")
+}
+
 #[derive(Debug, Hash, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum DiskObservation {
-    Text { text: String },
+    Text { text: String, version: String },
     Missing,
     Unavailable,
     Retry,
@@ -114,21 +138,17 @@ impl RootAnchor {
         }
     }
 
+    pub(super) fn open_directory(&self, parts: &[&str]) -> io::Result<File> {
+        let mut directory = self.root.try_clone()?;
+        for part in parts {
+            directory = open_at(&directory, part.as_bytes(), DIRECTORY)?;
+        }
+        Ok(directory)
+    }
+
     fn open_file(&self, parts: &[&str]) -> io::Result<File> {
         let (leaf, parents) = parts.split_last().expect("validated workspace path");
-        let mut directory = None;
-        for parent in parents {
-            directory = Some(open_at(
-                directory.as_ref().unwrap_or(&self.root),
-                parent.as_bytes(),
-                DIRECTORY,
-            )?);
-        }
-        open_at(
-            directory.as_ref().unwrap_or(&self.root),
-            leaf.as_bytes(),
-            FILE,
-        )
+        open_at(&self.open_directory(parents)?, leaf.as_bytes(), FILE)
     }
 
     pub fn create_file(&self, path: &Path, parts: &[&str]) -> CommandResult<()> {
@@ -151,10 +171,10 @@ impl RootAnchor {
                     .map_err(|error| format!("Open workspace directory: {error}"))?,
             );
         }
-        open_at(
+        create_at(
             directory.as_ref().unwrap_or(&self.root),
             leaf.as_bytes(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | FILE,
+            0o666,
         )
         .map(|_| ())
         .map_err(|error| format!("Create file: {error}"))
@@ -194,7 +214,10 @@ impl RootAnchor {
             return Unavailable;
         }
         match String::from_utf8(bytes) {
-            Ok(text) => Text { text },
+            Ok(text) => Text {
+                text,
+                version: review_version(&initial),
+            },
             Err(_) => Unavailable,
         }
     }
@@ -337,11 +360,8 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::write(root.join("file"), "original").unwrap();
         let anchor = RootAnchor::new(&root).unwrap();
-        assert_eq!(
-            anchor.inspect(&root, &["file"], 1024),
-            DiskObservation::Text {
-                text: "original".into()
-            }
+        assert!(
+            matches!(anchor.inspect(&root, &["file"], 1024), DiskObservation::Text { text, .. } if text == "original")
         );
         fs::rename(&root, parent.path().join("retired")).unwrap();
         fs::create_dir(&root).unwrap();

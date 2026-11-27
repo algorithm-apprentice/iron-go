@@ -14,7 +14,7 @@ import "monaco-editor/editor/contrib/suggest/browser/suggestController.js";
 import "monaco-editor/features/find/register.js";
 import "./editor-font.css";
 import EditorWorker from "monaco-editor/editor/editor.worker.js?worker";
-import type { Project } from "./workspace";
+import type { Project, ReadableDisk } from "./workspace";
 
 export { monaco };
 
@@ -81,6 +81,7 @@ export class Documents {
   private edits = 0;
   private opening = new Map<string, Promise<string>>();
   private applyingDisk?: DocumentTab;
+  private reviewingDisk?: DocumentTab;
 
   get editRevision() { return this.edits; }
 
@@ -284,7 +285,7 @@ export class Documents {
     return this.folder === folder && this.tabs.get(tab.path) === tab && !tab.model.isDisposed();
   }
 
-  async save(tab: DocumentTab) {
+  async save(tab: DocumentTab, reviewed?: ReadableDisk) {
     const folder = this.folder;
     if (!folder || !this.isLive(folder, tab) || !tab.dirty || tab.saving) return false;
     const text = bufferText(tab.model);
@@ -292,7 +293,7 @@ export class Documents {
     tab.saving = true;
     this.events.changed();
     try {
-      await folder.save(tab.path, tab.disk, text);
+      await folder.save(tab.path, reviewed?.text ?? tab.disk, text, reviewed?.version);
       if (!this.isLive(folder, tab)) return false;
       tab.disk = text;
       tab.clean = text;
@@ -326,13 +327,20 @@ export class Documents {
     return true;
   }
 
-  async reload(tab: DocumentTab) {
+  async reload(tab: DocumentTab, reviewed?: ReadableDisk) {
     const folder = this.folder;
     if (!folder || !this.isLive(folder, tab) || tab.saving) return false;
     const revision = ++tab.reloadRevision;
     tab.reloading = revision;
     try {
-      return await this.applyFileResult(tab, folder, () => folder.read(tab.path), disk => {
+      return await this.applyFileResult(tab, folder, async () => {
+        if (!reviewed) return folder.read(tab.path);
+        const observed = await folder.inspect?.(tab.path);
+        if (observed?.kind !== "text" || observed.version !== reviewed.version || observed.text !== reviewed.text) {
+          throw new Error("The reviewed disk version changed. Compare again before reloading.");
+        }
+        return observed.text;
+      }, disk => {
         this.adoptDisk(tab, disk, false);
       }, () => revision === tab.reloadRevision);
     } finally {
@@ -341,13 +349,19 @@ export class Documents {
     }
   }
 
+  holdDiskReview(tab: DocumentTab) {
+    tab.reloadRevision++;
+    this.reviewingDisk = tab;
+    return () => { if (this.reviewingDisk === tab) this.reviewingDisk = undefined; };
+  }
+
   async reconcile(tab: DocumentTab) {
     const folder = this.folder;
-    if (!folder?.inspect || !this.isLive(folder, tab) || tab.saving || tab.reloading !== undefined) return true;
+    if (!folder?.inspect || !this.isLive(folder, tab) || this.reviewingDisk === tab || tab.saving || tab.reloading !== undefined) return true;
     const version = tab.model.getVersionId();
     const revision = tab.reloadRevision;
     const observed = await folder.inspect(tab.path);
-    if (!this.isLive(folder, tab)) return true;
+    if (!this.isLive(folder, tab) || this.reviewingDisk === tab) return true;
     if (version !== tab.model.getVersionId() || revision !== tab.reloadRevision || observed.kind === "retry") return false;
 
     let change: DocumentTab["diskChange"];
