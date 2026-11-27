@@ -181,6 +181,16 @@
       <label class="settings-row"><div><strong>Word wrap</strong><small>Wrap long lines to the editor width.</small></div><input id="wrap-setting" type="checkbox" /></label>
       <div class="settings-tools"><h3>Go Toolchain</h3><div id="settings-tools-info" class="view-note"></div><button id="probe-tools" class="button quiet"><span data-icon="refresh"></span>Check tools</button></div>
     </dialog>
+    <dialog id="project-transition-dialog" class="form-dialog" aria-labelledby="project-transition-title" aria-describedby="project-transition-description">
+      <form method="dialog">
+        <div class="dialog-header"><h2 id="project-transition-title">Leave this project?</h2></div>
+        <p id="project-transition-description"></p>
+        <div class="dialog-actions">
+          <button id="project-transition-cancel" class="button primary" value="cancel" autofocus>Cancel</button>
+          <button id="project-transition-continue" class="button quiet" value="continue">Continue</button>
+        </div>
+      </form>
+    </dialog>
     <dialog id="quit-dialog" class="form-dialog" aria-labelledby="quit-title" aria-describedby="quit-description">
       <form method="dialog">
         <div class="dialog-header"><h2 id="quit-title">Quit Iron Go?</h2></div>

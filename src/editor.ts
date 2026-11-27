@@ -56,7 +56,10 @@ export class Documents {
   active: DocumentTab | undefined;
   private folder: Project | undefined;
   private location = 0;
-  private opening = new Map<string, Promise<DocumentTab | undefined>>();
+  private edits = 0;
+  private opening = new Map<string, Promise<string>>();
+
+  get editRevision() { return this.edits; }
 
   constructor(private readonly element: HTMLElement, private readonly events: DocumentEvents) {
     this.editor = monaco.editor.create(element, {
@@ -152,25 +155,35 @@ export class Documents {
     return uri.path.startsWith(prefix) ? uri.path.slice(prefix.length) || undefined : undefined;
   }
 
-  async open(path: string, options: { focus?: boolean; activate?: boolean; target?: Target } = {}) {
+  async open(path: string, options: { focus?: boolean; activate?: boolean; target?: Target; current?: () => boolean } = {}) {
     const folder = this.folder;
-    if (!folder) return;
-    const { focus = false, activate = true, target } = options;
-    const location = activate ? ++this.location : this.location;
+    const { focus = false, activate = true, target, current = () => true } = options;
+    if (!folder || !current()) return;
+    // A speculative Debug lookup must never invalidate a user's pending
+    // navigation, even when the two callers share the same disk read.
+    const location = activate && !options.current ? ++this.location : this.location;
     let tab = this.tabs.get(path);
     if (!tab) {
       let pending = this.opening.get(path);
       if (!pending) {
-        const load = folder.read(path).then(disk => {
-          if (folder !== this.folder) return;
+        const load = folder.read(path).finally(() => { if (this.opening.get(path) === load) this.opening.delete(path); });
+        this.opening.set(path, load);
+        pending = load;
+      }
+      try {
+        const disk = await pending;
+        if (folder !== this.folder || !current()) return;
+        tab = this.tabs.get(path);
+        if (!tab) {
           const root = folder.native?.path;
           const uri = root ? monaco.Uri.file(`${root.replace(/\/$/, "")}/${path}`) : monaco.Uri.from({ scheme: "irongo-preview", path: `/${path}` });
           const language = path.endsWith(".go") ? "go" : path.endsWith(".md") ? "markdown" : "plaintext";
           const model = monaco.editor.createModel(disk, language, uri);
           model.updateOptions({ insertSpaces: language !== "go", tabSize: 4, indentSize: 4, trimAutoWhitespace: true });
           const created: DocumentTab = {
-            path, model, disk, clean: bufferText(model), dirty: false, saving: false, reloadRevision: 0, viewState: null,
-            subscription: model.onDidChangeContent(() => {
+             path, model, disk, clean: bufferText(model), dirty: false, saving: false, reloadRevision: 0, viewState: null,
+             subscription: model.onDidChangeContent(() => {
+              this.edits++;
               const dirty = bufferText(model) !== created.clean;
               if (dirty !== created.dirty) {
                 created.dirty = dirty;
@@ -182,15 +195,11 @@ export class Documents {
           this.tabs.set(path, created);
           this.events.opened(created);
           this.events.changed();
-          return created;
-        }).finally(() => { if (this.opening.get(path) === load) this.opening.delete(path); });
-        this.opening.set(path, load);
-        pending = load;
-      }
-      try { tab = await pending; }
-      catch (error) { if (folder === this.folder) throw error; }
+          tab = created;
+        }
+      } catch (error) { if (folder === this.folder && current()) throw error; }
     }
-    if (!tab || folder !== this.folder) return;
+    if (!tab || folder !== this.folder || !current()) return;
     if (activate && location === this.location) this.activate(tab, focus, target);
     return tab;
   }

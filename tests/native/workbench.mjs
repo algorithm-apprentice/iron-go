@@ -645,24 +645,43 @@ async function standardWorkbenchSmoke() {
     }
   }
   await record("cancelling a dirty close preserves the buffer, accepting returns to welcome", async () => {
+    await eventually("wait target can be run", () => js("return document.querySelector('#run-target').value === './cmd/wait' && !document.querySelector('#run').disabled;"));
+    const previous = (await output()).match(/agent-ready (\d+)/)?.[1];
+    await click("#run");
+    const ready = await eventually("Go child running before switching", output, value => {
+      const current = value.match(/agent-ready (\d+)/)?.[1];
+      return current && current !== previous;
+    }, 30_000);
+    const pid = Number(ready.match(/agent-ready (\d+)/)[1]);
+    const alive = () => { try { process.kill(pid, 0); return true; } catch (error) { if (error.code === "ESRCH") return false; throw error; } };
     const unsaved = (await current()).text + "\n// unsaved close acceptance\n";
     await replace(unsaved);
     const active = await current();
     assert.equal(active.dirty, true);
-    await js("window.__realConfirm = window.confirm; window.confirm = () => false; return true;");
-    try {
-      await chooseCommand("close project");
-      const state = await current();
-      assert.equal(state.root, fixture);
-      assert.equal(state.text, unsaved);
-      assert.equal(state.dirty, true);
-      await js("window.confirm = () => true; return true;");
-      await chooseCommand("close project");
-      await eventually("back at welcome", () => js("return document.querySelector('#project-welcome').hidden === false;"));
-      assert.equal((await current()).root ?? null, null);
-      assert.equal(await js("return document.querySelector('#run').disabled;"), true);
-      assert.doesNotMatch(await readFile(path.join(fixture, active.path), "utf8"), /unsaved close acceptance/);
-    } finally { await js("window.confirm = window.__realConfirm; delete window.__realConfirm; return true;"); }
+    const confirm = () => eventually("real project transition confirmation", () => js("return document.querySelector('#project-transition-dialog')?.open === true;"));
+    await click("#open-folder");
+    await confirm();
+    assert.match(await text("#project-transition-description"), /unsaved edits.*Go task/i);
+    await click("#project-transition-cancel");
+    await eventually("cancelled Open restores workbench controls", () => js("return !document.querySelector('#open-folder').disabled;"));
+    assert.equal(alive(), true, "cancelling Open must leave the child's process running");
+    await chooseCommand("close project");
+    await confirm();
+    await click("#project-transition-cancel");
+    await eventually("cancelled transition restores workbench controls", () => js("return !document.querySelector('#open-folder').disabled;"));
+    const state = await current();
+    assert.equal(state.root, fixture);
+    assert.equal(state.text, unsaved);
+    assert.equal(state.dirty, true);
+    assert.equal(alive(), true, "cancelling Close must leave the child running");
+    await chooseCommand("close project");
+    await confirm();
+    await click("#project-transition-continue");
+    await eventually("back at welcome", () => js("return document.querySelector('#project-welcome').hidden === false;"));
+    assert.equal((await current()).root ?? null, null);
+    assert.equal(await js("return document.querySelector('#run').disabled;"), true);
+    assert.doesNotMatch(await readFile(path.join(fixture, active.path), "utf8"), /unsaved close acceptance/);
+    await eventually("committed project close stops the old Go child", () => !alive());
   });
   await record("a project without an executable offers Test as its primary action", async () => {
     await rename(path.join(fixture, "cmd"), path.join(fixture, ".hidden-cmd"));
@@ -672,19 +691,37 @@ async function standardWorkbenchSmoke() {
     await eventually("library tests run from the toolbar", output, value => /PASS: TestSummary[\s\S]*exit code 0/.test(value), 60_000);
   });
   await record("New Project creates and opens a real Go module", async () => {
-    await chooseCommand("close project");
-    await eventually("welcome before creating a project", () => js("return document.querySelector('#project-welcome').hidden === false;"));
-    await click("#welcome-new");
+    const unsaved = (await current()).text + "\n// discard only after confirming new project\n";
+    await replace(unsaved);
+    await chooseCommand("new project");
     await set("#form-name", "fresh-go");
     await set("#form-module", "example.com/fresh-go");
-    await click("#form-submit");
     const newRoot = path.join(temporary, "fresh-go");
+    const confirmation = () => eventually("New Project confirmation is focused and hit-testable above the form", () => js(`
+      const cancel = document.querySelector('#project-transition-cancel');
+      const confirm = document.querySelector('#project-transition-continue');
+      const hit = button => {
+        const bounds = button.getBoundingClientRect();
+        return button.contains(document.elementFromPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2));
+      };
+      return document.querySelector('#form-dialog').open && document.querySelector('#project-transition-dialog').open
+        && document.activeElement === cancel && hit(cancel) && hit(confirm);
+    `));
+    await click("#form-submit");
+    await confirmation();
+    await click("#project-transition-cancel");
+    await eventually("New Project returns to the intact filled form", () => js("return document.querySelector('#form-dialog').open && !document.querySelector('#form-submit').disabled && document.querySelector('#form-name').value === 'fresh-go';"));
+    assert.equal((await current()).text, unsaved);
+    await assert.rejects(stat(newRoot), { code: "ENOENT" });
+    await click("#form-submit");
+    await confirmation();
+    await click("#project-transition-continue");
     await eventually("created Go module opens in Monaco", current, state => state?.root === newRoot && state?.path === "main.go", 8000);
     assert.match(await readFile(path.join(newRoot, "go.mod"), "utf8"), /^module example\.com\/fresh-go\n/);
     assert.match(await readFile(path.join(newRoot, "main.go"), "utf8"), /func main\(\)/);
     await eventually("new main package selected", () => js("return document.querySelector('#run-target').value === '.' && !document.querySelector('#run').disabled;"));
     await click("#run");
-    await eventually("new project executes", output, value => /Hello from Iron Go![\s\S]*exit code 0/.test(value));
+    await eventually("new project executes", output, value => /Hello from Iron Go![\s\S]*exit code 0/.test(value), 30_000);
   });
   await record("a clean editor exits normally on system Quit", async () => {
     assert.equal((await current()).dirty, false);

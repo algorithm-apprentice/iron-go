@@ -173,6 +173,154 @@ test("a delayed format cannot replace newer edits or write to the newly active t
   });
 });
 
+test("Run and Debug refuse to dispatch after an edit and undo while a real document saves", async () => {
+  await documentScenario("edit-revision-vetoes-launch", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs, workflowFixture: { ExecutionLane } } = window;
+      const attempts = [];
+      for (const kind of ["run", "debug"]) {
+        const lane = new ExecutionLane(() => {});
+        const sent = Promise.withResolvers();
+        const commit = Promise.withResolvers();
+        docs.reset({ read: async path => path, save: async () => { sent.resolve(); await commit.promise; } });
+        const other = await docs.open("other.go");
+        const tab = await docs.open("saved.go");
+        tab.model.setValue("to be committed");
+        let launched = false;
+        const pending = lane.start(1, kind, {
+          revision: () => docs.editRevision,
+          dirty: () => docs.dirty,
+          save: () => docs.save(tab),
+        }, async () => { launched = true; }).catch(error => error.message);
+        await sent.promise;
+        other.model.pushStackElement();
+        other.model.pushEditOperations([], [{ range: other.model.getFullModelRange(), text: "transient edit" }], () => null);
+        other.model.pushStackElement();
+        await other.model.undo();
+        commit.resolve();
+        attempts.push({ error: await pending, launched, dirty: docs.dirty });
+      }
+      return attempts;
+    });
+    assert.deepEqual(outcome, [
+      { error: "Files changed while saving. Run the task again.", launched: false, dirty: false },
+      { error: "Files changed while saving. Debug again.", launched: false, dirty: false },
+    ]);
+  });
+});
+
+test("an obsolete Debug pause cannot open a tab, but ordinary navigation can share its read", async () => {
+  await documentScenario("stale-debug-navigation", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs } = window;
+      const newFile = Promise.withResolvers();
+      const sharedFile = Promise.withResolvers();
+      const reads = [];
+      let pause = 1;
+      docs.reset({ read: async path => { reads.push(path); return path === "stale.go" ? newFile.promise : path === "shared.go" ? sharedFile.promise : path; } });
+      await docs.open("initial.go");
+      const stale = docs.open("stale.go", { focus: true, current: () => pause === 1 });
+      const sharedPause = docs.open("shared.go", { focus: true, current: () => pause === 1 });
+      pause = 2; // The same workspace started another debug session.
+      newFile.resolve("late breakpoint source");
+      const old = await stale;
+      const before = docs.active.path;
+      const ordinary = docs.open("shared.go");
+      sharedFile.resolve("ordinary navigation");
+      const [ignored, opened] = await Promise.all([sharedPause, ordinary]);
+      return { applied: !!old || !!ignored, before, active: docs.active.path, opened: opened.path, paths: [...docs.tabs.keys()], reads };
+    });
+    assert.deepEqual(outcome, { applied: false, before: "initial.go", active: "shared.go", opened: "shared.go",
+      paths: ["initial.go", "shared.go"], reads: ["initial.go", "stale.go", "shared.go"] });
+  });
+});
+
+test("an obsolete Debug pause that joins an earlier ordinary read cannot steal its activation", async () => {
+  await documentScenario("ordinary-navigation-before-debug", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs } = window;
+      const shared = Promise.withResolvers();
+      let pause = 1;
+      let reads = 0;
+      docs.reset({ read: async path => path === "next.go" ? (++reads, shared.promise) : path });
+      await docs.open("initial.go");
+      const ordinary = docs.open("next.go");
+      const joined = docs.open("next.go", { focus: true, current: () => pause === 1 });
+      pause = 2;
+      shared.resolve("ordinary navigation");
+      const [opened, obsolete] = await Promise.all([ordinary, joined]);
+      return { active: docs.active.path, opened: opened.path, obsolete: !!obsolete, reads };
+    });
+    assert.deepEqual(outcome, { active: "next.go", opened: "next.go", obsolete: false, reads: 1 });
+  });
+});
+
+test("Debug terminal-before-admission waits for the eventual server cleanup", async () => {
+  await documentScenario("debug-early-terminal", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { DebugSession } = window.workflowFixture;
+      const started = Promise.withResolvers();
+      const admission = Promise.withResolvers();
+      const cleaning = Promise.withResolvers();
+      const cleanup = Promise.withResolvers();
+      const done = Promise.withResolvers();
+      const trace = [];
+      const session = new DebugSession({ id: 1, path: "/old" }, {}, {
+        isCurrent: () => true, admitted: () => trace.push("admitted"), finished: done.resolve,
+      }, {
+        debug: (_id, _pkg, events) => { started.resolve(events); return admission.promise; },
+        stopDebug: id => { trace.push(id); cleaning.resolve(); return cleanup.promise; },
+      });
+      let finished = false;
+      void done.promise.then(() => finished = true);
+      const launch = session.start("main_test.go", "TestMain");
+      const emit = await started.promise;
+      await session.stop(); // Not yet admitted: there is no server to stop.
+      emit({ type: "closed", reason: "early exit" });
+      const beforeAdmission = { finished, stoppable: session.canStop, trace: [...trace] };
+      admission.resolve({ server: 41, output: "/old/debug" });
+      await cleaning.promise;
+      const beforeCleanup = finished;
+      cleanup.resolve();
+      return { beforeAdmission, beforeCleanup, reason: await done.promise, trace, launched: await launch === undefined };
+    });
+    assert.deepEqual(outcome, { beforeAdmission: { finished: false, stoppable: false, trace: [] }, beforeCleanup: false,
+      reason: "early exit", trace: [41], launched: true });
+  });
+});
+
+test("a delayed Debug breakpoint reply cannot update the new project's marks", async () => {
+  await documentScenario("stale-debug-breakpoints", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { DebugSession } = window.workflowFixture;
+      const admitted = Promise.withResolvers();
+      const breakpoint = Promise.withResolvers();
+      const finished = Promise.withResolvers();
+      const verified = [];
+      let workspace = 1;
+      let emit;
+      const session = new DebugSession({ id: 1, path: "/old" }, {
+        verify(path, lines) { verified.push({ workspace, path, lines }); },
+      }, { isCurrent: () => workspace === 1, admitted: admitted.resolve, finished: finished.resolve }, {
+        debug: async (_id, _pkg, events) => { emit = events; return { server: 1, output: "/old/debug" }; },
+        sendDebug: async (_server, request) => { if (request.command === "setBreakpoints") breakpoint.resolve(request.seq); },
+        stopDebug: async () => {},
+      });
+      const startup = session.start("main_test.go", "TestA");
+      await admitted.promise;
+      const verifying = session.setBreakpoints("main_test.go", [5]);
+      const seq = await breakpoint.promise;
+      emit({ type: "message", message: { type: "response", request_seq: seq, success: true, body: { breakpoints: [{ verified: true }] } } });
+      workspace = 2; // Commit after receiving the response, before its continuation.
+      await verifying;
+      session.retire();
+      await Promise.all([startup, finished.promise]);
+      return verified;
+    });
+    assert.deepEqual(outcome, []);
+  });
+});
+
 test("an imported test fixture uses the real workbench and quick open", async () => {
   await scenario("navigation", async page => {
     assert.equal(await page.locator(".titlebar #quick-open").count(), 1);

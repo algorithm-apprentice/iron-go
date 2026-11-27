@@ -339,6 +339,112 @@ during execution. Keep native smoke coverage for actual IPC and UI wiring.
 Success is fewer independently writable flags/duplicated decisions, not a
 target file size.
 
+**Batch 3 implementation design (independently approved):** Split by ownership, not
+by UI widget. A small project workflow coordinates open/import/create/close
+and the app Quit decision. Keep native workspace identity in Rust and one
+renderer project reference in the workbench. Use a single exclusive
+reservation for a transition or exit decision; no raw writable `busy` shared
+between unrelated callbacks. A transition reserves before any confirmation
+or asynchronous picker, freezes document edits and prevents new mutations
+while the user is deciding, and releases on cancel or error. Do not start a
+transition during active save, reload, format, create-file, or Go launch
+preparation. Keep ordinary Go execution and Debug eligible for switching
+after confirmation. Preserve the previously approved native Quit ticket,
+timeout, presentation and retry path; only replace its renderer reservation.
+
+Use app-owned Cancel/Continue controls for **project transition** confirmation
+because the pinned native WebView does not expose `window.confirm`. Preserve
+the existing dirty/stop warnings and do not redesign tab-close or reload
+confirmation here. From New Project, show the confirmation above the form
+while submission is pending; Cancel returns to the same filled form. Test
+both buttons in native acceptance, including this overlapping-dialog case.
+Browser import starts its picker synchronously (user
+activation) and reserves/confirms on a returned selection, not on cancel.
+Native open/create returns no candidate on picker cancel: do not touch the
+current project, running readers or children before a result. For close,
+call the native close command as the commit boundary; no preemptive Debug
+stop on a close command failure. On a committed change invalidate outgoing
+operation identity before new controls become enabled. Set the new renderer
+project and detach old callbacks before asynchronous tree/model setup; if
+setup fails after native commit, keep the new project and show its error,
+not an unsafe rollback. Old callbacks may render only while both their
+project and their specific operation are current.
+Apply the project identity check to both snapshot results and errors at the
+point they publish. A rejected snapshot from the outgoing project must not
+replace feedback in the new project; a rejection for the current project
+still surfaces. Test both outcomes with held adapter promises.
+
+Give Go task/debug an independent typed lifecycle with at most one token:
+idle, preparing/starting, running (task or Debug session), and task stopping.
+Make start/stop/finish effects conditional on the captured token, not just
+the workspace. A terminal event wins over a later rejection from the same
+request; an old event from the same project cannot reset a new launch.
+Native task Stop targets the workspace's slot rather than a task ID. If the
+terminal event arrives with a Stop IPC outstanding, retain the token and
+withhold new launches until that IPC execution has settled. A committed
+workspace change gets a new native ID, so a pre-cutover Stop cannot affect
+its slot. Test delayed *execution*, not only a late rejection. For Debug,
+do not expose Stop before native admission returns the server ID. If an
+early terminal event happens before the admission returns, keep the old
+token until admission and cleanup of the eventual server ID both settle;
+exactly one owner retires that server.
+Before either Run/Build/Test or Debug dispatch, use the same save barrier:
+admit only with no save/reload/format/create already in flight; prevent new
+competing file mutations while preparing, except this launch's saves and
+ordinary typing. Capture a monotonic document edit revision before any save
+and recheck it, the token, and dirty state just before dispatch. Any edit
+after capture vetoes dispatch even if undo makes the buffer clean again.
+Verify this for both Run and Debug with a controlled pending save and an
+edit followed by undo; do not disable typing to pass. Native project ID and
+Rust's existing admission checks remain authoritative for subprocesses.
+
+Existing DebugSession owns DAP pause/resume and process-specific control;
+do not model those states twice. Synchronously retire outgoing Debug
+renderer effects on committed cutover before resetting documents and
+breakpoints, not on cancel or failed native operations. A delayed pause read
+checks the captured session and pause at the point Documents would create,
+activate or focus a tab, and again before drawing its annotation. If the
+lookup shares a pending read with ordinary navigation, each caller validates
+its own intent before applying it. A conditional Debug open observes the
+ordinary navigation generation but does not advance it. Only a newer
+ordinary navigation may supersede an earlier ordinary intent, even when an
+ordinary caller starts the shared read before an expired Debug pause joins
+it. Test both orders. Breakpoint verification also checks
+session identity at the point it writes to the shared store. Test late pause
+navigation after a same-project relaunch and a breakpoint response across
+a committed switch. No DAP protocol changes in this batch.
+
+Keep package selection, toolbar rendering, editor annotations and feedback
+formatting in the workbench or their current modules. Move the existing
+`__ironTest` bridge into a conditional test-only module and verify it is
+not bundled in release. Use fake host promises for cancelled/failed and
+committed transitions, competing requests, save barrier rejection and later
+edits, run/debug exclusivity, and late finish/stop errors from old tokens.
+Native acceptance uses the real project confirmation buttons; retain Quit
+tests and Go/Delve smoke, and verify a cancel cannot stop an existing child.
+
+**Batch 3 red evidence:** The existing native app timed out on the dirty
+Close Project path when the suite stopped replacing `window.confirm`
+(`test-results/native/1795740152327-21046`). The native runner now requires
+actual workbench controls instead of treating an injected answer as proof.
+The nested New Project case also checks focus and pointer hit-testing so
+programmatic clicks do not mask an inaccessible top dialog.
+Code review's ordinary-first shared-read case reproduced a stale Debug pause
+leaving the old tab active (`initial.go` instead of `next.go`). The regression
+passes after separating ordinary activation from conditional Debug lookups.
+A controlled snapshot test passes for outgoing failures/results and for
+publishing current-project failures and results.
+
+**Batch 3 final verification:** `npm run test:feedback` passed (15 TS,
+19 Rust, Go fixture, 16 browser, 17 standard native with gopls and Delve,
+and the standalone dirty Quit probe). Native artifacts: `1795741693097-25635`
+and `1795741745211-27284`. Native Open and Close Cancel preserved the running
+Go child; approved Close stopped it. New Project Cancel restored the filled
+form, and Continue created and ran the disposable module. The real picker
+cancel return is covered by a fake pending host result, not console automation.
+The release `.app` built without the acceptance chunk, hooks or test fixtures.
+Independent review approved the final code diff.
+
 ## 4. Share native process plumbing, not protocols
 
 Extract only the duplicated framed-JSON I/O, cancellation, child wait, and

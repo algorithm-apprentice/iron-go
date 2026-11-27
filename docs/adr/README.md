@@ -14,3 +14,4 @@ record detailed behavior, alternatives, implementation order, and acceptance.
 | [0007](0007-delve-test-debugging.md) | Delve DAP over a private socket for named Go tests | Accepted |
 | [0008](0008-appkit-quit-guard.md) | Send ordinary macOS Quit and window close through one AppKit guard | Accepted |
 | [0009](0009-save-transactions.md) | Serialize same-profile save replacement and reject stale file results | Accepted |
+| [0010](0010-workbench-workflow-ownership.md) | Separate project transitions and Quit reservations from Go execution | Accepted |

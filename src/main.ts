@@ -1,9 +1,7 @@
 import "./styles.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { invoke } from "@tauri-apps/api/core";
-import { LogicalSize } from "@tauri-apps/api/dpi";
 import { byId, element, Forms, message, Palette } from "./dialogs";
-import { bufferText, Documents, monaco, replaceBuffer, type DocumentTab } from "./editor";
+import { bufferText, Documents, monaco, type DocumentTab } from "./editor";
 import { Feedback } from "./feedback";
 import { fileIcon, icon, prepareIcons, type Icon } from "./icons";
 import { GoLanguage, debugTestCommand, runTestCommand, type LanguageState } from "./lsp";
@@ -12,7 +10,9 @@ import { packageForFile, RunTargets } from "./run-targets";
 import { bindColorTheme, chooseColorTheme } from "./theme";
 import { basename, dirname, initialWorkspaceFile, makeTree, quickFiles, validateRelative, type FileMatch, type ProjectSnapshot, type TreeNode } from "./project-model";
 import { decideExit } from "./quit-flow";
-import { desktop, host, importedProject, nativeProject, welcomeProject, type Project, type TaskKind, type ToolStatus } from "./workspace";
+import { ExecutionLane } from "./execution";
+import { ProjectWorkflow, publishProjectSnapshot } from "./project-workflow";
+import { desktop, host, importedProject, nativeProject, welcomeProject, type NativeFolder, type Project, type TaskKind, type ToolStatus } from "./workspace";
 
 type View = "explorer" | "search" | "tasks";
 
@@ -37,12 +37,8 @@ let tree: TreeNode[] = [];
 let opened = new Set<string>();
 let view: View = "explorer";
 let rootExpanded = true;
-let busy = false;
-let task: TaskKind | undefined;
-let debug: DebugSession | undefined;
 const breakpoints = new Breakpoints();
 let executionLine: { model: monaco.editor.ITextModel; ids: string[] } | undefined;
-let stopPending = false;
 let formatting = false;
 let fileMutations = 0;
 let testQuitRequests = 0;
@@ -63,6 +59,19 @@ const docs = new Documents(byId("editor"), {
   closed: tab => { breakpoints.close(tab); lsp?.closed(tab); queueMicrotask(renderProblems); },
   saved: tab => lsp?.saved(tab),
 });
+const execution = new ExecutionLane<NativeFolder, DebugSession>(syncControls);
+const projectWorkflow = new ProjectWorkflow(reserved => {
+  docs.editor.updateOptions({ readOnly: reserved });
+  syncControls();
+});
+
+const filesBusy = () => docs.saving || formatting || fileMutations !== 0;
+const fileActionsBlocked = () => projectWorkflow.busy || execution.preparing;
+const saveBarrier = {
+  revision: () => docs.editRevision,
+  dirty: () => docs.dirty,
+  async save() { for (const tab of docs.tabs.values()) if (tab.dirty) await docs.save(tab); },
+};
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") docs.refreshView();
 });
@@ -138,7 +147,7 @@ function revealParents(path: string) {
 }
 
 async function openFile(path: string, target?: monaco.IRange) {
-  if (busy) return;
+  if (projectWorkflow.busy) return;
   try {
     const tab = await docs.open(path, { focus: true, target });
     if (tab && tab.path === docs.active?.path) {
@@ -220,27 +229,31 @@ function updateCursor() {
 
 function syncControls() {
   const active = docs.active;
-  btn("format").disabled = !active?.path.endsWith(".go") || formatting || busy;
-  btn("save").disabled = !active || active.saving || busy;
-  btn("open-folder").disabled = busy || docs.saving;
+  const task = execution.task;
+  const debug = execution.debug;
+  const busy = projectWorkflow.busy;
+  btn("format").disabled = !active?.path.endsWith(".go") || formatting || fileActionsBlocked();
+  btn("save").disabled = !active || active.saving || fileActionsBlocked();
+  btn("open-folder").disabled = busy || execution.preparing || filesBusy();
   btn("welcome-open").disabled = busy;
   btn("welcome-new").disabled = busy;
-  btn("new-file").disabled = busy || !!project.welcome;
+  btn("new-file").disabled = fileActionsBlocked() || !!project.welcome;
   btn("refresh-files").disabled = busy || !!project.welcome;
   const run = btn("run");
-  run.disabled = busy || stopPending || !!debug || !!project.welcome;
+  run.disabled = busy || (execution.occupied ? !execution.canStopTask : filesBusy()) || !!project.welcome;
   run.dataset.running = String(!!task);
   const primary = runTargets.primaryAction();
   run.innerHTML = `${icon(task ? "stop" : primary === "test" ? "flask" : "play")}<span>${task ? "Stop" : primary === "test" ? "Test" : "Run"}</span>`;
   run.title = task ? "Stop Go Task" : primary === "test" ? "Test Go Packages (⌘↵)" : "Run Go Package (⌘↵)";
   btn("panel-stop").hidden = !task;
-  btn("panel-stop").disabled = stopPending;
-  btn("stop-task").disabled = !task || stopPending;
-  runTargets.setDisabled(busy, !!task || !!debug);
-  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-task]")) button.disabled = !!task || !!debug || busy || !!project.welcome;
+  btn("panel-stop").disabled = busy || !execution.canStopTask;
+  btn("stop-task").disabled = busy || !execution.canStopTask;
+  runTargets.setDisabled(busy, execution.occupied);
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-task]")) button.disabled = execution.occupied || busy || filesBusy() || !!project.welcome;
   byId("debug-controls").hidden = !debug;
-  btn("debug-continue").disabled = !debug?.paused;
-  btn("debug-next").disabled = !debug?.paused;
+  btn("debug-continue").disabled = busy || !debug?.paused;
+  btn("debug-next").disabled = busy || !debug?.paused;
+  btn("debug-stop").disabled = busy || !debug?.canStop;
 }
 
 function renderProblems() {
@@ -267,11 +280,11 @@ function renderProblems() {
 }
 
 function closeTab(tab: DocumentTab) {
-  if (!busy && !tab.saving && (!tab.dirty || window.confirm(`Discard unsaved changes to ${basename(tab.path)}?`))) docs.close(tab);
+  if (!fileActionsBlocked() && !tab.saving && (!tab.dirty || window.confirm(`Discard unsaved changes to ${basename(tab.path)}?`))) docs.close(tab);
 }
 
 async function saveActive() {
-  if (busy || !docs.active) return;
+  if (fileActionsBlocked() || !docs.active) return;
   const tab = docs.active;
   const target = project;
   try {
@@ -289,17 +302,18 @@ async function saveActive() {
 
 async function reloadActive() {
   const tab = docs.active;
-  if (!tab || tab.saving || busy || (tab.dirty && !window.confirm(`Discard unsaved changes and reload ${basename(tab.path)}?`))) return;
+  if (!tab || tab.saving || fileActionsBlocked() || (tab.dirty && !window.confirm(`Discard unsaved changes and reload ${basename(tab.path)}?`))) return;
   const target = project;
   fileMutations++;
+  syncControls();
   try { if (await docs.reload(tab) && project === target && docs.active === tab) status(`Reloaded ${basename(tab.path)}`); }
   catch (error) { if (project === target && docs.active === tab) showError(error); }
-  finally { fileMutations--; }
+  finally { fileMutations--; syncControls(); }
 }
 
 async function formatActive() {
   const tab = docs.active;
-  if (!tab?.path.endsWith(".go") || formatting || busy) return;
+  if (!tab?.path.endsWith(".go") || formatting || fileActionsBlocked()) return;
   if (!desktop) { toast("Go formatting uses gofmt in the macOS desktop app."); return; }
   const target = project;
   formatting = true;
@@ -310,27 +324,28 @@ async function formatActive() {
   finally { formatting = false; syncControls(); }
 }
 
-async function refresh() {
-  const target = project;
-  const result = await target.snapshot();
-  if (target !== project) return;
-  snapshot = result;
-  tree = makeTree(result.entries);
-  renderExplorer();
+function refresh() {
+  return publishProjectSnapshot(project, {
+    current: () => project,
+    read: target => target.snapshot(),
+    apply(result) {
+      snapshot = result;
+      tree = makeTree(result.entries);
+      renderExplorer();
+    },
+    fail: showError,
+  });
 }
 
 async function install(target: Project) {
-  const previousDebug = debug;
-  debug = undefined;
-  void previousDebug?.stop();
+  execution.retire()?.retire();
   clearExecutionLine();
   breakpoints.reset();
-  lsp?.dispose();
+  const previousLsp = lsp;
   lsp = undefined;
   project = target;
+  previousLsp?.dispose();
   runTargets.reset(target);
-  task = undefined;
-  stopPending = false;
   gopls = "idle";
   searchGeneration++;
   window.clearTimeout(searchTimer);
@@ -352,13 +367,12 @@ async function install(target: Project) {
   if (target.welcome) feedback.toggle(false); else feedback.show("output");
   chooseView("explorer", false);
   status("Opening workspace…");
-  try { await refresh(); }
-  catch (error) { showError(error); }
+  await refresh();
   if (target !== project) return;
   const initial = initialWorkspaceFile(snapshot.entries);
   if (initial) {
     try { await docs.open(initial); revealParents(initial); }
-    catch (error) { showError(error); }
+    catch (error) { if (target === project) showError(error); }
   }
   if (target !== project) return;
   renderExplorer();
@@ -371,35 +385,44 @@ async function install(target: Project) {
   maybeStartLsp();
 }
 
-function canSwitch() {
-  if (busy || docs.saving) return false;
-  return (!docs.dirty || window.confirm("Discard unsaved edits before leaving this project?")) &&
-    (!task || window.confirm("Stop the current Go task before leaving this project?")) &&
-    (!debug || window.confirm("Stop debugging before leaving this project?"));
+const transitionReady = () => !filesBusy() && !execution.preparing;
+
+async function confirmTransition() {
+  const warnings = [
+    docs.dirty && "Unsaved edits will be discarded.",
+    execution.task && "The current Go task will be stopped.",
+    execution.debug && "The debug session will be stopped.",
+  ].filter(Boolean);
+  if (!warnings.length) return true;
+  const dialog = byId<HTMLDialogElement>("project-transition-dialog");
+  byId("project-transition-description").textContent = warnings.join(" ");
+  dialog.returnValue = "cancel";
+  dialog.showModal();
+  return new Promise<boolean>(resolve => dialog.addEventListener("close", () => resolve(dialog.returnValue === "continue"), { once: true }));
 }
 
-async function openFolder() {
-  if (!canSwitch()) return;
-  if (!desktop) { input("import-folder").click(); return; }
-  busy = true;
-  syncControls();
-  try {
+function changeProject(choose: () => Promise<Project | undefined>) {
+  return projectWorkflow.transition({ ready: transitionReady, confirm: confirmTransition, choose, install });
+}
+
+function openFolder() {
+  if (!desktop) {
+    if (transitionReady() && !projectWorkflow.busy) input("import-folder").click();
+    return;
+  }
+  void changeProject(async () => {
     const folder = await host.open();
-    if (folder) await install(nativeProject(folder));
-  } catch (error) { showError(error); }
-  finally { busy = false; syncControls(); }
+    return folder ? nativeProject(folder) : undefined;
+  }).catch(showError);
 }
 
-async function closeProject() {
-  if (project.welcome || !canSwitch()) return;
-  busy = true;
-  syncControls();
-  try {
-    await debug?.stop();
-    if (project.native) await host.close(project.native.id);
-    await install(welcomeProject());
-  } catch (error) { showError(error); }
-  finally { busy = false; syncControls(); }
+function closeProject() {
+  const target = project;
+  if (target.welcome) return;
+  void changeProject(async () => {
+    if (target.native) await host.close(target.native.id);
+    return welcomeProject();
+  }).catch(showError);
 }
 
 function newModule() {
@@ -411,35 +434,32 @@ function newModule() {
       { name: "module", label: "Go module path", value: "example.com/hello-go", maxLength: 240 },
     ],
     async run({ name, module }) {
-      if (!canSwitch()) return false;
-      busy = true;
-      syncControls();
-      try {
+      return changeProject(async () => {
         const folder = await host.create(name, module);
-        if (!folder) return false;
-        await install(nativeProject(folder));
-      } finally { busy = false; syncControls(); }
+        return folder ? nativeProject(folder) : undefined;
+      });
     },
   });
 }
 
 function newFile() {
-  if (busy || project.welcome) return;
+  if (fileActionsBlocked() || project.welcome) return;
   const target = project;
   forms.show({
     title: "New File", description: `Create a file inside ${project.name}. Include a folder prefix to create missing folders.`,
     fields: [{ name: "path", label: "Relative file path", placeholder: "pkg/example.go" }],
     async run({ path }) {
-      if (busy) return false;
+      if (fileActionsBlocked()) return false;
       if (target !== project) throw new Error("This workspace has changed.");
       validateRelative(path);
       fileMutations++;
+      syncControls();
       try {
         await target.createFile(path);
         await refresh();
         await openFile(path);
         status(`Created ${path}`);
-      } finally { fileMutations--; }
+      } finally { fileMutations--; syncControls(); }
     },
   });
 }
@@ -505,7 +525,7 @@ function searchRow(result: FileMatch) {
 }
 
 async function runTask(kind: TaskKind, singleTest?: { path: string; name: string }) {
-  if (task || debug || busy || docs.saving) return;
+  if (execution.occupied || projectWorkflow.busy || filesBusy()) return;
   const target = project.native;
   if (!target) {
     toast(desktop ? "Open or create a Go project first." : "Run, build and test are available in the macOS desktop app.");
@@ -517,36 +537,23 @@ async function runTask(kind: TaskKind, singleTest?: { path: string; name: string
     packages = singleTest ? [packageForFile(singleTest.path)]
       : kind === "run" ? runTargets.runArguments() : runTargets.buildTestArguments(docs.active?.path);
   } catch (error) { showError(error); return; }
-  task = kind;
-  stopPending = true;
-  syncControls();
   feedback.show("output");
   status(`Preparing Go ${kind}…`);
   try {
-    for (const tab of docs.tabs.values()) if (tab.dirty) await docs.save(tab);
-    if (docs.dirty || project.native !== target) throw new Error("Files changed while saving. Run the task again.");
-    await host.task(target.id, kind, packages, singleTest?.name, event => {
-      if (project.native !== target) return;
+    await execution.start(target, kind, saveBarrier, token => host.task(target.id, kind, packages, singleTest?.name, event => {
+      if (project.native !== target || !execution.taskEvent(token, event.type)) return;
       const result = feedback.task(event);
       if (event.type === "started") {
-        stopPending = false;
         status(`Go ${kind} running…`);
-        syncControls();
       } else if (event.type === "finished") {
-        task = undefined;
-        stopPending = false;
         status(result ?? "Ready");
-        syncControls();
       }
-    });
+    }));
   } catch (error) {
     if (project.native !== target) return;
-    task = undefined;
-    stopPending = false;
     status(`Go ${kind} not started`);
     feedback.row(message(error), "error", "error");
     showError(error);
-    syncControls();
   }
 }
 
@@ -557,74 +564,71 @@ function clearExecutionLine() {
 
 function toggleBreakpoint(line = docs.editor.getPosition()?.lineNumber) {
   const tab = docs.active;
-  if (!project.native || !tab?.path.endsWith(".go") || !line) return;
+  if (projectWorkflow.busy || !project.native || !tab?.path.endsWith(".go") || !line) return;
   breakpoints.toggle(tab, line);
   docs.refreshView();
-  if (debug?.ready) void debug.setBreakpoints(tab.path).catch(showError);
+  const debug = execution.debug;
+  if (debug?.ready) void debug.setBreakpoints(tab.path).catch(error => { if (execution.debug === debug) showError(error); });
 }
 
 async function debugTest(path: string, name: string) {
   const folder = project.native;
-  if (!folder || task || debug || busy || docs.saving) return;
+  if (!folder || execution.occupied || projectWorkflow.busy || filesBusy()) return;
   if (!tools?.delve) {
     toast("Install Delve with `brew install delve`, then select Check tools in Settings.", true);
     return;
   }
-  busy = true;
-  syncControls();
   try {
-    for (const tab of docs.tabs.values()) if (tab.dirty) await docs.save(tab);
-    if (docs.dirty || project.native !== folder) throw new Error("Files changed while saving. Debug again.");
-    const session = new DebugSession(folder, breakpoints, {
-      paused(file, line, reason) {
-        if (debug !== session) return;
-        void (async () => {
+    await execution.start(folder, "debug", saveBarrier, async token => {
+      const isCurrent = () => execution.owns(token) && project.native === folder;
+      const session = new DebugSession(folder, breakpoints, {
+        isCurrent,
+        admitted() { if (isCurrent()) syncControls(); },
+        paused(file, line, reason, currentPause) {
+          const current = () => isCurrent() && currentPause();
+          if (!current()) return;
+          void (async () => {
+            clearExecutionLine();
+            const tab = file ? await docs.open(file, { focus: true, target: { lineNumber: line, column: 1 }, current }).catch(() => undefined) : undefined;
+            if (!current()) return;
+            if (tab) {
+              const ids = tab.model.deltaDecorations([], [{ range: new monaco.Range(line, 1, line, 1), options: { isWholeLine: true, className: "debug-execution-line" } }]);
+              executionLine = { model: tab.model, ids };
+            }
+            const prefix = reason === "breakpoint" ? "Breakpoint hit" : "Paused";
+            status(`${prefix}${file ? ` — ${basename(file)}:${line}` : " outside project source"}`);
+            syncControls();
+          })();
+        },
+        running() {
+          if (!isCurrent()) return;
           clearExecutionLine();
-          const tab = file ? await docs.open(file, { focus: true, target: { lineNumber: line, column: 1 } }).catch(() => undefined) : undefined;
-          if (debug !== session || !session.paused) return;
-          if (tab) {
-            const ids = tab.model.deltaDecorations([], [{ range: new monaco.Range(line, 1, line, 1), options: { isWholeLine: true, className: "debug-execution-line" } }]);
-            executionLine = { model: tab.model, ids };
-          }
-          const prefix = reason === "breakpoint" ? "Breakpoint hit" : "Paused";
-          status(`${prefix}${file ? ` — ${basename(file)}:${line}` : " outside project source"}`);
+          status(`Debugging ${name}…`);
           syncControls();
-        })();
-      },
-      running() {
-        if (debug !== session) return;
-        clearExecutionLine();
-        status(`Debugging ${name}…`);
-        syncControls();
-      },
-      finished(reason) {
-        if (debug !== session) return;
-        debug = undefined;
-        clearExecutionLine();
-        breakpoints.clearVerification();
-        status(reason);
-        feedback.row(reason, reason.startsWith("Debug failed") ? "error" : "quiet");
-        syncControls();
-      },
-      output(value) { if (debug === session && value.trim()) feedback.row(value.trimEnd()); },
+        },
+        finished(reason) {
+          if (!isCurrent() || !execution.release(token)) return;
+          clearExecutionLine();
+          breakpoints.clearVerification();
+          status(reason);
+          feedback.row(reason, reason.startsWith("Debug failed") ? "error" : "quiet");
+        },
+        output(value) { if (isCurrent() && value.trim()) feedback.row(value.trimEnd()); },
+      });
+      if (!execution.attachDebug(token, session)) return;
+      feedback.clear();
+      feedback.show("output");
+      feedback.row(`Launching ${name} with Delve…`, "command", "command");
+      status(`Launching ${name}…`);
+      await session.start(path, name);
     });
-    debug = session;
-    feedback.clear();
-    feedback.show("output");
-    feedback.row(`Launching ${name} with Delve…`, "command", "command");
-    status(`Launching ${name}…`);
-    void session.start(path, name);
-  } catch (error) { showError(error); }
-  finally { busy = false; syncControls(); }
+  } catch (error) { if (project.native === folder) showError(error); }
 }
 
 async function stopTask() {
-  const target = project.native;
-  if (!target || !task || stopPending) return;
-  stopPending = true;
-  syncControls();
-  try { await host.stop(target.id); }
-  catch (error) { stopPending = false; syncControls(); showError(error); }
+  if (projectWorkflow.busy) return;
+  try { await execution.stopTask(target => host.stop(target.id)); }
+  catch (error) { showError(error); }
 }
 
 function updateTools() {
@@ -683,7 +687,7 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "New Project…", icon: "package", run: newModule, workspace: true },
     { label: "Close Project", icon: "close", run: closeProject, workspace: true },
     { label: "New File…", icon: "filePlus", run: newFile, workspace: true },
-    { label: "Refresh Project", icon: "refresh", run: () => { void refresh().catch(showError); }, workspace: true },
+    { label: "Refresh Project", icon: "refresh", run: () => { void refresh(); }, workspace: true },
     { label: "Collapse Folders", icon: "folder", run: () => { opened.clear(); renderExplorer(); }, workspace: true },
     { label: "Search Saved Files", detail: "⇧⌘F", icon: "search", run: () => chooseView("search") },
     { label: "Save File", detail: "⌘S", icon: "save", run: saveActive },
@@ -775,10 +779,11 @@ byId("welcome-open").addEventListener("click", openFolder);
 byId("welcome-new").addEventListener("click", newModule);
 byId("toggle-sidebar").addEventListener("click", toggleSidebar);
 byId("new-file").addEventListener("click", newFile);
-byId("refresh-files").addEventListener("click", () => { void refresh().catch(showError); void runTargets.refresh(); });
+byId("refresh-files").addEventListener("click", () => { void refresh(); void runTargets.refresh(); });
 byId("format").addEventListener("click", formatActive);
 byId("save").addEventListener("click", saveActive);
-byId("run").addEventListener("click", () => { if (task) void stopTask(); else void runTask(runTargets.primaryAction()); });
+const runOrStop = () => execution.task ? stopTask() : runTask(runTargets.primaryAction());
+byId("run").addEventListener("click", runOrStop);
 byId("panel-stop").addEventListener("click", stopTask);
 byId("stop-task").addEventListener("click", stopTask);
 byId("settings").addEventListener("click", showSettings);
@@ -797,9 +802,9 @@ docs.editor.onMouseDown(event => {
     toggleBreakpoint(event.target.position?.lineNumber);
   }
 });
-byId("debug-continue").addEventListener("click", () => { void debug?.resume("continue"); });
-byId("debug-next").addEventListener("click", () => { void debug?.resume("next"); });
-byId("debug-stop").addEventListener("click", () => { void debug?.stop(); });
+byId("debug-continue").addEventListener("click", () => { void execution.debug?.resume("continue"); });
+byId("debug-next").addEventListener("click", () => { void execution.debug?.resume("next"); });
+byId("debug-stop").addEventListener("click", () => { void execution.debug?.stop(); syncControls(); });
 input("search-text").addEventListener("input", scheduleSearch);
 byId("search-case").addEventListener("click", event => {
   const button = event.currentTarget as HTMLButtonElement;
@@ -809,7 +814,10 @@ byId("search-case").addEventListener("click", event => {
 byId("search-form").addEventListener("submit", event => { event.preventDefault(); scheduleSearch(); });
 input("import-folder").addEventListener("change", () => {
   const picker = input("import-folder");
-  if (picker.files?.length) void install(importedProject(picker.files)).catch(showError);
+  if (picker.files?.length) {
+    const selected = importedProject(picker.files);
+    void changeProject(async () => selected).catch(showError);
+  }
   picker.value = "";
 });
 
@@ -842,7 +850,7 @@ document.addEventListener("keydown", event => {
     if (key === "j") apply = () => feedback.toggle();
     if (key === "b") apply = toggleSidebar;
     if (key === ",") apply = showSettings;
-    if (key === "enter") apply = () => task ? stopTask() : runTask(runTargets.primaryAction());
+    if (key === "enter") apply = runOrStop;
   }
   if (event.altKey && event.shiftKey && (key === "f" || event.code === "KeyF")) apply = formatActive;
   if (apply) { event.preventDefault(); event.stopPropagation(); void apply(); }
@@ -882,14 +890,14 @@ if (desktop) {
   void getCurrentWindow().listen<number>("iron-go-exit-requested", event => {
     if (event.payload <= lastExpiredQuitTicket) return;
     if (import.meta.env.VITE_IRON_E2E === "1") testQuitRequests++;
+    let release: (() => void) | undefined;
     void decideExit({
-      canDecide: () => !busy && !docs.saving && !formatting && fileMutations === 0,
+      canDecide: () => !projectWorkflow.busy && transitionReady(),
       hasUnsavedChanges: () => docs.dirty,
       confirmDiscard: () => confirmQuit(event.payload),
       freeze: frozen => {
-        busy = frozen;
-        docs.editor.updateOptions({ readOnly: frozen });
-        syncControls();
+        if (frozen) release = projectWorkflow.reserve();
+        else release?.();
       },
       reply: approve => host.resolveExit(event.payload, approve),
     }).catch(showError);
@@ -901,71 +909,11 @@ if (desktop) {
 }
 
 if (import.meta.env.VITE_IRON_E2E === "1") {
-  const runtimeErrors: string[] = [];
-  let gutterHit: { line: number | null; type: string } | undefined;
-  let selectionSource: string | undefined;
-  docs.editor.onMouseDown(event => {
-    gutterHit = { line: event.target.position?.lineNumber ?? null, type: monaco.editor.MouseTargetType[event.target.type] };
-  });
-  docs.editor.onDidChangeCursorSelection(event => { selectionSource = event.source; });
-  window.addEventListener("error", event => {
-    runtimeErrors.push(`${event.message} ${event.error?.stack ?? ""}`);
-    if (runtimeErrors.length > 10) runtimeErrors.shift();
-  });
-  Object.assign(window, { __ironTest: {
-    snapshot: () => ({ root: project.native?.path, path: docs.active?.path, text: docs.active && bufferText(docs.active.model), dirty: docs.active?.dirty,
-      markers: docs.active ? monaco.editor.getModelMarkers({ resource: docs.active.model.uri }) : [], gopls,
-      editor: { width: docs.editor.getLayoutInfo().width, height: docs.editor.getLayoutInfo().height, scrollTop: docs.editor.getScrollTop(), contentHeight: docs.editor.getContentHeight(), runtimeErrors } }),
-    replace: (value: string) => { if (docs.active) replaceBuffer(docs.active.model, value); },
-    gutterTrace: (inspect: number[] = []) => {
-      const selection = docs.editor.getSelection();
-      const rows = [...document.querySelectorAll<HTMLElement>("#editor .line-numbers")];
-      const selected = rows.filter(row => row.classList.contains("gutter-selected-number"));
-      const caret = rows.filter(row => row.classList.contains("active-line-number"));
-      return {
-        hit: gutterHit, selectionSource,
-        caret: docs.editor.getPosition(),
-        selection: selection && { start: selection.getStartPosition(), end: selection.getEndPosition(), empty: selection.isEmpty() },
-        caretNumbers: caret.map(row => row.textContent?.trim()),
-        highlightedNumbers: (selected.length ? selected : caret).map(row => row.textContent?.trim()).filter(Boolean),
-        numberColors: Object.fromEntries(rows.flatMap(row => {
-          const number = row.textContent?.trim();
-          return number && inspect.includes(Number(number)) ? [[number, getComputedStyle(row).color]] : [];
-        })),
-      };
-    },
-    refreshView: () => docs.refreshView(),
-    resize: (width: number, height: number) => getCurrentWindow().setSize(new LogicalSize(width, height)),
-    revealLine: (lineNumber: number) => {
-      docs.layout();
-      docs.editor.setPosition({ lineNumber, column: 1 });
-      const top = docs.editor.getTopForLineNumber(lineNumber, true);
-      const height = docs.editor.getLayoutInfo().height;
-      docs.editor.setScrollTop(Math.max(0, top - height / 2), monaco.editor.ScrollType.Immediate);
-      docs.editor.focus();
-      docs.refreshView();
-    },
-    suggest: (lineNumber: number, column: number) => {
-      docs.editor.setPosition({ lineNumber, column });
-      docs.editor.focus();
-      docs.editor.trigger("iron-test", "editor.action.triggerSuggest", {});
-    },
-    action: (id: string, lineNumber: number, column: number) => {
-      docs.editor.setPosition({ lineNumber, column });
-      docs.editor.focus();
-      // Some built-ins (including Go to Definition) are registered with
-      // Monaco's command service, not in editor.getAction().
-      docs.editor.trigger("iron-test", id, {});
-    },
-    quit: () => { void getCurrentWindow().destroy(); },
-    closeWindow: () => invoke<void>("test_perform_window_close"),
-    quitWindowState: (minimize = false) => invoke<[boolean, boolean]>("test_quit_window_state", { minimize }),
-    quitMenu: () => invoke<boolean>("test_quit_menu_action"),
+  void import("./acceptance").then(({ installAcceptance }) => installAcceptance(docs, {
+    root: () => project.native?.path,
+    gopls: () => gopls,
     quitRequests: () => testQuitRequests,
-    holdSave: (hold?: boolean) => invoke<boolean>("test_hold_save", { hold }),
-    saving: () => docs.saving,
-    tryType: (text: string) => docs.editor.trigger("keyboard", "type", { text }),
-  } });
+  }));
 }
 
 void install(project).catch(showError);

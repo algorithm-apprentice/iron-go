@@ -87,14 +87,19 @@ interface Pending {
 }
 
 interface DebugEvents {
-  paused(path: string | undefined, line: number, reason: string): void;
+  isCurrent(): boolean;
+  admitted(): void;
+  paused(path: string | undefined, line: number, reason: string, currentPause: () => boolean): void;
   running(): void;
   finished(reason: string): void;
   output(text: string): void;
 }
 
+type DebugHost = Pick<typeof host, "debug" | "sendDebug" | "stopDebug">;
+
 export class DebugSession {
   private server?: number;
+  private admission?: ReturnType<DebugHost["debug"]>;
   private seq = 0;
   private readonly pending = new Map<number, Pending>();
   private initialized = false;
@@ -102,22 +107,28 @@ export class DebugSession {
   private closed = false;
   private stopping = false;
   private thread?: number;
+  private pauseRevision = 0;
   private outputRemaining = 512 * 1024;
 
-  constructor(private readonly folder: NativeFolder, private readonly marks: Breakpoints, private readonly events: DebugEvents) {}
+  constructor(private readonly folder: NativeFolder, private readonly marks: Breakpoints, private readonly events: DebugEvents, private readonly native: DebugHost = host) {}
 
   get paused() { return this.thread !== undefined; }
   get ready() { return this.configDone; }
+  get canStop() { return this.server !== undefined && !this.closed && !this.stopping; }
   private absolute(path: string) { return `${this.folder.path.replace(/\/$/, "")}/${path}`; }
 
   async start(path: string, name: string) {
+    // Store the admission promise before any channel event can call finish.
+    const admission = Promise.resolve().then(() => this.native.debug(this.folder.id, packageForFile(path), event => {
+      if (event.type === "closed") this.finish(this.stopping ? "Debug session stopped" : event.reason);
+      else void this.receive(event.message as DebugMessage);
+    }));
+    this.admission = admission;
     try {
-      const { server, output } = await host.debug(this.folder.id, packageForFile(path), event => {
-        if (event.type === "closed") this.finish(this.stopping ? "Debug session stopped" : event.reason);
-        else void this.receive(event.message as DebugMessage);
-      });
-      if (this.closed) { await host.stopDebug(server); return; }
+      const { server, output } = await admission;
+      if (this.closed) return;
       this.server = server;
+      this.events.admitted();
       await this.request("initialize", { adapterID: "go", linesStartAt1: true, columnsStartAt1: true, pathFormat: "path" });
       const dir = dirname(path);
       const program = dir ? this.absolute(dir) : this.folder.path;
@@ -145,7 +156,7 @@ export class DebugSession {
       };
       const timer = window.setTimeout(() => fail(`Delve ${command} timed out.`), timeout);
       this.pending.set(seq, { resolve: value => resolve(value as T), reject, timer });
-      void host.sendDebug(server, { seq, type: "request", command, arguments: args }).catch(fail);
+      void this.native.sendDebug(server, { seq, type: "request", command, arguments: args }).catch(fail);
     });
   }
 
@@ -153,7 +164,7 @@ export class DebugSession {
     const result = await this.request<{ breakpoints: { verified: boolean }[] }>("setBreakpoints", {
       source: { path: this.absolute(path) }, breakpoints: lines.map(line => ({ line })),
     });
-    if (!this.closed) this.marks.verify(path, lines.filter((_, index) => result.breakpoints[index]?.verified));
+    if (!this.closed && this.events.isCurrent()) this.marks.verify(path, lines.filter((_, index) => result.breakpoints[index]?.verified));
   }
 
   private async receive(event: DebugMessage) {
@@ -185,14 +196,16 @@ export class DebugSession {
           if (thread === undefined) break;
           const reason = body?.reason ?? "pause";
           this.thread = thread;
+          const revision = ++this.pauseRevision;
+          const currentPause = () => !this.closed && this.thread === thread && this.pauseRevision === revision;
           try {
             const result = await this.request<{ stackFrames: { source?: { path?: string }; line: number }[] }>("stackTrace", { threadId: thread, levels: 1 });
-            if (this.closed || this.thread !== thread) break;
+            if (!currentPause()) break;
             const frame = result.stackFrames[0];
             const prefix = `${this.folder.path.replace(/\/$/, "")}/`;
             const file = frame?.source?.path;
-            this.events.paused(file?.startsWith(prefix) ? file.slice(prefix.length) : undefined, frame?.line ?? 1, reason);
-          } catch { if (!this.closed && this.thread === thread) this.events.paused(undefined, 1, reason); }
+            this.events.paused(file?.startsWith(prefix) ? file.slice(prefix.length) : undefined, frame?.line ?? 1, reason, currentPause);
+          } catch { if (currentPause()) this.events.paused(undefined, 1, reason, currentPause); }
           break;
         }
       }
@@ -209,20 +222,20 @@ export class DebugSession {
   }
 
   async stop() {
-    if (this.closed || this.stopping) return;
+    if (!this.canStop) return;
     this.stopping = true;
-    if (this.server !== undefined) {
-      try { await this.request("disconnect", { terminateDebuggee: true }, 2500); } catch { /* The host still owns process teardown. */ }
-    }
+    try { await this.request("disconnect", { terminateDebuggee: true }, 2500); } catch { /* The host still owns process teardown. */ }
     this.finish("Debug session stopped");
   }
+
+  retire() { this.finish("Debug session stopped"); }
 
   private finish(reason: string) {
     if (this.closed) return;
     this.closed = true;
-    const server = this.server;
     // Drop the native lane before re-enabling Run and Test controls.
-    void (server === undefined ? Promise.resolve() : host.stopDebug(server)).catch(() => {}).then(() => this.events.finished(reason));
+    void Promise.resolve(this.admission).then(result => result && this.native.stopDebug(result.server))
+      .catch(() => {}).then(() => this.events.finished(reason));
     for (const pending of this.pending.values()) {
       window.clearTimeout(pending.timer);
       pending.reject(new Error(reason));
