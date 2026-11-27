@@ -11,6 +11,7 @@ import { collectGroups, fixtureGroups, nativePlan, runtimeClean, summarizeGroup,
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const workerPath = fileURLToPath(new URL("./session.mjs", import.meta.url));
+const quitSource = fileURLToPath(new URL("./request-quit.swift", import.meta.url));
 const { values, groups } = nativePlan(process.argv.slice(2));
 assert.equal(process.platform, "darwin", "Native acceptance requires macOS.");
 const artifacts = path.join(root, "test-results/native", `${Date.now()}-${process.pid}`);
@@ -160,7 +161,7 @@ async function goEnvironment() {
   return env;
 }
 
-async function runGroup(executable, env, group) {
+async function runGroup(executable, env, group, quitHelper) {
   if (interrupt) return { group, result: "not-run", reason: `Interrupted by ${interrupt}.`, cases: [] };
   console.log(`  GROUP ${group}`);
   const directory = path.join(artifacts, group);
@@ -188,9 +189,9 @@ async function runGroup(executable, env, group) {
     app = await logged(executable, [], path.join(directory, "app.log"), {
       ...groupEnv, HOME: home, CFFIXED_USER_HOME: home,
       IRON_GO_E2E_WORKSPACE: fixture, TAURI_WEBDRIVER_PORT: String(available),
-      IRON_GO_E2E_WATCH_STDIN: "1", IRON_GO_E2E_EXIT_TIMEOUT_MS: group === "quit" ? "3500" : "",
+      IRON_GO_E2E_WATCH_STDIN: "1", IRON_GO_E2E_EXIT_TIMEOUT_MS: group === "quit" ? "10000" : "",
     }, true);
-    const config = { group, values, driver: `http://127.0.0.1:${available}`, artifacts: directory, fixture, home, pid: app.child.pid };
+    const config = { group, values, driver: `http://127.0.0.1:${available}`, artifacts: directory, fixture, home, pid: app.child.pid, quitHelper };
     worker = monitor(fork(workerPath, [JSON.stringify(config)], { cwd: root, execArgv: [], stdio: ["ignore", "inherit", "inherit", "ipc"] }));
     void app.exited.then(result => {
       if (worker.child.connected) worker.child.send({ type: "app-exit", result }, () => {});
@@ -236,8 +237,16 @@ try {
     assert.equal(result?.code, 0, `Native build failed or interrupted; see ${artifacts}/build.log`);
   }
   await access(executable, constants.X_OK);
+  let quitHelper;
+  if (groups.includes("lifecycle") || groups.includes("quit")) {
+    quitHelper = path.join(temporary, "request-quit");
+    const compiler = await logged("swiftc", [quitSource, "-o", quitHelper], path.join(artifacts, "quit-helper-build.log"), process.env);
+    const result = await Promise.race([bounded(compiler.exited, 120_000), interrupted.then(() => undefined)]);
+    if (result === undefined) await terminate(compiler);
+    assert.equal(result?.code, 0, `Native Quit helper build failed or was interrupted; see ${artifacts}/quit-helper-build.log`);
+  }
   const env = await goEnvironment();
-  report.groups = await collectGroups(groups, group => runGroup(executable, env, group));
+  report.groups = await collectGroups(groups, group => runGroup(executable, env, group, quitHelper));
 } catch (error) {
   report.failure = String(error.stack ?? error);
   report.groups = groups.map(group => ({ group, result: "not-run", reason: "Build or runner setup failed.", cases: [] }));

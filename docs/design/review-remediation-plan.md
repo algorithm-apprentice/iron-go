@@ -120,8 +120,10 @@ in-flight save, with a test-only barrier inside real `save_file` IPC. Attempt
 normal editor input while the decision is displayed and ensure the buffer
 does not change. Check actual expiration dismisses the dialog. Use focused
 tests for stale approvals. Minimize the main window through AppKit before
-system Quit, verify AppKit reports it restored and visible while the dirty
-dialog is open, and then Cancel. Do not use a synthetic `AppHandle::exit`
+invoking the native Quit menu action, verify AppKit reports it restored and
+visible while the dirty dialog is open, and then Cancel. The
+[hosted acceptance revision](hosted-native-quit.md) covers external system
+Quit on visible windows. Do not use a synthetic `AppHandle::exit`
 or the test bridge's force-destroy shortcut as the native quit oracle.
 
 **Batch 1 evidence:** The initial native regression failed with `Native Quit

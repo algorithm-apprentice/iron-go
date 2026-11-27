@@ -7,7 +7,7 @@ import { expectedGoSyntax, goSyntaxSample, renderedGoSyntax } from "../go-syntax
 import { runtimeClean } from "./plan.mjs";
 
 if (!process.send) throw new Error("Run native acceptance through workbench.mjs.");
-const { group, values, driver, artifacts, fixture, home, pid } = JSON.parse(process.argv[2]);
+const { group, values, driver, artifacts, fixture, home, pid, quitHelper } = JSON.parse(process.argv[2]);
 const report = { version: 1, group, cases: [] };
 const app = { child: { pid }, exited: new Promise(resolve => {
   process.on("message", message => { if (message?.type === "app-exit") resolve(message.result); });
@@ -340,8 +340,8 @@ try {
 }
 
 function requestNativeQuit() {
-  const requested = execFileSync("swift", ["-e", 'import AppKit; let pid = Int32(CommandLine.arguments[1])!; print(NSRunningApplication(processIdentifier: pid)?.terminate() ?? false)', String(app.child.pid)], { encoding: "utf8", timeout: 10_000 }).trim();
-  assert.equal(requested, "true", "macOS should accept the native Quit request");
+  assert.ok(quitHelper, "A compiled native Quit helper is required");
+  execFileSync(quitHelper, [String(app.child.pid)], { timeout: 10_000 });
 }
 
 async function nativeQuitSmoke() {
@@ -357,17 +357,11 @@ async function nativeQuitSmoke() {
     const saved = `${initial.text}\n// saved after the held IPC\n`;
     const unsaved = `${saved}\n// unsaved native quit\n`;
     const alive = () => { try { process.kill(pid, 0); return true; } catch (error) { if (error.code === "ESRCH") return false; throw error; } };
-    async function cancelled(label, restored = false) {
+    async function cancelled(label) {
       await Promise.race([
         eventually(`${label}: display the real confirmation`, () => js("return document.querySelector('#quit-dialog')?.open === true;")),
         app.exited.then(() => { throw new Error(`${label}: exited before confirming the unsaved buffer.`); }),
       ]);
-      if (restored) {
-        await eventually(`${label}: AppKit restored a visible window with the confirmation open`, () => js(`
-          void window.__ironTest.quitWindowState().then(state => window.__nativeWindowState = state);
-          return { state: window.__nativeWindowState, ready: document.querySelector('#quit-dialog').open && !document.querySelector('#quit-discard').disabled };
-        `), result => result?.ready && result.state?.[0] === false && result.state[1] === true);
-      }
       await js("window.__ironTest.tryType('unexpected edit'); return true;");
       assert.equal((await current()).text, unsaved, `${label}: the pending decision must prevent typing`);
       await click("#quit-cancel");
@@ -408,13 +402,33 @@ async function nativeQuitSmoke() {
       requestNativeQuit();
       await cancelled("System Quit");
 
-      await js("void window.__ironTest.quitWindowState(true); return true;");
-      await eventually("AppKit minimized the dirty window", () => js(`
+      const readMinimizedQuit = () => js(`
+        return { menu: window.__menuQuit, requests: window.__ironTest.quitRequests(),
+          window: window.__nativeWindowState, dialog: document.querySelector('#quit-dialog').open,
+          ready: !document.querySelector('#quit-discard').disabled };
+      `);
+      const observeWindow = () => js(`
         void window.__ironTest.quitWindowState().then(state => window.__nativeWindowState = state);
-        return window.__nativeWindowState;
-      `), state => state?.[0] === true);
-      requestNativeQuit();
-      await cancelled("System Quit with minimized window", true);
+        return true;
+      `);
+      await js("window.__nativeWindowState = null; void window.__ironTest.quitWindowState(true); return true;");
+      const minimized = await eventually("AppKit minimized the dirty window", async () => {
+        await observeWindow();
+        return readMinimizedQuit();
+      }, result => result?.window?.[0] === true && result.window[1] === false);
+      let restored;
+      try {
+        await js("window.__menuQuit = null; void window.__ironTest.quitMenu().then(found => window.__menuQuit = found).catch(error => window.__menuQuit = String(error)); return true;");
+        restored = await eventually("Quit menu restores the minimized window with a usable confirmation", async () => {
+          await observeWindow();
+          return readMinimizedQuit();
+        }, result => result?.menu === true && result.requests === minimized.requests + 1 &&
+          result.window?.[0] === false && result.window[1] === true && result.dialog && result.ready);
+        await cancelled("Quit menu with minimized window");
+      } finally {
+        const last = await readMinimizedQuit().catch(error => ({ error: String(error) }));
+        await writeFile(path.join(artifacts, "minimized-quit.json"), JSON.stringify({ minimized, restored, last }, null, 2));
+      }
 
       await js("window.__menuQuit = null; void window.__ironTest.quitMenu().then(found => window.__menuQuit = found).catch(error => window.__menuQuit = String(error)); return true;");
       await eventually("default AppKit Quit menu action invoked", () => js("return { result: window.__menuQuit, requests: window.__ironTest.quitRequests(), dialog: document.querySelector('#quit-dialog').open };"), state => state?.result === true);
