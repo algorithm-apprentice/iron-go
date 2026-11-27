@@ -779,6 +779,28 @@ test("Go navigation rejects malformed workspace locations and cancels an outstan
   });
 });
 
+test("an explicit Go edit preserves unrelated auto-indent whitespace and line endings", async () => {
+  await documentScenario("go-exact-edit", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { monaco, applyExactTextEdits } = window.workflowFixture;
+      const docs = window.documents;
+      docs.reset({ read: async () => "package main\r\n\r\nvar _ = 1\r\n" });
+      const { model } = await docs.open("source.go");
+      model.pushStackElement();
+      model.pushEditOperations([], [{ range: new monaco.Range(2, 1, 2, 1), text: "\t", isAutoWhitespaceEdit: true }], () => null);
+      const before = model.getValue();
+      const [decoration] = model.deltaDecorations([], [{ range: new monaco.Range(1, 1, 1, 1), options: {} }]);
+      const changed = applyExactTextEdits(model, [{ range: new monaco.Range(3, 1, 3, 10), text: "var _ = 2\nvar _ = 3" }]);
+      const after = model.getValue();
+      const decorationLine = model.getDecorationRange(decoration)?.startLineNumber;
+      await model.undo();
+      return { changed, before, after, decorationLine, undone: model.getValue(), trimRestored: model.getOptions().trimAutoWhitespace };
+    });
+    const before = "package main\r\n\t\r\nvar _ = 1\r\n";
+    assert.deepEqual(outcome, { changed: true, before, after: "package main\r\n\t\r\nvar _ = 2\r\nvar _ = 3\r\n", decorationLine: 1, undone: before, trimRestored: true });
+  });
+});
+
 test("the dirty tab dialog defaults to Cancel and restores focus on Escape", async () => {
   await scenario("dirty-tab-dialog", async page => {
     await page.locator("#editor textarea.inputarea").focus();

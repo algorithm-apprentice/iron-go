@@ -1294,7 +1294,7 @@ async function goSuite() {
 
   if (!capabilities.gopls) {
     for (const name of ["gopls publishes/clears real errors and completes a Go symbol", "gopls hover and definition work through Monaco",
-      "gopls symbol and reference navigation uses unsaved UTF-16 locations",
+      "gopls symbol and reference navigation uses unsaved UTF-16 locations", "Organize Imports updates only the Go buffer as one undoable edit",
       "runs exactly one Go test from its editor action", "whole-line selection highlights the selected number, not its endpoint"]) {
       console.log(`  SKIP ${name} (gopls not installed)`);
       report.cases.push({ name, result: "skip", reason: "gopls not installed" });
@@ -1379,7 +1379,7 @@ async function goSuite() {
       await set("#go-symbol-search", "ineditor");
       await click("#go-symbol-results button");
       await eventually("selecting the filtered symbol navigates to its line", () => text("#cursor"), value => value.startsWith("Ln 5,"));
-      await js("window.__ironTest.holdGoReferences(); return true;");
+      await js("window.__ironTest.holdGoRequest('textDocument/references'); return true;");
       try {
         await invokeReferences();
         await eventually("the live reference reply is held", () => js("return window.__ironTest.goReferenceProbe().deferred;"));
@@ -1400,6 +1400,34 @@ async function goSuite() {
       assert.equal(await js("return !!document.querySelector('#tabs [data-path=\"cmd/orbit/navigation.go\"]');"), false);
       assert.equal(await readFile(file, "utf8"), disk);
       await click("#close-references");
+    });
+    await record("Organize Imports updates only the Go buffer as one undoable edit", async () => {
+      const file = path.join(fixture, "cmd/orbit/organize.go");
+      const original = 'package main\n\nimport (\n\t"os"\n\t"fmt"\n)\n\nvar importFixture = fmt.Sprintf("ready")\n';
+      await writeFile(file, original);
+      await eventually("organize fixture appears", () => js("return !!document.querySelector('#explorer [data-path=\"cmd/orbit/organize.go\"]');"));
+      await click('#explorer [data-path="cmd/orbit/organize.go"]');
+      await eventually("organize fixture is open", current, state => state?.path === "cmd/orbit/organize.go");
+      await chooseCommand("go organize imports");
+      await eventually("unused import removed from the buffer", current, state => state?.dirty && state.text.includes('"fmt"') && !state.text.includes('"os"'));
+      assert.equal(await readFile(file, "utf8"), original);
+      await js("window.__ironTest.action('undo', 1, 1); return true;");
+      await eventually("one Undo restores the original imports", current, state => state?.text === original && !state.dirty);
+      const later = original + "\n// An ordinary save while gopls is pending\n";
+      await js("window.__ironTest.holdGoRequest('textDocument/codeAction'); return true;");
+      try {
+        await chooseCommand("go organize imports");
+        await eventually("the import response is held", () => js("return window.__ironTest.goReferenceProbe().deferred;"));
+        await replace(later);
+        await click("#save");
+        await eventually("ordinary Save remains available while the code action is waiting", () => readFile(file, "utf8"), bytes => bytes === later);
+      } finally { await js("window.__ironTest.releaseGoReferences(); return true;"); }
+      await eventually("the superseded import response is rejected", () => text("#status"), value => /buffer changed/.test(value));
+      await eventually("the superseded import response leaves the new buffer alone", current, state => state?.text === later && !state.dirty);
+      const corrected = later.replace('\t"os"\n', "");
+      await writeFile(file, corrected);
+      await eventually("the valid fixture on disk is adopted", current, state => state?.text === corrected && !state.dirty);
+      await click('#tabs [data-path="cmd/orbit/main.go"]');
     });
     await record("gopls hover and definition work through Monaco", async () => {
       const source = (await current()).text.split("\n");

@@ -124,6 +124,8 @@ self-generated save events, and late events after switching projects.
 ## 2. Go navigation and refactoring
 
 Implementation starts with [Go symbol navigation](go-symbol-navigation.md).
+The next step is [reviewing Go refactors](go-refactor-preview.md), starting
+with the single-buffer Organize Imports action.
 
 - Add **Find References** and **Go to Symbol in File**. Use `gopls`, with
   cancellable requests, and group references by file. Selecting a result opens

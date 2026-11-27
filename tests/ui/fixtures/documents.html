@@ -3,7 +3,7 @@
 <title>Document operation fixture</title>
 <div id="editor" style="width: 800px; height: 600px"></div>
 <script type="module">
-  import { Documents, bufferText, exactModelRange, monaco } from "../../../src/editor.ts";
+  import { Documents, applyExactTextEdits, bufferText, exactModelRange, monaco } from "../../../src/editor.ts";
   import { EditorLayoutInfoComputer } from "monaco-editor/editor/common/config/editorOptions.js";
   import { DebugSession } from "../../../src/debugger.ts";
   import { ExecutionLane } from "../../../src/execution.ts";
@@ -32,6 +32,6 @@
       pixelRatio: devicePixelRatio, viewLineCount: count, isDominatedByLongLines: false, glyphMarginDecorationLaneCount: 1,
     });
   };
-  window.workflowFixture = { DebugSession, ExecutionLane, createCursorTestWorkflow, monaco, GoLanguage, exactModelRange,
+  window.workflowFixture = { DebugSession, ExecutionLane, createCursorTestWorkflow, monaco, GoLanguage, exactModelRange, applyExactTextEdits,
     AbstractMessageReader, AbstractMessageWriter, CancellationTokenSource, createMessageConnection };
 </script>

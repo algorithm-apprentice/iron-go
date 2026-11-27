@@ -24,3 +24,4 @@ record detailed behavior, alternatives, implementation order, and acceptance.
 | [0017](0017-save-before-transition.md) | Guard sequential saves before project cutover and native Quit | Accepted design |
 | [0018](0018-exclusive-new-path-save.md) | Publish new-path saves with exclusive native replacement | Accepted design |
 | [0019](0019-go-navigation-snapshots.md) | Bind Go navigation results to the originating editor snapshot | Accepted design |
+| [0020](0020-explicit-go-import-edits.md) | Apply only direct, version-bound Go import edits | Accepted design |

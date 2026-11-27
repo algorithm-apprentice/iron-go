@@ -71,14 +71,14 @@ export function installAcceptance(docs: Documents, workbench: {
       docs.editor.trigger("iron-test", "editor.action.triggerSuggest", {});
     },
     position: (lineNumber: number, column: number) => docs.editor.setPosition({ lineNumber, column }),
-    holdGoReferences() {
+    holdGoRequest(method: "textDocument/references" | "textDocument/codeAction") {
       releaseNavigation();
       navigationRequest = undefined;
       navigationCancelled = false;
       window.__ironNavigationProbe = {
         sent(value) {
           const message = value as { method?: string; id?: unknown; params?: { id?: unknown } };
-          if (navigationRequest === undefined && message.method === "textDocument/references") navigationRequest = message.id;
+          if (navigationRequest === undefined && message.method === method) navigationRequest = message.id;
           if (message.method === "$/cancelRequest" && navigationRequest !== undefined && message.params?.id === navigationRequest) navigationCancelled = true;
         },
         holdReply(value, deliver) {

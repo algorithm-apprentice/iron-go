@@ -83,6 +83,40 @@ export function replaceBuffer(model: monaco.editor.ITextModel, text: string) {
   model.pushStackElement();
 }
 
+export function applyExactTextEdits(model: monaco.editor.ITextModel, edits: readonly { range: monaco.IRange; text: string }[]) {
+  const original = model.getValue();
+  const eol = model.getEOL();
+  const offsets = edits.map(({ range, text }) => {
+    if (!exactModelRange(model, range)) throw new Error("The edit no longer matches the buffer.");
+    const start = model.getOffsetAt({ lineNumber: range.startLineNumber, column: range.startColumn });
+    const end = model.getOffsetAt({ lineNumber: range.endLineNumber, column: range.endColumn });
+    if (end < start) throw new Error("The edit has an invalid range.");
+    return { range, start, end, text: text.replace(/\r\n|\n|\r/g, eol) };
+  }).sort((left, right) => left.start - right.start || left.end - right.end);
+  let last = 0;
+  let previousStart = -1;
+  const pieces: string[] = [];
+  for (const edit of offsets) {
+    if (edit.start < last || edit.start === previousStart) throw new Error("The edits overlap or have ambiguous ordering.");
+    pieces.push(original.slice(last, edit.start), edit.text);
+    previousStart = edit.start;
+    last = edit.end;
+  }
+  pieces.push(original.slice(last));
+  const updated = pieces.join("");
+  if (updated === original) return false;
+  const trimAutoWhitespace = model.getOptions().trimAutoWhitespace;
+  model.updateOptions({ trimAutoWhitespace: false });
+  try {
+    model.pushStackElement();
+    model.pushEditOperations([], offsets.map(({ range, text }) => ({ range, text })), () => null);
+    model.pushStackElement();
+  }
+  finally { model.updateOptions({ trimAutoWhitespace }); }
+  if (model.getValue() !== updated) throw new Error("The editor did not apply the exact text. Use Undo to restore the previous buffer.");
+  return true;
+}
+
 type Target = monaco.IRange | monaco.IPosition;
 
 // Be conservative about missing paths, which have no inode to compare. Case

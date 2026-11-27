@@ -28,6 +28,7 @@ When launched from Finder, Iron Go also searches common tool locations, includin
 - Dark and light themes, saved through **Settings → Color Theme** (`⌘,`).
 - `gopls` completion, hover documentation, workspace definition navigation, and diagnostics in the Problems panel. Run a named test through its **Run Test** CodeLens or **Go: Run Test at Cursor** in the command palette.
 - **Go to Line** works without `gopls`. With `gopls`, **Go to Symbol in File** searches the current Go buffer, and **Find References** lists workspace locations using open unsaved buffers.
+- **Go: Organize Imports** applies a `gopls` import edit to the current buffer as one undoable change. It does not save the file.
 - Go test debugging with Delve. Install it with `brew install delve` and probe for tools again in Settings. Set a breakpoint to the left of a Go line number or press `F9`, then use **Debug Test** or **Go: Debug Test at Cursor**. Continue, step over, and stop are supported.
 - `go build`, `go run`, and `go test` with live output, exit status, and task cancellation. Run only trusted projects.
 - Keyboard shortcuts: `⌘O` opens a project, `⌘P` opens a file, `⇧⌘P` opens the command palette, `⌘S` saves, `⇧⌘F` searches saved files, `⇧⌥F` formats, and `⌘↵` runs or stops a task. `⇧⌘[` and `⇧⌘]` cycle editors; `⌘B` and `⌘J` toggle the sidebar and bottom panel.

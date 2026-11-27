@@ -3,7 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { CancellationTokenSource } from "vscode-jsonrpc/lib/browser/main.js";
 import { byId, element, Forms, message, Palette } from "./dialogs";
 import { showDiskComparison } from "./disk-compare";
-import { bufferText, defaultEditorFontSize, Documents, editorTypography, exactModelRange, monaco, type DocumentTab } from "./editor";
+import { applyExactTextEdits, bufferText, defaultEditorFontSize, Documents, editorTypography, exactModelRange, monaco, type DocumentTab } from "./editor";
 import { Feedback } from "./feedback";
 import { fileIcon, icon, prepareIcons, type Icon } from "./icons";
 import { GoLanguage, debugTestCommand, runTestCommand, type GoLocation, type GoSymbol, type LanguageState } from "./lsp";
@@ -657,6 +657,28 @@ async function formatActive() {
   finally { formatting = false; syncControls(); }
 }
 
+async function organizeImports() {
+  const tab = docs.active;
+  const service = lsp;
+  if (!tab || tab.model.getLanguageId() !== "go" || !service || gopls !== "ready") {
+    toast("Open a Go file with gopls running to organize imports.");
+    return;
+  }
+  if (fileActionsBlocked() || filesBusy()) return;
+  const live = captureTab(tab);
+  let release: (() => void) | undefined;
+  try {
+    const edits = await service.organizeImports(tab.model);
+    if (docs.active !== tab || lsp !== service) return;
+    if (!live()) { status("Imports were not changed because the buffer changed"); return; }
+    if (!edits) { status("No applicable Go import edits"); return; }
+    release = reserveFileActivity();
+    if (!release) return;
+    status(applyExactTextEdits(tab.model, edits) ? `Organized imports in ${basename(tab.path)}` : "Go imports are already organized");
+  } catch (error) { if (docs.active === tab && lsp === service) showError(error); }
+  finally { release?.(); }
+}
+
 function refresh() {
   return snapshots.refresh(project, {
     current: () => project,
@@ -1134,6 +1156,7 @@ function showPalette(command = false, workspaceOnly = false) {
     ...(project.native && docs.active ? [{ label: "Compare with Disk", icon: "files" as const, run: compareWithDisk }] : []),
     ...(project.native && docs.active ? [{ label: "Save to a New Path…", icon: "save" as const, run: saveToNewPath }] : []),
     { label: "Format Go File", detail: "⇧⌥F", icon: "format", run: formatActive },
+    { label: "Go: Organize Imports", icon: "format", run: organizeImports },
     { label: "Go: Run Selected Target", detail: "⌘↵", icon: "play", run: () => { void runTask("run"); } },
     { label: "Go: Choose Run Target", icon: "package", run: () => runTargets.picker.focus() },
     { label: "Go: Build Packages", icon: "hammer", run: () => { void runTask("build"); } },

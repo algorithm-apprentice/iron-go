@@ -1,10 +1,11 @@
-import { AbstractMessageReader, AbstractMessageWriter, CancellationToken, createMessageConnection, type DataCallback, type Message, type MessageConnection } from "vscode-jsonrpc/lib/browser/main.js";
-import { SymbolKind, type CompletionItem, type CompletionList, type Diagnostic, type DocumentSymbol, type Hover, type Location, type LocationLink, type MarkedString, type MarkupContent, type Range, type SymbolInformation } from "vscode-languageserver-types";
+import { AbstractMessageReader, AbstractMessageWriter, CancellationToken, CancellationTokenSource, createMessageConnection, type DataCallback, type Message, type MessageConnection } from "vscode-jsonrpc/lib/browser/main.js";
+import { SymbolKind, type CodeAction, type Command, type CompletionItem, type CompletionList, type Diagnostic, type DocumentSymbol, type Hover, type Location, type LocationLink, type MarkedString, type MarkupContent, type Range, type SymbolInformation } from "vscode-languageserver-types";
 import { message } from "./dialogs";
 import { exactModelRange, monaco, type DocumentTab, type Documents } from "./editor";
 import { host, type NativeFolder } from "./workspace";
 import { goTestAt, isGoTestFunction } from "./go-test-target";
 import { validateRelative } from "./project-model";
+import { decodeLocalFileUri, organizeImportEdits } from "./go-import-edits";
 
 export type LanguageState = "idle" | "missing" | "starting" | "ready" | "failed";
 const markerOwner = "gopls";
@@ -151,6 +152,7 @@ export class GoLanguage {
               completion: { completionItem: { snippetSupport: true, insertReplaceSupport: true, documentationFormat: ["markdown", "plaintext"] } },
               definition: { linkSupport: true },
               documentSymbol: { hierarchicalDocumentSymbolSupport: true },
+              codeAction: { codeActionLiteralSupport: { codeActionKind: { valueSet: ["source.organizeImports"] } } },
               hover: { contentFormat: ["markdown", "plaintext"] },
             },
           },
@@ -241,12 +243,10 @@ export class GoLanguage {
   }
 
   private workspaceLocation(uri: string, range: Range): GoLocation | undefined {
-    const rawPath = /^file:\/\/\/(?!\/)[^?#\\\s\u0000-\u001f\u007f-\u009f]+$/u;
-    if (!rawPath.test(uri) || /%2f|%5c|%(?![a-f0-9]{2})/i.test(uri) || !validRange(range)) return;
+    const decoded = decodeLocalFileUri(uri);
+    if (!decoded || !validRange(range)) return;
     try {
-      decodeURIComponent(uri);
-      const parsed = monaco.Uri.parse(uri, true);
-      if (parsed.query || parsed.fragment) return;
+      const parsed = monaco.Uri.file(decoded);
       const path = this.docs.relative(parsed);
       if (!path) return;
       validateRelative(path);
@@ -279,6 +279,31 @@ export class GoLanguage {
     };
     add(raw);
     return results;
+  }
+
+  async organizeImports(model: monaco.editor.ITextModel) {
+    const version = model.getVersionId();
+    const last = model.getLineCount();
+    const source = new CancellationTokenSource();
+    let timer: number | undefined;
+    const request = this.request<(CodeAction | Command)[] | null>("textDocument/codeAction", model, undefined, source.token, {
+      range: { start: { line: 0, character: 0 }, end: { line: last - 1, character: model.getLineMaxColumn(last) - 1 } },
+      context: { diagnostics: [], only: ["source.organizeImports"], triggerKind: 1 },
+    });
+    try {
+      const actions = await Promise.race([request, new Promise<never>((_, reject) => {
+        timer = window.setTimeout(() => reject(new Error("gopls did not finish organizing imports.")), 10_000);
+      })]);
+      if (!actions) return;
+      return organizeImportEdits(actions, model.uri.toString(), version)?.map(edit => {
+        if (!validRange(edit.range)) throw new Error("The import edit has an invalid UTF-16 range.");
+        return { range: fromRange(edit.range), text: edit.newText };
+      });
+    } finally {
+      window.clearTimeout(timer);
+      source.cancel();
+      source.dispose();
+    }
   }
 
   async references(model: monaco.editor.ITextModel, position: monaco.Position, token: monaco.CancellationToken) {
