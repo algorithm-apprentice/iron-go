@@ -35,9 +35,11 @@ copy of `tests/fixtures/orbit`. No existing IDE instance or manual folder
 selection is needed. It requires a working macOS app session. For repeat
 runs with an unchanged test build, use `npm run test:native -- --skip-build`.
 
-One native build serves isolated `lifecycle`, `files`, `go`, `debug`, and
-`quit` groups. Each selected group gets its own app, worker, workspace and
-home. Select groups with repeatable `--group` (for example `--group files`);
+One native build serves isolated `lifecycle`, `files`, `go`, `debug`, `quit`,
+and `quit-save` groups. `quit-save` covers partial saves, expiry during an
+admitted write, and a successful native Save and Quit. Each selected group
+gets its own app, worker, workspace and home. Select groups with repeatable
+`--group` (for example `--group files`);
 the default includes all except `debug`, which `--require-delve` adds.
 Explicit Debug requires gopls and Delve. Go's language-service cases skip
 only when its capability probe confirms gopls is absent and it was not

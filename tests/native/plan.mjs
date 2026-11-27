@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { parseArgs } from "node:util";
 
-export const fixtureGroups = ["lifecycle", "files", "go", "debug", "quit"];
+export const fixtureGroups = ["lifecycle", "files", "go", "debug", "quit", "quit-save"];
 
 export function nativePlan(args) {
   const { values } = parseArgs({ args, options: {
@@ -49,7 +49,7 @@ export function validReport(group, report) {
 }
 
 export function validTerminal(group, terminal) {
-  const action = { lifecycle: "clean system Quit", quit: "dirty Discard" }[group];
+  const action = { lifecycle: "clean system Quit", quit: "dirty Discard", "quit-save": "dirty Save and Quit" }[group];
   return typeof action === "string" && terminal?.action === action && typeof terminal.rendererObserved === "string";
 }
 
@@ -60,7 +60,7 @@ export function summarizeGroup(group, { worker, report, failure, cleanup, native
     || (!valid ? "Missing or invalid matching group report." : undefined)
     || (report.cases.some(entry => entry.result === "fail") ? "A worker case failed." : undefined)
     || (!report.cases.some(entry => entry.result === "pass") ? "No passing case in the selected group." : undefined)
-    || (["lifecycle", "quit"].includes(group) && (!validTerminal(group, report.terminal) || !nativeTerminal)
+    || (["lifecycle", "quit", "quit-save"].includes(group) && (!validTerminal(group, report.terminal) || !nativeTerminal)
       ? "Missing verified native Quit; watchdog EOF is not the Quit oracle." : undefined);
   const secondary = [...diagnostics, ...(valid ? report.diagnostics ?? [] : [])];
   if (cleanup && primary) secondary.push(cleanup);

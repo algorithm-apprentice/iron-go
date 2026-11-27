@@ -653,6 +653,48 @@ test("creates a nested file, rejects duplicates, and does not fake native tasks"
   });
 });
 
+test("the dirty tab dialog defaults to Cancel and restores focus on Escape", async () => {
+  await scenario("dirty-tab-dialog", async page => {
+    await page.locator("#editor textarea.inputarea").focus();
+    await page.keyboard.insertText("// Unsaved dialog check");
+    await page.locator('.tab.dirty [data-path="cmd/orbit/main.go"]').waitFor();
+    const close = page.getByRole("button", { name: "Close main.go" });
+    await close.focus();
+    await close.press("Enter");
+    const dialog = page.getByRole("dialog", { name: "Close unsaved file?" });
+    await dialog.waitFor({ timeout: 3000 });
+    assert.match(await dialog.innerText(), /cmd\/orbit\/main\.go/);
+    assert.deepEqual(await dialog.getByRole("button").allTextContents(), ["Cancel", "Discard", "Save and Close"]);
+    assert.equal(await dialog.getByRole("button", { name: "Cancel" }).evaluate(button => document.activeElement === button), true);
+    await page.keyboard.press("Escape");
+    await dialog.waitFor({ state: "hidden" });
+    assert.equal(await close.evaluate(button => document.activeElement === button), true);
+    assert.match(await page.locator("#editor .view-lines").innerText(), /Unsaved\s+dialog\s+check/);
+    await close.press("Enter");
+    await dialog.getByRole("button", { name: "Discard", exact: true }).click();
+    await close.waitFor({ state: "detached" });
+    assert.equal(await page.locator("#empty-quick-open").evaluate(button => document.activeElement === button), true);
+  });
+});
+
+test("an asynchronous tab close does not cancel a newer pending navigation", async () => {
+  await documentScenario("close-preserves-navigation", async page => {
+    const active = await page.evaluate(async () => {
+      const { documents: docs } = window;
+      const pending = Promise.withResolvers();
+      docs.reset({ read: path => path === "next.txt" ? pending.promise : Promise.resolve(path) });
+      const close = await docs.open("closing.txt");
+      await docs.open("successor.txt", { activate: false });
+      const next = docs.open("next.txt");
+      docs.close(close, { focus: false, preserveNavigation: true });
+      pending.resolve("latest navigation");
+      await next;
+      return docs.active.path;
+    });
+    assert.equal(active, "next.txt");
+  });
+});
+
 test("Dark and Light switch the entire workbench and persist without dropping edits", async () => {
   await scenario("color-themes", async page => {
     const backgrounds = () => page.evaluate(() => [".monaco-editor-background", ".sidebar", ".bottom-panel"].map(selector =>

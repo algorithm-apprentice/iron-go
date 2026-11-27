@@ -21,3 +21,4 @@ record detailed behavior, alternatives, implementation order, and acceptance.
 | [0014](0014-editor-typography.md) | Bundle JetBrains Mono as the editor default | Accepted |
 | [0015](0015-external-file-reconciliation.md) | Reconcile native filesystem changes against document baselines | Accepted design |
 | [0016](0016-reviewed-disk-conflicts.md) | Bind a disk conflict decision to the version shown to the user | Accepted design |
+| [0017](0017-save-before-transition.md) | Guard sequential saves before project cutover and native Quit | Accepted design |

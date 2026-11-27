@@ -42,7 +42,14 @@ test("a clean editor needs no confirmation and stays frozen after approval", asy
 test("an unsuccessful reply cannot leave the editor frozen", async () => {
   const attempt = decision({ discard: true, send: () => Promise.reject(new Error("IPC failed")) });
   await assert.rejects(() => decideExit(attempt), /IPC failed/);
-  assert.deepEqual(attempt.calls, ["freeze", "confirm", true, "thaw"]);
+  assert.deepEqual(attempt.calls, ["freeze", "confirm", true, false, "thaw"]);
+});
+
+test("an unsuccessful save decision releases its native ticket before thawing", async () => {
+  const attempt = decision();
+  attempt.confirmDiscard = async () => { throw new Error("save failed"); };
+  await assert.rejects(() => decideExit(attempt), /save failed/);
+  assert.deepEqual(attempt.calls, ["freeze", false, "thaw"]);
 });
 
 test("the editor stays frozen while the dialog awaits a choice", async () => {

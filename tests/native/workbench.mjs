@@ -190,7 +190,7 @@ async function runGroup(executable, env, group, quitHelper) {
     app = await logged(executable, [], path.join(directory, "app.log"), {
       ...groupEnv, HOME: home, CFFIXED_USER_HOME: home,
       IRON_GO_E2E_WORKSPACE: fixture, TAURI_WEBDRIVER_PORT: String(available),
-      IRON_GO_E2E_WATCH_STDIN: "1", IRON_GO_E2E_EXIT_TIMEOUT_MS: group === "quit" ? "10000" : "",
+      IRON_GO_E2E_WATCH_STDIN: "1", IRON_GO_E2E_EXIT_TIMEOUT_MS: group === "quit" || group === "quit-save" ? "10000" : "",
     }, true);
     const config = { group, values, driver: `http://127.0.0.1:${available}`, artifacts: directory, fixture, home, pid: app.child.pid, quitHelper };
     worker = monitor(fork(workerPath, [JSON.stringify(config)], { cwd: root, execArgv: [], stdio: ["ignore", "inherit", "inherit", "ipc"] }));
@@ -239,7 +239,7 @@ try {
   }
   await access(executable, constants.X_OK);
   let quitHelper;
-  if (groups.includes("lifecycle") || groups.includes("quit")) {
+  if (groups.some(group => ["lifecycle", "quit", "quit-save"].includes(group))) {
     quitHelper = path.join(temporary, "request-quit");
     const compiler = await logged("swiftc", [quitSource, "-o", quitHelper], path.join(artifacts, "quit-helper-build.log"), process.env);
     const result = await Promise.race([bounded(compiler.exited, 120_000), interrupted.then(() => undefined)]);

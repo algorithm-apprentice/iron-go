@@ -13,6 +13,8 @@ export function installAcceptance(docs: Documents, workbench: {
   root(): string | undefined;
   gopls(): LanguageState;
   quitRequests(): number;
+  quitExpiry(): number;
+  workspaceId(): number | undefined;
 }) {
   let gutterHit: { line: number | null; type: string } | undefined;
   let selectionSource: string | undefined;
@@ -71,7 +73,12 @@ export function installAcceptance(docs: Documents, workbench: {
     quitWindowState: (minimize = false) => invoke<[boolean, boolean]>("test_quit_window_state", { minimize }),
     quitMenu: () => invoke<boolean>("test_quit_menu_action"),
     quitRequests: workbench.quitRequests,
-    holdSave: (hold?: boolean) => invoke<boolean>("test_hold_save", { hold }),
+    quitExpiry: workbench.quitExpiry,
+    quitDeadline: (hold?: boolean) => invoke<[number, boolean] | null>("test_quit_deadline", { hold }),
+    cancelNextPicker: () => invoke<void>("test_cancel_next_picker"),
+    holdSave: (hold?: boolean, path?: string) => invoke<boolean>("test_hold_save", { hold, path }),
+    attemptQuitSave: (path: string, expected: string, text: string, quitTicket: number) =>
+      invoke<void>("save_file", { id: workbench.workspaceId(), path, expected, text, quitTicket }),
     saving: () => docs.saving,
     tryType: (text: string) => docs.editor.trigger("keyboard", "type", { text }),
   } });

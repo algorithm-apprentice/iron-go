@@ -21,6 +21,7 @@ When launched from Finder, Iron Go also searches common tool locations, includin
 ## Features
 
 - File tree, editor tabs, unsaved-change indicators, undo, save conflict protection, quick file navigation, and full-text search across saved files.
+- **Save All** saves dirty tabs in order. When closing an unsaved tab, switching projects, or quitting, Iron Go offers to save or discard the edits; a failed save keeps the project open.
 - Native file watching updates the project tree and reloads open files without unsaved edits. Changed, missing, or unreadable files are indicated without overwriting unsaved buffers. **Compare with Disk** shows both versions and can reload or save only against the reviewed disk file. **Refresh Project** also rechecks open files.
 - Go syntax highlighting in Monaco. `gofmt` formats the current buffer without saving it.
 - Dark and light themes, saved through **Settings → Color Theme** (`⌘,`).

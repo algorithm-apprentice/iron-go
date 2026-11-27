@@ -192,6 +192,17 @@
       <label class="settings-row"><div><strong>Word wrap</strong><small>Wrap long lines to the editor width.</small></div><input id="wrap-setting" type="checkbox" /></label>
       <div class="settings-tools"><h3>Go Toolchain</h3><div id="settings-tools-info" class="view-note"></div><button id="probe-tools" class="button quiet"><span data-icon="refresh"></span>Check tools</button></div>
     </dialog>
+    <dialog id="file-decision-dialog" class="form-dialog" aria-labelledby="file-decision-title" aria-describedby="file-decision-description">
+      <form method="dialog">
+        <div class="dialog-header"><h2 id="file-decision-title"></h2></div>
+        <p id="file-decision-description"></p>
+        <div class="dialog-actions">
+          <button id="file-decision-cancel" class="button primary" value="cancel" autofocus>Cancel</button>
+          <button id="file-decision-discard" class="button quiet" value="discard"></button>
+          <button id="file-decision-save" class="button quiet" value="save">Save and Close</button>
+        </div>
+      </form>
+    </dialog>
     <dialog id="disk-compare-dialog" class="form-dialog disk-compare-dialog" aria-labelledby="disk-compare-title" aria-describedby="disk-compare-path disk-compare-status">
       <form method="dialog">
         <div class="dialog-header"><h2 id="disk-compare-title">Compare with Disk</h2></div>
@@ -215,16 +226,18 @@
         <div class="dialog-actions">
           <button id="project-transition-cancel" class="button primary" value="cancel" autofocus>Cancel</button>
           <button id="project-transition-continue" class="button quiet" value="continue">Continue</button>
+          <button id="project-transition-save" class="button quiet" value="save" hidden>Save and Continue</button>
         </div>
       </form>
     </dialog>
     <dialog id="quit-dialog" class="form-dialog" aria-labelledby="quit-title" aria-describedby="quit-description">
       <form method="dialog">
         <div class="dialog-header"><h2 id="quit-title">Quit Iron Go?</h2></div>
-        <p id="quit-description">Unsaved changes will be lost if you quit.</p>
+        <p id="quit-description">Save your edits or discard them before quitting.</p>
         <div class="dialog-actions">
           <button id="quit-cancel" class="button primary" value="cancel" autofocus>Cancel</button>
           <button id="quit-discard" class="button quiet" value="discard">Discard and Quit</button>
+          <button id="quit-save" class="button quiet" value="save">Save and Quit</button>
         </div>
       </form>
     </dialog>

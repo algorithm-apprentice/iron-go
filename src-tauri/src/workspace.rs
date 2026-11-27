@@ -124,7 +124,7 @@ fn read_text(root: &Path, relative: &str, limit: u64) -> CommandResult<String> {
 
 const SAVE_LOCK: &str = "save.lock";
 const OPEN_REGULAR: libc::c_int = libc::O_NOFOLLOW | libc::O_NONBLOCK;
-const SAVE_CONFLICT: &str = "The file changed on disk. Reload the tab before saving.";
+const SAVE_CONFLICT: &str = "The file changed on disk. Open its tab and choose Compare with Disk.";
 
 fn file_identity(info: &Metadata) -> (u64, u64) {
     (info.dev(), info.ino())
@@ -668,14 +668,18 @@ pub async fn save_file(
     expected: String,
     text: String,
     reviewed_version: Option<String>,
+    quit_ticket: Option<u64>,
 ) -> CommandResult<()> {
     let (root, anchor) = observation_root(&state, id)?;
     let data_dir = app
         .path()
         .app_local_data_dir()
         .map_err(|error| format!("Resolve save lock directory: {error}"))?;
+    if quit_ticket.is_some_and(|ticket| !crate::quit::live_ticket(&app, ticket)) {
+        return Err("The Quit decision expired before this file could be saved.".into());
+    }
     #[cfg(feature = "e2e")]
-    state.1.wait().await?;
+    state.1.wait(&path).await?;
     blocking(move || {
         persist_text_impl(
             &root,
@@ -693,7 +697,7 @@ pub async fn save_file(
 
 #[cfg(feature = "e2e")]
 pub struct TestSaveHold {
-    gate: tokio::sync::watch::Sender<bool>,
+    gate: tokio::sync::watch::Sender<(bool, Option<String>)>,
     waiting: std::sync::atomic::AtomicBool,
 }
 
@@ -701,7 +705,7 @@ pub struct TestSaveHold {
 impl Default for TestSaveHold {
     fn default() -> Self {
         Self {
-            gate: tokio::sync::watch::channel(false).0,
+            gate: tokio::sync::watch::channel((false, None)).0,
             waiting: false.into(),
         }
     }
@@ -709,16 +713,19 @@ impl Default for TestSaveHold {
 
 #[cfg(feature = "e2e")]
 impl TestSaveHold {
-    async fn wait(&self) -> CommandResult<()> {
+    async fn wait(&self, path: &str) -> CommandResult<()> {
         use std::sync::atomic::Ordering;
         let mut held = self.gate.subscribe();
-        if !*held.borrow() {
+        let holds_path = |(enabled, target): &(bool, Option<String>)| {
+            *enabled && target.as_deref().is_none_or(|target| target == path)
+        };
+        if !holds_path(&held.borrow()) {
             return Ok(());
         }
         self.waiting.store(true, Ordering::SeqCst);
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            held.wait_for(|hold| !*hold),
+            held.wait_for(|hold| !holds_path(hold)),
         )
         .await;
         self.waiting.store(false, Ordering::SeqCst);
@@ -731,9 +738,9 @@ impl TestSaveHold {
 
 #[cfg(feature = "e2e")]
 #[tauri::command]
-pub fn test_hold_save(state: State<'_, Core>, hold: Option<bool>) -> bool {
+pub fn test_hold_save(state: State<'_, Core>, hold: Option<bool>, path: Option<String>) -> bool {
     if let Some(hold) = hold {
-        state.1.gate.send_replace(hold);
+        state.1.gate.send_replace((hold, path));
     }
     state.1.waiting.load(std::sync::atomic::Ordering::SeqCst)
 }

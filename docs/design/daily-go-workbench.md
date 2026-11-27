@@ -55,6 +55,8 @@ below. Signing and notarization are a distribution gate, not a feature batch.
 ## 1. File decisions and external changes
 
 Implementation starts with [external file reconciliation](external-file-reconciliation.md).
+The next file workflows are [reviewed disk conflicts](reviewed-disk-conflicts.md)
+and [save and discard decisions](document-decisions.md).
 
 ### Behavior
 

@@ -17,6 +17,9 @@ export async function decideExit(decision: ExitDecision) {
     const approve = !decision.hasUnsavedChanges() || await decision.confirmDiscard();
     const accepted = await decision.reply(approve);
     exiting = approve && accepted;
+  } catch (error) {
+    try { await decision.reply(false); } catch { /* The same ticket will expire if the host is unavailable. */ }
+    throw error;
   } finally {
     if (!exiting) decision.freeze(false);
   }

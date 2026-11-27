@@ -53,7 +53,7 @@ export interface Project {
   snapshot(): Promise<ProjectSnapshot>;
   read(path: string): Promise<string>;
   inspect?(path: string): Promise<DiskObservation>;
-  save(path: string, expected: string, text: string, reviewedVersion?: string): Promise<void>;
+  save(path: string, expected: string, text: string, reviewedVersion?: string, quitTicket?: number): Promise<void>;
   createFile(path: string): Promise<void>;
   search(query: string, caseSensitive: boolean): Promise<SearchResult>;
 }
@@ -65,7 +65,7 @@ export function nativeProject(native: NativeFolder): Project {
     snapshot: () => invoke<ProjectSnapshot>("snapshot", { id }),
     read: (path) => invoke<string>("read_file", { id, path }),
     inspect: (path) => invoke<DiskObservation>("inspect_file", { id, path }),
-    save: (path, expected, text, reviewedVersion) => invoke<void>("save_file", { id, path, expected, text, reviewedVersion }),
+    save: (path, expected, text, reviewedVersion, quitTicket) => invoke<void>("save_file", { id, path, expected, text, reviewedVersion, quitTicket }),
     createFile: (path) => invoke<void>("create_file", { id, path }),
     search: (query, caseSensitive) => invoke<SearchResult>("search_files", { id, query, caseSensitive }),
   };

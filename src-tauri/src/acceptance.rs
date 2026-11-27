@@ -10,6 +10,15 @@ pub struct Admission {
     sealed: bool,
     short_tools: usize,
     unproved_exit: bool,
+    pub cancel_next_picker: bool,
+}
+
+#[tauri::command]
+pub fn test_cancel_next_picker(state: tauri::State<'_, Core>) -> CommandResult<()> {
+    let mut session = state.0.lock().unwrap();
+    session.acceptance.check()?;
+    session.acceptance.cancel_next_picker = true;
+    Ok(())
 }
 
 impl Admission {

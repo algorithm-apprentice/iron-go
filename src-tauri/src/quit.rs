@@ -15,7 +15,7 @@ use objc2_app_kit::{NSApplication, NSApplicationTerminateReply};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     sync::oneshot,
-    time::{sleep, timeout_at, Instant},
+    time::{sleep, sleep_until, timeout_at, Instant},
 };
 
 use crate::CommandResult;
@@ -29,31 +29,64 @@ fn queue_on_main(work: impl FnOnce() + Send + 'static) {
     DispatchQueue::main().exec_async(work);
 }
 
-#[derive(Default)]
-pub struct ExitGate(Mutex<Ticket>);
+pub struct ExitGate(
+    Mutex<Ticket>,
+    #[cfg(feature = "e2e")] tokio::sync::watch::Sender<bool>,
+);
+
+impl Default for ExitGate {
+    fn default() -> Self {
+        Self(
+            Mutex::new(Ticket::default()),
+            #[cfg(feature = "e2e")]
+            tokio::sync::watch::channel(false).0,
+        )
+    }
+}
 
 #[derive(Default)]
 struct Ticket {
     sequence: u64,
-    pending: Option<u64>,
+    pending: Option<(u64, Instant)>,
+    last_expired: Option<u64>,
 }
 
 impl Ticket {
-    fn begin(&mut self) -> Option<u64> {
+    fn begin(&mut self, deadline: Instant) -> Option<u64> {
         if self.pending.is_some() {
             return None;
         }
         self.sequence += 1;
-        self.pending = Some(self.sequence);
-        self.pending
+        self.pending = Some((self.sequence, deadline));
+        Some(self.sequence)
     }
 
     fn take(&mut self, ticket: u64) -> bool {
-        if self.pending != Some(ticket) {
+        if !self.pending.is_some_and(|(id, _)| id == ticket) {
             return false;
         }
         self.pending = None;
         true
+    }
+
+    fn live(&self, ticket: u64, now: Instant) -> bool {
+        self.pending
+            .is_some_and(|(id, deadline)| id == ticket && now < deadline)
+    }
+
+    fn expire(&mut self, ticket: u64, now: Instant) -> bool {
+        if self.live(ticket, now) || !self.take(ticket) {
+            return false;
+        }
+        self.last_expired = Some(ticket);
+        true
+    }
+
+    fn resolve(&mut self, ticket: u64, approve: bool, now: Instant) -> CommandResult<bool> {
+        if approve && (self.expire(ticket, now) || self.last_expired == Some(ticket)) {
+            return Err("The Quit decision expired. Files already saved remain on disk.".into());
+        }
+        Ok(self.take(ticket))
     }
 }
 
@@ -109,7 +142,8 @@ extern "C-unwind" fn should_terminate(_: *mut AnyObject, _: Sel, _: *mut AnyObje
     let Ok(mut gate) = app.state::<ExitGate>().inner().0.lock() else {
         return NSApplicationTerminateReply::TerminateCancel.0;
     };
-    let Some(ticket) = gate.begin() else {
+    let deadline = Instant::now() + decision_timeout();
+    let Some(ticket) = gate.begin(deadline) else {
         return NSApplicationTerminateReply::TerminateCancel.0;
     };
     drop(gate);
@@ -121,15 +155,37 @@ extern "C-unwind" fn should_terminate(_: *mut AnyObject, _: Sel, _: *mut AnyObje
             return;
         }
         tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(decision_timeout()).await;
+            sleep_until(deadline).await;
+            #[cfg(feature = "e2e")]
+            {
+                let mut held = app.state::<ExitGate>().inner().1.subscribe();
+                let _ = held.wait_for(|hold| !*hold).await;
+            }
             queue_on_main(move || {
-                if take(app, ticket) {
+                let expired = app
+                    .state::<ExitGate>()
+                    .inner()
+                    .0
+                    .lock()
+                    .is_ok_and(|mut gate| gate.expire(ticket, Instant::now()));
+                if expired {
                     let _ = app.emit_to("main", EXIT_EXPIRED, ticket);
                 }
             });
         });
     });
     NSApplicationTerminateReply::TerminateCancel.0
+}
+
+#[cfg(feature = "e2e")]
+#[tauri::command]
+pub fn test_quit_deadline(app: AppHandle, hold: Option<bool>) -> Option<(u64, bool)> {
+    let gate = app.state::<ExitGate>();
+    if let Some(hold) = hold {
+        gate.inner().1.send_replace(hold);
+    }
+    let pending = gate.inner().0.lock().unwrap().pending;
+    pending.map(|(ticket, deadline)| (ticket, Instant::now() >= deadline))
 }
 
 fn decision_timeout() -> Duration {
@@ -148,6 +204,14 @@ fn take(app: &AppHandle, ticket: u64) -> bool {
         .0
         .lock()
         .is_ok_and(|mut gate| gate.take(ticket))
+}
+
+pub fn live_ticket(app: &AppHandle, ticket: u64) -> bool {
+    app.state::<ExitGate>()
+        .inner()
+        .0
+        .lock()
+        .is_ok_and(|gate| gate.live(ticket, Instant::now()))
 }
 
 pub fn request_termination() {
@@ -194,7 +258,7 @@ async fn sample_presentation(
                     .state::<ExitGate>()
                     .0
                     .lock()
-                    .is_ok_and(|gate| gate.pending == Some(ticket))
+                    .is_ok_and(|gate| gate.live(ticket, Instant::now()))
         };
         let result = (|| {
             if !current() {
@@ -240,10 +304,17 @@ pub async fn present_app_exit(app: AppHandle, ticket: u64) -> CommandResult<bool
 pub async fn resolve_app_exit(app: AppHandle, ticket: u64, approve: bool) -> CommandResult<bool> {
     let (send, receive) = oneshot::channel();
     queue_on_main(move || {
-        if !take(&app, ticket) {
-            let _ = send.send(false);
+        let accepted = app
+            .state::<ExitGate>()
+            .inner()
+            .0
+            .lock()
+            .map_err(|error| error.to_string())
+            .and_then(|mut gate| gate.resolve(ticket, approve, Instant::now()));
+        if !matches!(accepted, Ok(true)) {
+            let _ = send.send(accepted);
         } else if !approve {
-            let _ = send.send(true);
+            let _ = send.send(Ok(true));
         } else {
             if let Some(mtm) = MainThreadMarker::new() {
                 APPROVED_RETRY.with(|permit| {
@@ -254,10 +325,10 @@ pub async fn resolve_app_exit(app: AppHandle, ticket: u64, approve: bool) -> Com
             }
             // If AppKit returns, the app is still alive. The renderer must
             // thaw and any later Quit must obtain a fresh decision.
-            let _ = send.send(false);
+            let _ = send.send(Ok(false));
         }
     });
-    receive.await.map_err(|error| error.to_string())
+    receive.await.map_err(|error| error.to_string())?
 }
 
 #[cfg(feature = "e2e")]
@@ -367,12 +438,29 @@ mod tests {
     }
 
     #[test]
+    fn elapsed_ticket_refuses_save_and_approval_before_expiry_callback() {
+        let mut gate = Ticket::default();
+        let deadline = Instant::now();
+        let ticket = gate.begin(deadline).unwrap();
+        assert!(!gate.live(ticket, deadline));
+        assert!(gate
+            .resolve(ticket, true, deadline)
+            .unwrap_err()
+            .contains("expired"));
+        assert!(gate.resolve(ticket, true, deadline).is_err());
+        let retry = gate.begin(deadline + Duration::from_secs(60)).unwrap();
+        assert_ne!(retry, ticket);
+        assert!(gate.live(retry, deadline));
+    }
+
+    #[test]
     fn tickets_coalesce_and_cannot_approve_a_later_attempt() {
         let mut gate = Ticket::default();
-        let initial = gate.begin().unwrap();
-        assert_eq!(gate.begin(), None);
+        let future = Instant::now() + Duration::from_secs(60);
+        let initial = gate.begin(future).unwrap();
+        assert_eq!(gate.begin(future), None);
         assert!(gate.take(initial));
-        let retry = gate.begin().unwrap();
+        let retry = gate.begin(future).unwrap();
         assert_ne!(initial, retry);
         assert!(!gate.take(initial));
         assert!(gate.take(retry));

@@ -13,6 +13,7 @@ import { basename, dirname, initialWorkspaceFile, makeTree, quickFiles, validate
 import { decideExit } from "./quit-flow";
 import { ExecutionLane } from "./execution";
 import { ProjectSnapshots } from "./project-workflow";
+import { saveDirtyTabs } from "./save-batch";
 import { createCursorTestWorkflow } from "./cursor-test-workflow";
 import { handleEditorCycle } from "./editor-shortcuts";
 import { desktop, host, importedProject, nativeProject, welcomeProject, type NativeFolder, type Project, type ReadableDisk, type TaskKind, type ToolStatus } from "./workspace";
@@ -44,7 +45,7 @@ const breakpoints = new Breakpoints();
 let executionLine: { model: monaco.editor.ITextModel; ids: string[] } | undefined;
 let formatting = false;
 let fileMutations = 0;
-let reviewingDisk = false;
+let fileDecisionPending = false;
 let testQuitRequests = 0;
 let quitDialogTicket: number | undefined;
 let lastExpiredQuitTicket = 0;
@@ -86,12 +87,25 @@ function cycleEditor(direction: 1 | -1) {
 }
 
 const filesBusy = () => docs.saving || formatting || fileMutations !== 0;
-const fileActionsBlocked = () => projectWorkflow.busy || execution.preparing || reviewingDisk;
+const fileActionsBlocked = () => projectWorkflow.busy || execution.preparing || fileDecisionPending;
 const saveBarrier = {
   revision: () => docs.editRevision,
   dirty: () => docs.dirty,
   async save() { for (const tab of docs.tabs.values()) if (tab.dirty) await docs.save(tab); },
 };
+
+function reserveFileActivity() {
+  if (fileActionsBlocked() || filesBusy() || document.querySelector("dialog[open]")) return;
+  fileDecisionPending = true;
+  fileMutations++;
+  syncControls();
+  return () => {
+    fileMutations--;
+    fileDecisionPending = false;
+    syncControls();
+    void refreshDisk?.();
+  };
+}
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
     docs.refreshView();
@@ -157,8 +171,13 @@ function renderExplorer() {
     if (snapshot.truncated) list.append(element("p", "view-note tree-note", "Explorer limit reached. Open a smaller folder to see more files."));
   }
   const scroll = explorer.scrollTop;
+  const focused = document.activeElement?.closest<HTMLButtonElement>("#explorer button");
   explorer.replaceChildren(root, list);
   explorer.scrollTop = scroll;
+  if (focused) {
+    const restored = [...list.querySelectorAll<HTMLButtonElement>(".tree-row")].find(row => row.dataset.path === focused.dataset.path);
+    (restored ?? root).focus({ preventScroll: true });
+  }
   byId("module-kind").textContent = snapshot.goWork ? "Go workspace" : snapshot.module ? "Go module" : "Folder";
   const moduleName = snapshot.module ?? (snapshot.goWork ? "go.work" : project.name);
   byId("module-name").textContent = moduleName;
@@ -186,11 +205,13 @@ function renderDocuments() {
   const tabs = byId("tabs");
   const active = docs.active;
   const scroll = tabs.scrollLeft;
-  const focusedTab = tabs.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset.path : undefined;
+  const focusedTab = document.activeElement?.closest<HTMLElement>("#tabs .tab")?.dataset.tabPath;
+  const focusedClose = document.activeElement?.classList.contains("tab-close");
   const children: HTMLElement[] = [];
   for (const tab of docs.tabs.values()) {
     const selected = tab === active;
     const row = element("div", `tab${selected ? " active" : ""}${tab.dirty ? " dirty" : ""}`);
+    row.dataset.tabPath = tab.path;
     if (tab.diskChange) row.dataset.diskChange = tab.diskChange;
     row.setAttribute("role", "presentation");
     const name = element("button", "tab-main");
@@ -206,13 +227,13 @@ function renderDocuments() {
     close.innerHTML = icon("close");
     close.title = tab.dirty ? "Close unsaved file" : "Close tab";
     close.setAttribute("aria-label", `Close ${basename(tab.path)}`);
-    close.addEventListener("click", () => closeTab(tab));
+    close.addEventListener("click", () => { void closeTab(tab); });
     row.append(name, close);
     children.push(row);
   }
   tabs.replaceChildren(...children);
   tabs.scrollLeft = scroll;
-  if (focusedTab) [...tabs.querySelectorAll<HTMLButtonElement>(".tab-main")].find(node => node.dataset.path === focusedTab)?.focus();
+  if (focusedTab) tabControl(focusedTab, focusedClose ? "close" : "main")?.focus();
   if (renderedActive !== active?.path) {
     const crumbs = byId("breadcrumbs");
     crumbs.replaceChildren();
@@ -308,8 +329,61 @@ function renderProblems() {
   }));
 }
 
-function closeTab(tab: DocumentTab) {
-  if (!fileActionsBlocked() && !tab.saving && (!tab.dirty || window.confirm(`Discard unsaved changes to ${basename(tab.path)}?`))) docs.close(tab);
+function tabControl(path: string, role: "close" | "main") {
+  return byId("tabs").querySelector<HTMLButtonElement>(`.tab[data-tab-path="${CSS.escape(path)}"] .tab-${role}`);
+}
+
+function closeDocument(tab: DocumentTab, preserveNavigation = false) {
+  const focused = document.activeElement;
+  const restore = focused?.closest<HTMLElement>("#tabs .tab")?.dataset.tabPath === tab.path ||
+    docs.active === tab && byId("editor").contains(focused);
+  docs.close(tab, { focus: false, preserveNavigation });
+  if (restore) {
+    if (docs.active) docs.editor.focus();
+    else btn("empty-quick-open").focus();
+  }
+}
+
+async function askFileDecision(tab: DocumentTab, operation: "close" | "reload") {
+  const dialog = byId<HTMLDialogElement>("file-decision-dialog");
+  const focus = document.activeElement;
+  const focusedTab = focus?.closest<HTMLElement>("#tabs .tab")?.dataset.tabPath;
+  const focusRole = focus?.classList.contains("tab-close") ? "close" : "main";
+  const closing = operation === "close";
+  byId("file-decision-title").textContent = closing ? "Close unsaved file?" : "Reload unsaved file?";
+  byId("file-decision-description").textContent = `You have unsaved changes to ${tab.path}.`;
+  btn("file-decision-discard").textContent = closing ? "Discard" : "Reload and Discard";
+  btn("file-decision-save").hidden = !closing;
+  dialog.returnValue = "cancel";
+  const choice = new Promise<string>(resolve => dialog.addEventListener("close", () => resolve(dialog.returnValue), { once: true }));
+  dialog.showModal();
+  const result = await choice;
+  if (focusedTab && !focus?.isConnected && (result === "cancel" || document.activeElement === document.body)) {
+    tabControl(focusedTab, focusRole)?.focus();
+  }
+  return result;
+}
+
+function captureTab(tab: DocumentTab) {
+  const projectAtStart = project;
+  const version = tab.model.getVersionId();
+  const revision = tab.reloadRevision;
+  return (writes = 0) => project === projectAtStart && docs.tabs.get(tab.path) === tab &&
+    version === tab.model.getVersionId() && revision + writes === tab.reloadRevision;
+}
+
+async function closeTab(tab: DocumentTab) {
+  if (fileActionsBlocked() || tab.saving || tab.reloading !== undefined) return;
+  if (!tab.dirty) { closeDocument(tab); return; }
+  const release = reserveFileActivity();
+  if (!release) return;
+  const live = captureTab(tab);
+  try {
+    const choice = await askFileDecision(tab, "close");
+    if (!live()) return;
+    if (choice === "discard" || (choice === "save" && await saveDocument(tab) && live(1) && !tab.dirty)) closeDocument(tab, true);
+  } catch (error) { showError(new Error(`${tab.path}: ${message(error)}`)); }
+  finally { release(); }
 }
 
 async function saveActive() {
@@ -322,31 +396,49 @@ async function saveActive() {
   } catch (error) { if (project === target && docs.active === tab) showError(error); }
 }
 
-async function saveDocument(tab: DocumentTab, reviewed?: ReadableDisk) {
+async function saveDocument(tab: DocumentTab, options: { reviewed?: ReadableDisk; quitTicket?: number } = {}) {
   const target = project;
-  if (!await docs.save(tab, reviewed) || project !== target) return;
+  if (!await docs.save(tab, options)) return false;
+  if (project !== target) return true;
   if (docs.active === tab) status(`Saved ${basename(tab.path)}`);
   if (/(^|\/)go\.(mod|work)$/.test(tab.path)) {
     await refresh();
     if (project === target) void runTargets.refresh();
   }
   if (project === target && view === "search") scheduleSearch();
+  return true;
+}
+
+async function saveAllDocuments(ticket?: number) {
+  const result = await saveDirtyTabs(() => [...docs.tabs.values()], tab => saveDocument(tab, { quitTicket: ticket }),
+    () => ticket === undefined || ticket > lastExpiredQuitTicket);
+  if (result.committed.length) {
+    feedback.row(`Saved: ${result.committed.join(", ")}`, "success", "check");
+    status(`Saved ${result.committed.length} ${result.committed.length === 1 ? "file" : "files"}`);
+  }
+  if (result.issue) showError(new Error(result.issue));
+  return !result.issue && !docs.dirty;
+}
+
+async function saveAll() {
+  const release = reserveFileActivity();
+  if (!release) return;
+  try {
+    if (!docs.dirty) status("No unsaved files");
+    else await saveAllDocuments();
+  } finally { release(); }
 }
 
 async function compareWithDisk() {
   const tab = docs.active;
   const target = project;
   const inspect = target.inspect;
-  if (!tab || !inspect || tab.saving || tab.reloading !== undefined || fileActionsBlocked() || document.querySelector("dialog[open]")) return;
-  const release = docs.holdDiskReview(tab);
-  const version = tab.model.getVersionId();
-  const revision = tab.reloadRevision;
-  const current = () => project === target && docs.tabs.get(tab.path) === tab &&
-    version === tab.model.getVersionId() && revision === tab.reloadRevision;
+  if (!tab || !inspect || tab.reloading !== undefined) return;
+  const release = reserveFileActivity();
+  if (!release) return;
+  const unhold = docs.holdDiskReview(tab);
+  const current = captureTab(tab);
   const staleEditor = () => new Error("This editor has changed. Compare again to review the current buffer.");
-  reviewingDisk = true;
-  fileMutations++;
-  syncControls();
   try {
     const decision = await showDiskComparison({
       path: tab.path, language: tab.model.getLanguageId(), buffer: bufferText(tab.model),
@@ -354,31 +446,32 @@ async function compareWithDisk() {
     });
     if (!decision) return;
     if (!current()) throw staleEditor();
-    if (decision.action === "save") await saveDocument(tab, decision.observed);
+    if (decision.action === "save") await saveDocument(tab, { reviewed: decision.observed });
     else {
       if (!await docs.reload(tab, decision.observed)) throw staleEditor();
       if (docs.active === tab) status(`Reloaded ${basename(tab.path)}`);
     }
   } catch (error) { if (project === target) showError(error); }
   finally {
+    unhold();
     release();
-    reviewingDisk = false;
-    fileMutations--;
-    syncControls();
     if (document.activeElement === document.body && docs.active === tab) docs.editor.focus();
-    void refreshDisk?.();
   }
 }
 
 async function reloadActive() {
   const tab = docs.active;
-  if (!tab || tab.saving || fileActionsBlocked() || (tab.dirty && !window.confirm(`Discard unsaved changes and reload ${basename(tab.path)}?`))) return;
+  if (!tab || tab.saving || fileActionsBlocked()) return;
   const target = project;
-  fileMutations++;
-  syncControls();
-  try { if (await docs.reload(tab) && project === target && docs.active === tab) status(`Reloaded ${basename(tab.path)}`); }
+  const release = reserveFileActivity();
+  if (!release) return;
+  const live = captureTab(tab);
+  try {
+    if (tab.dirty && await askFileDecision(tab, "reload") !== "discard") return;
+    if (live() && await docs.reload(tab) && project === target && docs.active === tab) status(`Reloaded ${basename(tab.path)}`);
+  }
   catch (error) { if (project === target && docs.active === tab) showError(error); }
-  finally { fileMutations--; syncControls(); }
+  finally { release(); }
 }
 
 async function formatActive() {
@@ -525,16 +618,19 @@ const transitionReady = () => !filesBusy() && !execution.preparing;
 
 async function confirmTransition() {
   const warnings = [
-    docs.dirty && "Unsaved edits will be discarded.",
+    docs.dirty && "This project has unsaved edits.",
     execution.task && "The current Go task will be stopped.",
     execution.debug && "The debug session will be stopped.",
   ].filter(Boolean);
   if (!warnings.length) return true;
   const dialog = byId<HTMLDialogElement>("project-transition-dialog");
   byId("project-transition-description").textContent = warnings.join(" ");
+  btn("project-transition-save").hidden = !docs.dirty;
+  btn("project-transition-continue").textContent = docs.dirty ? "Discard and Continue" : "Continue";
   dialog.returnValue = "cancel";
   dialog.showModal();
-  return new Promise<boolean>(resolve => dialog.addEventListener("close", () => resolve(dialog.returnValue === "continue"), { once: true }));
+  const choice = await new Promise<string>(resolve => dialog.addEventListener("close", () => resolve(dialog.returnValue), { once: true }));
+  return choice === "continue" || (choice === "save" && await saveAllDocuments());
 }
 
 function changeProject(choose: () => Promise<Project | undefined>) {
@@ -858,6 +954,7 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Collapse Folders", icon: "folder", run: () => { opened.clear(); renderExplorer(); }, workspace: true },
     { label: "Search Saved Files", detail: "⇧⌘F", icon: "search", run: () => chooseView("search") },
     { label: "Save File", detail: "⌘S", icon: "save", run: saveActive },
+    { label: "Save All", icon: "save", run: saveAll },
     { label: "Reload File from Disk", icon: "refresh", run: reloadActive },
     ...(project.native && docs.active ? [{ label: "Compare with Disk", icon: "files" as const, run: compareWithDisk }] : []),
     { label: "Format Go File", detail: "⇧⌥F", icon: "format", run: formatActive },
@@ -1071,26 +1168,35 @@ bindSettings();
 if (desktop) {
   const quitDialog = byId<HTMLDialogElement>("quit-dialog");
   const discardQuit = byId<HTMLButtonElement>("quit-discard");
+  const saveQuit = btn("quit-save");
   const cancelQuitDialog = (ticket: number) => {
     if (quitDialogTicket === ticket && quitDialog.open) quitDialog.close("cancel");
   };
-  const confirmQuit = (ticket: number) => new Promise<boolean>(resolve => {
-    quitDialogTicket = ticket;
-    quitDialog.returnValue = "cancel";
-    discardQuit.disabled = true;
-    quitDialog.addEventListener("close", () => {
-      quitDialogTicket = undefined;
-      resolve(!discardQuit.disabled && quitDialog.returnValue === "discard");
-    }, { once: true });
-    quitDialog.showModal();
-    void host.presentExit(ticket).then(presented => {
-      if (!presented) cancelQuitDialog(ticket);
-      else if (quitDialogTicket === ticket && quitDialog.open) discardQuit.disabled = false;
-    }).catch(error => {
-      cancelQuitDialog(ticket);
-      showError(error);
+  const confirmQuit = async (ticket: number) => {
+    const choice = await new Promise<string>(resolve => {
+      quitDialogTicket = ticket;
+      quitDialog.returnValue = "cancel";
+      discardQuit.disabled = true;
+      saveQuit.disabled = true;
+      quitDialog.addEventListener("close", () => {
+        quitDialogTicket = undefined;
+        resolve(discardQuit.disabled ? "cancel" : quitDialog.returnValue);
+      }, { once: true });
+      quitDialog.showModal();
+      void host.presentExit(ticket).then(presented => {
+        if (!presented) cancelQuitDialog(ticket);
+        else if (quitDialogTicket === ticket && quitDialog.open) {
+          discardQuit.disabled = false;
+          saveQuit.disabled = false;
+        }
+      }).catch(error => {
+        cancelQuitDialog(ticket);
+        showError(error);
+      });
     });
-  });
+    if (ticket <= lastExpiredQuitTicket) return false;
+    return choice === "discard" || (choice === "save" && await saveAllDocuments(ticket));
+  };
   void getCurrentWindow().listen<number>("iron-go-exit-expired", event => {
     lastExpiredQuitTicket = Math.max(lastExpiredQuitTicket, event.payload);
     cancelQuitDialog(event.payload);
@@ -1121,6 +1227,8 @@ if (import.meta.env.VITE_IRON_E2E === "1") {
     root: () => project.native?.path,
     gopls: () => gopls,
     quitRequests: () => testQuitRequests,
+    quitExpiry: () => lastExpiredQuitTicket,
+    workspaceId: () => project.native?.id,
   }));
 }
 

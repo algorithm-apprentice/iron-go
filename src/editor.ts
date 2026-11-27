@@ -266,8 +266,8 @@ export class Documents {
     tab.model.dispose();
   }
 
-  close(tab: DocumentTab) {
-    this.location++;
+  close(tab: DocumentTab, { focus = true, preserveNavigation = false } = {}) {
+    if (!preserveNavigation) this.location++;
     const paths = [...this.tabs.keys()];
     const index = paths.indexOf(tab.path);
     const next = this.tabs.get(paths[index + 1] ?? paths[index - 1]);
@@ -277,7 +277,7 @@ export class Documents {
     }
     this.tabs.delete(tab.path);
     this.remove(tab);
-    if (!this.active && next) this.activate(next, true);
+    if (!this.active && next) this.activate(next, focus);
     this.events.changed();
   }
 
@@ -285,7 +285,7 @@ export class Documents {
     return this.folder === folder && this.tabs.get(tab.path) === tab && !tab.model.isDisposed();
   }
 
-  async save(tab: DocumentTab, reviewed?: ReadableDisk) {
+  async save(tab: DocumentTab, options: { reviewed?: ReadableDisk; quitTicket?: number } = {}) {
     const folder = this.folder;
     if (!folder || !this.isLive(folder, tab) || !tab.dirty || tab.saving) return false;
     const text = bufferText(tab.model);
@@ -293,7 +293,7 @@ export class Documents {
     tab.saving = true;
     this.events.changed();
     try {
-      await folder.save(tab.path, reviewed?.text ?? tab.disk, text, reviewed?.version);
+      await folder.save(tab.path, options.reviewed?.text ?? tab.disk, text, options.reviewed?.version, options.quitTicket);
       if (!this.isLive(folder, tab)) return false;
       tab.disk = text;
       tab.clean = text;

@@ -101,6 +101,12 @@ fn install_workspace(
 async fn open_workspace(state: State<'_, Core>) -> CommandResult<Option<workspace::WorkspaceInfo>> {
     #[cfg(feature = "e2e")]
     let fixture = std::env::var_os("IRON_GO_E2E_WORKSPACE").map(PathBuf::from);
+    #[cfg(feature = "e2e")]
+    if fixture.is_some()
+        && std::mem::take(&mut state.0.lock().unwrap().acceptance.cancel_next_picker)
+    {
+        return Ok(None);
+    }
     #[cfg(not(feature = "e2e"))]
     let fixture = None;
     let selection = match fixture {
@@ -206,7 +212,11 @@ fn main() {
             #[cfg(feature = "e2e")]
             quit::test_quit_window_state,
             #[cfg(feature = "e2e")]
+            quit::test_quit_deadline,
+            #[cfg(feature = "e2e")]
             workspace::test_hold_save,
+            #[cfg(feature = "e2e")]
+            acceptance::test_cancel_next_picker,
         ])
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {

@@ -317,6 +317,7 @@ try {
 
   if (group === "external") await externalProjectSmoke();
   else if (group === "quit") await nativeQuitSmoke();
+  else if (group === "quit-save") await nativeSaveQuit();
   else if (group === "crash") await crashWorkerWithLiveChild();
   else await ({ lifecycle: lifecycleSuite, files: fileSuite, go: goSuite, debug: debugSuite })[group]();
 } catch (error) {
@@ -342,6 +343,93 @@ try {
 function requestNativeQuit() {
   assert.ok(quitHelper, "A compiled native Quit helper is required");
   execFileSync(quitHelper, [String(app.child.pid)], { timeout: 10_000 });
+}
+
+async function nativeSaveQuit() {
+  await record("native Save and Quit preserves the project on partial saves and expired tickets", async () => {
+    const source = path.join(fixture, "cmd/orbit/main.go");
+    const readme = path.join(fixture, "README.md");
+    const original = 'package main\nimport ("fmt"; "os"; "time")\nfunc main(){fmt.Printf("save-quit-child %d\\n",os.Getpid());time.Sleep(time.Minute)}\n';
+    await writeFile(source, original);
+    await openProjectControl("#welcome-open");
+    await eventually("the project and run target are ready", () => js("return document.querySelector('#run-target').value === './cmd/orbit' && !document.querySelector('#run').disabled;"));
+    await click("#run");
+    const ready = await eventually("the child runs", output, value => /save-quit-child \d+/.test(value), 30_000);
+    const pid = Number(ready.match(/save-quit-child (\d+)/)[1]);
+    const alive = () => { try { process.kill(pid, 0); return true; } catch (error) { if (error.code === "ESRCH") return false; throw error; } };
+    const mainTab = () => click('#tabs [data-path="cmd/orbit/main.go"]');
+    const startQuit = async () => {
+      requestNativeQuit();
+      await eventually("a live Save and Quit choice opens", () => js("return document.querySelector('#quit-dialog').open && !document.querySelector('#quit-save').disabled;"));
+    };
+    const thawed = () => eventually("the same workbench accepts another decision", () => js("return !document.querySelector('#open-folder').disabled;"));
+    const first = original + "\n// First commit before conflict\n";
+    const diskReadme = await readFile(readme, "utf8");
+    await replace(first);
+    await click('#explorer [data-path="README.md"]');
+    await eventually("README loaded", current, state => state?.path === "README.md");
+    const dirtyReadme = diskReadme + "\nUnsaved second tab.\n";
+    await replace(dirtyReadme);
+    await writeFile(readme, diskReadme + "\nExternal conflict.\n");
+    await startQuit();
+    await click("#quit-save");
+    await eventually("second file reports the save conflict", () => text("#toast"), value => /README\.md.*changed on disk/i.test(value));
+    await thawed();
+    assert.match(await output(), /Saved: cmd\/orbit\/main\.go/);
+    assert.equal(await readFile(source, "utf8"), first);
+    assert.equal((await current()).text, dirtyReadme);
+    assert.equal(alive(), true);
+    await startQuit();
+    await click("#quit-cancel");
+    await thawed();
+
+    await writeFile(readme, diskReadme);
+    const later = first + "// First admitted before expiry\n";
+    await mainTab();
+    await replace(later);
+    await js("window.__batchHoldReady = false; void window.__ironTest.holdSave(true, 'cmd/orbit/main.go').then(() => window.__batchHoldReady = true); return true;");
+    await eventually("the native save barrier is armed", () => js("return window.__batchHoldReady;"));
+    await js("window.__expiryHoldReady = false; void window.__ironTest.quitDeadline(true).then(() => window.__expiryHoldReady = true); return true;");
+    await eventually("the timeout callback is held independently", () => js("return window.__expiryHoldReady;"));
+    try {
+      const expiry = await js("return window.__ironTest.quitExpiry();");
+      await startQuit();
+      await click("#quit-save");
+      await eventually("first Quit save is admitted and held", () => js(`
+        if (!window.__batchAtBarrier) void window.__ironTest.holdSave().then(waiting => window.__batchAtBarrier = waiting);
+        return !!window.__batchAtBarrier;
+      `));
+      const [expired] = await eventually("the pending native ticket reaches its deadline before callback delivery", () => js(`
+        void window.__ironTest.quitDeadline().then(value => window.__pendingQuitDeadline = value);
+        return window.__pendingQuitDeadline ?? null;
+      `), value => value?.[1] === true);
+      assert.equal(await js("return window.__ironTest.quitExpiry();"), expiry);
+      await js(`window.__expiredSaveAdmission = null;
+        void window.__ironTest.attemptQuitSave('README.md', arguments[0], arguments[1], arguments[2]).then(
+          () => window.__expiredSaveAdmission = 'unexpected save', error => window.__expiredSaveAdmission = String(error));
+        return true;`, diskReadme, dirtyReadme, expired);
+      await eventually("the host rejects a queued save with the expired ticket", () => js("return window.__expiredSaveAdmission;"), value => /expired/i.test(value ?? ""));
+      await js("void window.__ironTest.quitDeadline(false); return true;");
+      await eventually("the timeout event still arrives for the held write", () => js("return window.__ironTest.quitExpiry();"), value => value > expiry);
+      assert.equal(await readFile(source, "utf8"), first);
+      assert.equal(alive(), true);
+    } finally { await js("void window.__ironTest.quitDeadline(false); void window.__ironTest.holdSave(false); return true;"); }
+    await thawed();
+    assert.equal(await readFile(source, "utf8"), later);
+    assert.equal(await readFile(readme, "utf8"), diskReadme);
+    assert.equal(alive(), true);
+    const final = later + "// Save and Quit completes both files\n";
+    await replace(final);
+    await startQuit();
+    await terminalCheckpoint("dirty Save and Quit");
+    try { await click("#quit-save"); }
+    catch (error) { if (error.cause?.code !== "UND_ERR_SOCKET") throw error; }
+    const result = await Promise.race([app.exited, delay(6000, { code: null, timedOut: true }, { ref: false })]);
+    assert.equal(result.code, 0, "Save and Quit must exit normally");
+    assert.equal(await readFile(source, "utf8"), final);
+    assert.equal(await readFile(readme, "utf8"), dirtyReadme);
+    await eventually("successful native Quit stops the Go child", () => !alive());
+  });
 }
 
 async function nativeQuitSmoke() {
@@ -733,15 +821,25 @@ async function fileSuite() {
     await eventually("save conflict message", () => text("#toast"), value => value.includes("changed on disk"));
     assert.equal(await readFile(source, "utf8"), external);
     assert.equal((await stat(profileLock, { bigint: true })).ino, lockInode, "save attempts must retain the profile lock inode");
-    // The test controls the confirmation answer, not the reload or its disk I/O.
-    await js("window.__realConfirm = window.confirm; window.confirm = () => false; return true;");
-    try {
-      await chooseCommand("reload file from disk");
-      assert.match((await current()).text, /Unsaved buffer/);
-      await js("window.confirm = () => true; return true;");
-      await chooseCommand("reload file from disk");
-      await eventually("confirmed reload reads the real disk", current, state => state?.text === external && !state.dirty);
-    } finally { await js("window.confirm = window.__realConfirm; delete window.__realConfirm; return true;"); }
+    const prompt = () => eventually("reload confirmation is visible", () => js("return document.querySelector('#file-decision-dialog')?.open;"));
+    const settled = () => eventually("file decision settles", () => js("return !document.querySelector('#save').disabled;"));
+    await chooseCommand("reload file from disk");
+    await prompt();
+    await click("#file-decision-cancel");
+    await settled();
+    const unsaved = (await current()).text;
+    assert.match(unsaved, /Unsaved buffer/);
+    await chooseCommand("reload file from disk");
+    await prompt();
+    const newer = unsaved + "\n// Changed while the question was open\n";
+    await replace(newer);
+    await click("#file-decision-discard");
+    await settled();
+    assert.equal((await current()).text, newer);
+    await chooseCommand("reload file from disk");
+    await prompt();
+    await click("#file-decision-discard");
+    await eventually("confirmed reload reads the real disk", current, state => state?.text === external && !state.dirty);
   });
   await record("native external edits reconcile clean, dirty, and missing tabs", async () => {
     const readme = path.join(fixture, "README.md");
@@ -798,7 +896,134 @@ async function fileSuite() {
       await diskState(readmePath, "");
     } finally { await select(goPath, "cmd/orbit/main.go"); }
   });
+  await record("native dirty tab close targets the intended buffer without stealing focus", async () => {
+    const readme = path.join(fixture, "README.md");
+    const originalReadme = await readFile(readme, "utf8");
+    const goTab = '#tabs [data-path="cmd/orbit/main.go"]';
+    const tab = '.tab[data-tab-path="README.md"]';
+    const close = `${tab} .tab-close`;
+    const open = async () => {
+      await click('#explorer [data-path="README.md"]');
+      await eventually("README is active", current, state => state?.path === "README.md");
+    };
+    const ask = async () => {
+      await js("const button = document.querySelector(arguments[0]); button.focus(); button.click(); return true;", close);
+      await eventually("a real close decision names README", () => js(`
+        const dialog = document.querySelector('#file-decision-dialog');
+        return dialog?.open && dialog.textContent.includes('README.md');
+      `));
+    };
+    const ready = () => eventually("the decision is settled", () => js("return !document.querySelector('#save').disabled;"));
+    const edited = originalReadme + "\nSave this inactive tab.\n";
+    await open();
+    await replace(edited);
+    await js("document.querySelector('#tabs [data-path=\"README.md\"]').focus(); document.querySelector(arguments[0]).click(); return true;", close);
+    await eventually("the tab label opens the close decision", () => js("return document.querySelector('#file-decision-dialog').open;"));
+    await replace(originalReadme);
+    await click("#file-decision-cancel");
+    await ready();
+    assert.equal(await js("return document.activeElement?.dataset.path ?? document.activeElement?.tagName;"), "README.md");
+    await replace(edited);
+    await click(goTab);
+    await ask();
+    const quitRequests = await js("return window.__ironTest.quitRequests();");
+    await js("void window.__ironTest.quitMenu(); return true;");
+    await eventually("Quit reaches the workbench during a pending file decision", () => js("return window.__ironTest.quitRequests();"), count => count === quitRequests + 1);
+    assert.equal(await js("return document.querySelector('#quit-dialog').open;"), false);
+    await click("#file-decision-cancel");
+    await ready();
+    assert.equal(await readFile(readme, "utf8"), originalReadme);
+    await ask();
+    await click("#file-decision-save");
+    await eventually("the inactive saved tab closes", () => js("return !document.querySelector(arguments[0]);", tab));
+    assert.equal((await current()).path, "cmd/orbit/main.go");
+    assert.equal(await readFile(readme, "utf8"), edited);
+
+    await open();
+    await replace(edited + "\nSave with a focus move.\n");
+    await js("window.__closeHoldReady = false; void window.__ironTest.holdSave(true).then(() => window.__closeHoldReady = true); return true;");
+    await eventually("tab save hold enabled", () => js("return window.__closeHoldReady;"));
+    try {
+      await ask();
+      await click("#file-decision-save");
+      await eventually("tab close waits for the save", () => js(`
+        if (!window.__closeAtBarrier) void window.__ironTest.holdSave().then(waiting => window.__closeAtBarrier = waiting);
+        return !!window.__closeAtBarrier;
+      `));
+      await js("document.querySelector('#explorer .explorer-root').focus(); return true;");
+    } finally { await js("void window.__ironTest.holdSave(false); return true;"); }
+    await eventually("active saved tab closes", () => js("return !document.querySelector(arguments[0]);", tab));
+    assert.equal(await js("return document.activeElement?.matches('#explorer .explorer-root');"), true);
+
+    await open();
+    const captured = (await current()).text + "\nFirst submitted edit.\n";
+    const typed = captured + "More text typed during Save and Close.\n";
+    await replace(captured);
+    await js("window.__closeHoldReady = false; window.__closeAtBarrier = false; void window.__ironTest.holdSave(true).then(() => window.__closeHoldReady = true); return true;");
+    await eventually("the second close hold is enabled", () => js("return window.__closeHoldReady;"));
+    try {
+      await ask();
+      await click("#file-decision-save");
+      await eventually("the second close save is admitted", () => js(`
+        if (!window.__closeAtBarrier) void window.__ironTest.holdSave().then(waiting => window.__closeAtBarrier = waiting);
+        return !!window.__closeAtBarrier;
+      `));
+      await js("window.__ironTest.revealLine(arguments[0]); window.__ironTest.tryType(arguments[1]); return true;",
+        captured.split("\n").length, "More text typed during Save and Close.\n");
+      await eventually("the user can type while Save and Close is held", current, state => state?.text === typed);
+    } finally { await js("void window.__ironTest.holdSave(false); return true;"); }
+    await ready();
+    assert.equal((await current()).text, typed);
+    assert.equal((await current()).dirty, true);
+    assert.equal(await readFile(readme, "utf8"), captured);
+
+    await open();
+    const replacement = await readFile(readme, "utf8");
+    const dirty = replacement + "\nDo not discard on failure.\n";
+    await replace(dirty);
+    await writeFile(readme, replacement + "\nExternal conflict.\n");
+    await ask();
+    await click("#file-decision-save");
+    await eventually("the failed close reports the conflict", () => text("#toast"), value => /changed on disk/i.test(value));
+    await ready();
+    assert.equal((await current()).text, dirty);
+    await ask();
+    await click("#file-decision-discard");
+    await eventually("discard closes the affected tab", () => js("return !document.querySelector(arguments[0]);", tab));
+    assert.equal(await readFile(readme, "utf8"), replacement + "\nExternal conflict.\n");
+  });
+  await record("standalone Save All stops admitting files after a previously saved tab becomes dirty", async () => {
+    const paths = ["batch-first.txt", "batch-second.txt", "batch-third.txt"];
+    await Promise.all(paths.map(file => writeFile(path.join(fixture, file), "original\n")));
+    for (const file of paths) {
+      const selector = `#explorer [data-path="${file}"]`;
+      await eventually(`${file} is in the tree`, () => js("return !!document.querySelector(arguments[0]);", selector));
+      await click(selector);
+      await eventually(`${file} is active`, current, state => state?.path === file);
+      await replace(`new ${file}\n`);
+    }
+    await js(`window.__standaloneHoldReady = false;
+      void window.__ironTest.holdSave(true, 'batch-second.txt').then(() => window.__standaloneHoldReady = true); return true;`);
+    await eventually("the second file's save hold is armed", () => js("return window.__standaloneHoldReady;"));
+    try {
+      await chooseCommand("save all");
+      await eventually("the second file is held", () => js(`
+        if (!window.__standaloneAtBarrier) void window.__ironTest.holdSave().then(waiting => window.__standaloneAtBarrier = waiting);
+        return !!window.__standaloneAtBarrier;
+      `));
+      await click('#tabs [data-path="batch-first.txt"]');
+      await eventually("the already saved first file is active", current, state => state?.path === paths[0] && !state.dirty);
+      await replace("newer first edit\n");
+    } finally { await js("void window.__ironTest.holdSave(false); return true;"); }
+    await eventually("Save All reports the interruption", () => text("#toast"), value => /Newer edits in batch-first\.txt/.test(value));
+    assert.match(await output(), /Saved: batch-first\.txt, batch-second\.txt/);
+    assert.equal(await readFile(path.join(fixture, paths[2]), "utf8"), "original\n");
+    await chooseCommand("save all");
+    await eventually("retry saves the third file", () => readFile(path.join(fixture, paths[2]), "utf8"), value => value === `new ${paths[2]}\n`);
+  });
   await record("native disk comparison authorizes only the versions the user reviewed", async () => {
+    await click('#tabs [data-path="cmd/orbit/main.go"]');
+    await eventually("the Go file under comparison is active", current, state => state?.path === "cmd/orbit/main.go");
     const saved = await readFile(source, "utf8");
     const edited = saved + "\n// Reviewed editor version\n";
     const incoming = saved + "\n// Reviewed disk version\n";
@@ -1205,13 +1430,44 @@ async function lifecycleTransitions() {
     assert.equal(state.text, unsaved);
     assert.equal(state.dirty, true);
     assert.equal(alive(), true, "cancelling Close must leave the child running");
+    const activeDisk = path.join(fixture, active.path);
+    const readme = path.join(fixture, "README.md");
+    const readmeBaseline = await readFile(readme, "utf8");
+    const readmeEdit = readmeBaseline + "\nSecond transition save.\n";
+    await click('#explorer [data-path="README.md"]');
+    await eventually("the second transition buffer is active", current, value => value?.path === "README.md");
+    await replace(readmeEdit);
+    await writeFile(readme, readmeBaseline + "\nExternal transition conflict.\n");
+    await js("window.__cancelNextPickerReady = false; void window.__ironTest.cancelNextPicker().then(() => window.__cancelNextPickerReady = true); return true;");
+    await eventually("the fixture picker will cancel", () => js("return window.__cancelNextPickerReady;"));
+    await openProjectControl("#open-folder");
+    await confirm();
+    await click("#project-transition-save");
+    await eventually("Save and Continue reports the second conflict instead of opening the picker", () => text("#toast"), value => /README\.md.*changed on disk/i.test(value));
+    await eventually("the conflict releases the reservation", () => js("return !document.querySelector('#open-folder').disabled;"));
+    assert.equal(await readFile(activeDisk, "utf8"), unsaved);
+    assert.equal((await current()).text, readmeEdit);
+    assert.equal((await current()).dirty, true);
+    assert.equal(alive(), true);
+    await writeFile(readme, readmeBaseline);
+    await openProjectControl("#open-folder");
+    await confirm();
+    await click("#project-transition-save");
+    await eventually("a cancelled picker keeps the saved project", current, value => value?.root === fixture && value.text === readmeEdit && !value.dirty);
+    await eventually("the cancelled picker restores the controls", () => js("return !document.querySelector('#open-folder').disabled;"));
+    assert.equal(await readFile(path.join(fixture, active.path), "utf8"), unsaved);
+    assert.equal(await readFile(readme, "utf8"), readmeEdit);
+    assert.equal(alive(), true);
+    await click(`#tabs [data-path="${active.path}"]`);
+    await eventually("the original Go tab is active again", current, value => value?.path === active.path);
+    await replace(unsaved + "\n// discarded after the cancelled picker\n");
     await chooseCommand("close project");
     await confirm();
     await click("#project-transition-continue");
     await eventually("back at welcome", () => js("return document.querySelector('#project-welcome').hidden === false;"));
     assert.equal((await current()).root ?? null, null);
     assert.equal(await js("return document.querySelector('#run').disabled;"), true);
-    assert.doesNotMatch(await readFile(path.join(fixture, active.path), "utf8"), /unsaved close acceptance/);
+    assert.equal(await readFile(path.join(fixture, active.path), "utf8"), unsaved);
     await eventually("committed project close stops the old Go child", () => !alive());
   });
   await record("a project without an executable offers Test as its primary action", async () => {
