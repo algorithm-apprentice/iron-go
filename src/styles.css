@@ -159,6 +159,8 @@ kbd { font: 11px/1.35 var(--mono); color: var(--muted); padding: 1px 5px; backgr
 .problem-row .problem-location { margin-left: auto; flex: none; color: var(--muted); font: 11px/1.5 var(--mono); }
 .problem-error { color: var(--danger); }
 .problem-warning { color: var(--warning); }
+.go-symbol-results { max-height: 48vh; overflow: auto; margin-top: 8px; }
+.go-reference-heading { color: var(--muted); padding: 8px 10px 3px; }
 .problem-info { color: var(--accent); }
 
 .statusbar { min-width: 0; display: flex; align-items: stretch; font-size: 11px; background: var(--side); border-top: 1px solid var(--edge); }

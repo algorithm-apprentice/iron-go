@@ -125,6 +125,7 @@
               <div class="panel-tabs" role="tablist" aria-label="Feedback view">
                 <button class="panel-tab" id="problems-tab" role="tab" aria-controls="problems-pane" aria-selected="false" data-panel="problems">Problems <span id="problem-count" class="count">0</span></button>
                 <button class="panel-tab active" id="output-tab" role="tab" aria-controls="output-pane" aria-selected="true" data-panel="output">Output</button>
+                <button class="panel-tab" id="references-tab" role="tab" aria-controls="references-pane" aria-selected="false" data-panel="references" hidden>References</button>
               </div>
               <div class="panel-actions inline-actions">
                 <button id="panel-stop" class="icon-button" title="Stop Task" aria-label="Stop Task" data-icon="stop" hidden></button>
@@ -135,6 +136,10 @@
               <div id="output-log" class="output-log"></div>
             </div>
             <div id="problems-pane" class="problems-pane" role="tabpanel" aria-labelledby="problems-tab" hidden></div>
+            <div id="references-pane" class="problems-pane" role="tabpanel" aria-labelledby="references-tab" hidden>
+              <button id="close-references" type="button" class="button quiet">Close References</button>
+              <div id="references-results"></div>
+            </div>
           </section>
         </section>
       </main>
@@ -192,6 +197,11 @@
       <label class="settings-row"><div><strong>Minimap</strong><small>Show a compact overview of the file.</small></div><input id="minimap-setting" type="checkbox" /></label>
       <label class="settings-row"><div><strong>Word wrap</strong><small>Wrap long lines to the editor width.</small></div><input id="wrap-setting" type="checkbox" /></label>
       <div class="settings-tools"><h3>Go Toolchain</h3><div id="settings-tools-info" class="view-note"></div><button id="probe-tools" class="button quiet"><span data-icon="refresh"></span>Check tools</button></div>
+    </dialog>
+    <dialog id="go-symbol-dialog" class="form-dialog" aria-labelledby="go-symbol-title">
+      <div class="dialog-header"><h2 id="go-symbol-title">Go to Symbol in File</h2><button type="button" class="icon-button" data-dialog-close="go-symbol-dialog" aria-label="Close symbol search" data-icon="close"></button></div>
+      <input id="go-symbol-search" class="text-field" aria-label="Filter Go symbols" placeholder="Filter Go symbols" autocomplete="off" autofocus />
+      <div id="go-symbol-results" class="go-symbol-results"></div>
     </dialog>
     <dialog id="file-decision-dialog" class="form-dialog" aria-labelledby="file-decision-title" aria-describedby="file-decision-description">
       <form method="dialog">

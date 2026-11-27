@@ -23,3 +23,4 @@ record detailed behavior, alternatives, implementation order, and acceptance.
 | [0016](0016-reviewed-disk-conflicts.md) | Bind a disk conflict decision to the version shown to the user | Accepted design |
 | [0017](0017-save-before-transition.md) | Guard sequential saves before project cutover and native Quit | Accepted design |
 | [0018](0018-exclusive-new-path-save.md) | Publish new-path saves with exclusive native replacement | Accepted design |
+| [0019](0019-go-navigation-snapshots.md) | Bind Go navigation results to the originating editor snapshot | Accepted design |

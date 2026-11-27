@@ -1,11 +1,12 @@
 import "./styles.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { CancellationTokenSource } from "vscode-jsonrpc/lib/browser/main.js";
 import { byId, element, Forms, message, Palette } from "./dialogs";
 import { showDiskComparison } from "./disk-compare";
-import { bufferText, defaultEditorFontSize, Documents, editorTypography, monaco, type DocumentTab } from "./editor";
+import { bufferText, defaultEditorFontSize, Documents, editorTypography, exactModelRange, monaco, type DocumentTab } from "./editor";
 import { Feedback } from "./feedback";
 import { fileIcon, icon, prepareIcons, type Icon } from "./icons";
-import { GoLanguage, debugTestCommand, runTestCommand, type LanguageState } from "./lsp";
+import { GoLanguage, debugTestCommand, runTestCommand, type GoLocation, type GoSymbol, type LanguageState } from "./lsp";
 import { Breakpoints, DebugSession } from "./debugger";
 import { packageForFile, RunTargets } from "./run-targets";
 import { bindColorTheme, chooseColorTheme } from "./theme";
@@ -58,6 +59,7 @@ let toastTimer: number | undefined;
 let renderedActive: string | undefined;
 const snapshots = new ProjectSnapshots();
 let refreshDisk: ((tree?: boolean) => Promise<void>) | undefined;
+let navigation: { current(): boolean; cancel(): void } | undefined;
 
 const diskMessage = {
   changed: "File changed on disk",
@@ -67,13 +69,14 @@ const diskMessage = {
 
 const docs = new Documents(byId("editor"), {
   changed: renderDocuments,
-  opened: tab => { breakpoints.open(tab); lsp?.opened(tab); void refreshDisk?.(); },
+  opened: tab => { breakpoints.open(tab); lsp?.opened(tab); invalidateNavigation(); void refreshDisk?.(); },
   edited: tab => {
     lsp?.edited(tab);
+    invalidateNavigation();
     if (!tab.dirty && tab.diskChange === "changed") void refreshDisk?.();
   },
-  closed: tab => { breakpoints.close(tab); lsp?.closed(tab); queueMicrotask(renderProblems); },
-  saved: tab => lsp?.saved(tab),
+  closed: tab => { breakpoints.close(tab); lsp?.closed(tab); invalidateNavigation(); queueMicrotask(renderProblems); },
+  saved: tab => { lsp?.saved(tab); invalidateNavigation(); },
   fileSettled: () => { void refreshDisk?.(); },
 });
 const execution = new ExecutionLane<NativeFolder, DebugSession>(syncControls);
@@ -202,6 +205,7 @@ async function openFile(path: string, target?: monaco.IRange) {
 }
 
 function renderDocuments() {
+  invalidateNavigation();
   const tabs = byId("tabs");
   const active = docs.active;
   const scroll = tabs.scrollLeft;
@@ -276,6 +280,147 @@ function updateCursor() {
   byId("cursor").textContent = position ? `Ln ${position.lineNumber}, Col ${position.column}` : "";
   byId("indent").textContent = active ? (active.model.getOptions().insertSpaces ? "Spaces: 4" : "Tab Size: 4") : "";
   byId("language").textContent = active ? active.path.endsWith(".go") ? "Go" : active.path.endsWith(".md") ? "Markdown" : /(^|\/)go\.(mod|work|sum)$/.test(active.path) ? "Go Module" : "Plain Text" : "";
+}
+
+function invalidateNavigation() {
+  if (navigation && !navigation.current()) navigation.cancel();
+}
+
+function goToLine() {
+  const tab = docs.active;
+  if (!tab || projectWorkflow.busy) return;
+  const live = captureTab(tab);
+  forms.show({
+    title: "Go to Line", description: `Go to a line in ${tab.path}.`, submit: "Go to Line",
+    fields: [{ name: "line", label: "Line number" }],
+    async run({ line }) {
+      if (!live() || docs.active !== tab) throw new Error("This editor has changed. Open Go to Line again.");
+      const last = tab.model.getLineCount();
+      const value = Number(line);
+      if (!/^[0-9]+$/.test(line) || value < 1 || value > last) throw new Error(`Enter a whole line number from 1 through ${last}.`);
+      docs.editor.setPosition({ lineNumber: value, column: 1 });
+      docs.editor.revealLineInCenterIfOutsideViewport(value);
+      byId("form-dialog").addEventListener("close", () => { if (live() && docs.active === tab) docs.editor.focus(); }, { once: true });
+    },
+  });
+}
+
+async function goNavigation(kind: "symbols" | "references") {
+  const tab = docs.active;
+  const service = lsp;
+  const position = docs.editor.getPosition();
+  if (!tab || !service || gopls !== "ready" || tab.model.getLanguageId() !== "go" || !position) {
+    toast("Open a Go file with gopls running to use this command.");
+    return;
+  }
+  if (projectWorkflow.busy) return;
+  navigation?.cancel();
+  const inFile = kind === "symbols";
+  const editRevision = docs.editRevision;
+  const live = captureTab(tab);
+  const tracked = new Map([...docs.tabs].filter(([, entry]) => entry.model.getLanguageId() === "go"));
+  const valid = (selected?: string) => {
+    if (!live() || lsp !== service || gopls !== "ready" || docs.active !== tab || projectWorkflow.busy) return false;
+    if (inFile) return true;
+    const caret = docs.editor.getPosition();
+    if (docs.editRevision !== editRevision || !caret || !position.equals(caret)) return false;
+    if ([...tracked].some(([path, entry]) => docs.tabs.get(path) !== entry)) return false;
+    return [...docs.tabs].every(([path, entry]) => entry.model.getLanguageId() !== "go" || tracked.has(path) || path === selected);
+  };
+
+  const cancel = new CancellationTokenSource();
+  const dialog = byId<HTMLDialogElement>("go-symbol-dialog");
+  const filter = input("go-symbol-search");
+  const list = byId(inFile ? "go-symbol-results" : "references-results");
+  const note = (text: string) => list.replaceChildren(element("p", "view-note tree-note", text));
+  let symbols: GoSymbol[] = [];
+  let selected: GoLocation | undefined;
+  const finish = () => {
+    if (navigation !== job) return;
+    navigation = undefined;
+    dialog.removeEventListener("close", dismissed);
+    filter.removeEventListener("input", renderSymbols);
+    cancel.cancel();
+    cancel.dispose();
+  };
+  const dismissed = () => finish();
+  const job = {
+    current: () => valid(selected?.path),
+    cancel() {
+      finish();
+      if (inFile && dialog.open) dialog.close();
+      if (!inFile) note("References are out of date. Run Find References again.");
+    },
+  };
+  const select = (location: GoLocation) => {
+    if (navigation !== job || selected || !valid()) return;
+    selected = location;
+    if (inFile && dialog.open) {
+      dialog.removeEventListener("close", dismissed);
+      dialog.close();
+    }
+    if (!inFile) note("Opening reference…");
+    void docs.open(location.path, {
+      focus: true, target: location.range, userNavigation: true,
+      current: () => navigation === job && valid(location.path),
+      validate(result) {
+        if (!exactModelRange(result.model, location.range)) throw new Error("This location no longer matches the file.");
+      },
+      beforeActivate() {
+        finish();
+        if (!inFile) note("Run Find References to refresh the results.");
+      },
+    })
+      .then(result => {
+        if (navigation === job) job.cancel();
+        if (result && docs.active === result) { revealParents(result.path); renderExplorer(); }
+      }).catch(error => { if (navigation === job) { job.cancel(); showError(error); } });
+  };
+  const row = (location: GoLocation, label: string, detail: string) => {
+    const button = element("button", "problem-row");
+    button.append(element("span", "", ""), element("span", "", label), element("span", "problem-location", detail));
+    button.addEventListener("click", () => select(location));
+    return button;
+  };
+  const renderSymbols = () => {
+    const query = filter.value.trim().toLowerCase();
+    const matches = symbols.filter(symbol => `${symbol.name} ${symbol.detail}`.toLowerCase().includes(query));
+    if (!matches.length) { note("No matching Go symbols."); return; }
+    list.replaceChildren(...matches.map(symbol => row(symbol, symbol.name, `${symbol.detail} · Line ${symbol.range.startLineNumber}`)));
+  };
+  navigation = job;
+  if (inFile) {
+    filter.value = "";
+    dialog.addEventListener("close", dismissed, { once: true });
+    dialog.showModal();
+  } else {
+    btn("references-tab").hidden = false;
+    feedback.show("references");
+    btn("close-references").focus();
+  }
+  note(inFile ? "Finding Go symbols…" : "Finding Go references…");
+  try {
+    const results = inFile ? await service.documentSymbols(tab.model, cancel.token) : await service.references(tab.model, position, cancel.token);
+    if (navigation !== job) return;
+    if (!valid()) { job.cancel(); return; }
+    if (inFile) {
+      symbols = results as GoSymbol[];
+      filter.addEventListener("input", renderSymbols);
+      renderSymbols();
+    } else if (results.length) {
+      const groups: HTMLElement[] = [];
+      let previous: string | undefined;
+      for (const reference of results) {
+        if (reference.path !== previous) groups.push(element("h3", "go-reference-heading", reference.path));
+        previous = reference.path;
+        const { startLineNumber, startColumn } = reference.range;
+        groups.push(row(reference, `${basename(reference.path)}:${startLineNumber}:${startColumn}`, "Reference"));
+      }
+      list.replaceChildren(...groups);
+    } else note("No workspace references found.");
+  } catch (error) {
+    if (navigation === job) note(message(error));
+  }
 }
 
 function syncControls() {
@@ -589,6 +734,8 @@ function watchProject(target: Project) {
 }
 
 async function install(target: Project) {
+  navigation?.cancel();
+  btn("references-tab").hidden = true;
   execution.retire()?.retire();
   clearExecutionLine();
   breakpoints.reset();
@@ -978,6 +1125,9 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Refresh Project", icon: "refresh", run: refreshProject, workspace: true },
     { label: "Collapse Folders", icon: "folder", run: () => { opened.clear(); renderExplorer(); }, workspace: true },
     { label: "Search Saved Files", detail: "⇧⌘F", icon: "search", run: () => chooseView("search") },
+    { label: "Go to Line…", icon: "search", run: goToLine },
+    { label: "Go to Symbol in File…", icon: "search", run: () => { void goNavigation("symbols"); } },
+    { label: "Find References", icon: "search", run: () => { void goNavigation("references"); } },
     { label: "Save File", detail: "⌘S", icon: "save", run: saveActive },
     { label: "Save All", icon: "save", run: saveAll },
     { label: "Reload File from Disk", icon: "refresh", run: reloadActive },
@@ -1112,6 +1262,12 @@ byId("format").addEventListener("click", formatActive);
 byId("save").addEventListener("click", saveActive);
 byId("compare-disk").addEventListener("click", compareWithDisk);
 byId("save-new-path").addEventListener("click", saveToNewPath);
+byId("close-references").addEventListener("click", () => {
+  navigation?.cancel();
+  btn("references-tab").hidden = true;
+  feedback.show("output");
+  btn("output-tab").focus();
+});
 const runOrStop = () => execution.task ? stopTask() : runTask(runTargets.primaryAction());
 byId("run").addEventListener("click", runOrStop);
 byId("panel-stop").addEventListener("click", stopTask);
@@ -1188,7 +1344,7 @@ document.addEventListener("keydown", event => {
   if (apply) { event.preventDefault(); event.stopPropagation(); void apply(); }
 }, true);
 
-docs.editor.onDidChangeCursorPosition(updateCursor);
+docs.editor.onDidChangeCursorPosition(() => { updateCursor(); invalidateNavigation(); });
 monaco.editor.onDidChangeMarkers(renderProblems);
 bindLayout();
 bindSettings();

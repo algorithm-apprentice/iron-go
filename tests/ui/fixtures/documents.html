@@ -3,12 +3,14 @@
 <title>Document operation fixture</title>
 <div id="editor" style="width: 800px; height: 600px"></div>
 <script type="module">
-  import { Documents, bufferText, monaco } from "../../../src/editor.ts";
+  import { Documents, bufferText, exactModelRange, monaco } from "../../../src/editor.ts";
   import { EditorLayoutInfoComputer } from "monaco-editor/editor/common/config/editorOptions.js";
   import { DebugSession } from "../../../src/debugger.ts";
   import { ExecutionLane } from "../../../src/execution.ts";
   import { createCursorTestWorkflow } from "../../../src/cursor-test-workflow.ts";
   import { showDiskComparison } from "../../../src/disk-compare.ts";
+  import { GoLanguage } from "../../../src/lsp.ts";
+  import { AbstractMessageReader, AbstractMessageWriter, CancellationTokenSource, createMessageConnection } from "vscode-jsonrpc/lib/browser/main.js";
   import workbenchMarkup from "../../../index.html?raw";
 
   const shell = new DOMParser().parseFromString(workbenchMarkup, "text/html");
@@ -30,5 +32,6 @@
       pixelRatio: devicePixelRatio, viewLineCount: count, isDominatedByLongLines: false, glyphMarginDecorationLaneCount: 1,
     });
   };
-  window.workflowFixture = { DebugSession, ExecutionLane, createCursorTestWorkflow, monaco };
+  window.workflowFixture = { DebugSession, ExecutionLane, createCursorTestWorkflow, monaco, GoLanguage, exactModelRange,
+    AbstractMessageReader, AbstractMessageWriter, CancellationTokenSource, createMessageConnection };
 </script>

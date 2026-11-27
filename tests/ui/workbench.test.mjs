@@ -472,7 +472,7 @@ test("an imported test fixture uses the real workbench and quick open", async ()
     assert.equal(await page.locator(".editor-actions #run").count(), 1, "Run belongs to the editor group");
     assert.equal(await page.getByRole("combobox", { name: "Run target" }).isDisabled(), true, "The preview does not discover local targets");
     assert.equal(await page.locator(".titlebar img").count(), 0);
-    assert.deepEqual(await page.locator(".panel-tabs [data-panel]").evaluateAll(tabs => tabs.map(tab => tab.dataset.panel)), ["problems", "output"]);
+    assert.deepEqual(await page.locator(".panel-tabs [data-panel]:visible").evaluateAll(tabs => tabs.map(tab => tab.dataset.panel)), ["problems", "output"]);
     const sidebar = page.getByRole("button", { name: "Toggle Side Bar", exact: true });
     await sidebar.click();
     await page.locator("#sidebar").waitFor({ state: "hidden" });
@@ -696,6 +696,86 @@ test("creates a nested file, rejects duplicates, and does not fake native tasks"
     await page.getByRole("button", { name: "Cancel", exact: true }).click();
     await page.locator("#run").click();
     assert.match(await page.locator("#toast").innerText(), /desktop app/i);
+  });
+});
+
+test("Go to Line works without gopls and rejects invalid line numbers", async () => {
+  await scenario("go-to-line", async page => {
+    await page.locator('#explorer [data-path="go.mod"]').click();
+    await page.getByRole("tab", { name: "go.mod", selected: true }).waitFor();
+    await page.locator("#quick-open").click();
+    const palette = page.getByRole("textbox", { name: "Quick Open search" });
+    await palette.fill(">go to line");
+    await page.getByRole("button", { name: "Go to Line…", exact: true }).click({ timeout: 3000 });
+    const input = page.getByRole("textbox", { name: "Line number" });
+    for (const invalid of ["0", "1.5", "1e0", "999"]) {
+      await input.fill(invalid);
+      await page.getByRole("button", { name: "Go to Line", exact: true }).click();
+      await page.getByRole("alert").filter({ hasText: /whole line/ }).waitFor();
+    }
+    await input.fill("3");
+    await page.getByRole("button", { name: "Go to Line", exact: true }).click();
+    await page.waitForFunction(() => document.querySelector("#cursor").textContent === "Ln 3, Col 1");
+  });
+});
+
+test("Go navigation rejects malformed workspace locations and cancels an outstanding RPC", async () => {
+  await documentScenario("go-navigation-cancellation", async page => {
+    const checks = await page.evaluate(async () => {
+      const { GoLanguage, AbstractMessageReader, AbstractMessageWriter, CancellationTokenSource, createMessageConnection, monaco, exactModelRange } = window.workflowFixture;
+      const docs = window.documents;
+      const native = { id: 1, path: "/navigation-fixture", name: "Fixture" };
+      docs.reset({ native, read: async () => "package main\n// 🚀 token\n" });
+      const tab = await docs.open("source.go");
+      const service = new GoLanguage(native, docs, () => {});
+      const range = { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } };
+      try {
+        await docs.open("closed.go", { validate(candidate) {
+          if (!exactModelRange(candidate.model, new monaco.Range(99, 1, 99, 2))) throw new Error("invalid target");
+        } });
+        throw new Error("invalid target was accepted");
+      } catch (error) {
+        if (error.message !== "invalid target" || docs.tabs.has("closed.go")) throw error;
+        if (monaco.editor.getModel(monaco.Uri.file(`${native.path}/closed.go`))) throw new Error("invalid target leaked a model");
+      }
+      const uris = ["file:///navigation-fixture/source.go", "file:///outside.go", "file:///navigation-fixture/../outside.go",
+        "file:///navigation-fixture/%2e%2e/outside.go", "file:///navigation-fixture/source.go?query", "file:///navigation-fixture/source.go#fragment",
+        "file://host/navigation-fixture/source.go", "https://example.com/navigation-fixture/source.go", "not a URI",
+        "file:navigation-fixture/source.go", "file:///navigation-fixture/source.go?", "file:///navigation-fixture/source.go#",
+        "file:///navigation-fixture/%ZZ.go", "file:///navigation-fixture%2Fsource.go",
+        "file:///navigation-fixture/unescaped file.go", "file:///navigation-fixture/unescaped\tfile.go"];
+      const results = uris.map(uri => service.workspaceLocation(uri, range)?.path ?? null);
+      for (const invalid of [
+        { start: { line: 1, character: 4 }, end: { line: 1, character: 6 } },
+        { start: { line: 80, character: 0 }, end: { line: 80, character: 1 } },
+        { start: { line: 1, character: 90 }, end: { line: 1, character: 90 } },
+      ]) results.push(service.workspaceLocation(uris[0], invalid)?.path ?? null);
+      results.push(service.workspaceLocation("file:///navigation-fixture/escaped%20file.go", range)?.path ?? null);
+      const sent = [];
+      class Reader extends AbstractMessageReader { listen() { return { dispose() {} }; } }
+      class Writer extends AbstractMessageWriter {
+        async write(message) { sent.push(message); }
+        end() {}
+      }
+      const rpc = createMessageConnection(new Reader(), new Writer());
+      rpc.listen();
+      service.connection = rpc;
+      service.ready = true;
+      service.opened(tab);
+      const source = new CancellationTokenSource();
+      window.navigationRpc = { service, sent, source };
+      void service.references(tab.model, new monaco.Position(1, 1), source.token);
+      return results;
+    });
+    assert.deepEqual(checks, ["source.go", ...Array(18).fill(null), "escaped file.go"]);
+    await page.waitForFunction(() => window.navigationRpc.sent.some(message => message.method === "textDocument/references"));
+    await page.evaluate(() => window.navigationRpc.source.cancel());
+    await page.waitForFunction(() => {
+      const { sent } = window.navigationRpc;
+      return sent.some(message => message.method === "$/cancelRequest" &&
+        message.params.id === sent.find(request => request.method === "textDocument/references").id);
+    });
+    await page.evaluate(() => window.navigationRpc.service.dispose());
   });
 });
 

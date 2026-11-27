@@ -18,6 +18,15 @@ export function installAcceptance(docs: Documents, workbench: {
 }) {
   let gutterHit: { line: number | null; type: string } | undefined;
   let selectionSource: string | undefined;
+  let navigationRequest: unknown;
+  let deferredNavigation: (() => void) | undefined;
+  let navigationCancelled = false;
+  const releaseNavigation = () => {
+    delete window.__ironNavigationProbe;
+    const deferred = deferredNavigation;
+    deferredNavigation = undefined;
+    deferred?.();
+  };
   docs.editor.onMouseDown(event => {
     gutterHit = { line: event.target.position?.lineNumber ?? null, type: monaco.editor.MouseTargetType[event.target.type] };
   });
@@ -61,6 +70,27 @@ export function installAcceptance(docs: Documents, workbench: {
       docs.editor.focus();
       docs.editor.trigger("iron-test", "editor.action.triggerSuggest", {});
     },
+    position: (lineNumber: number, column: number) => docs.editor.setPosition({ lineNumber, column }),
+    holdGoReferences() {
+      releaseNavigation();
+      navigationRequest = undefined;
+      navigationCancelled = false;
+      window.__ironNavigationProbe = {
+        sent(value) {
+          const message = value as { method?: string; id?: unknown; params?: { id?: unknown } };
+          if (navigationRequest === undefined && message.method === "textDocument/references") navigationRequest = message.id;
+          if (message.method === "$/cancelRequest" && navigationRequest !== undefined && message.params?.id === navigationRequest) navigationCancelled = true;
+        },
+        holdReply(value, deliver) {
+          const message = value as { id?: unknown; method?: string };
+          if (navigationRequest === undefined || message?.id !== navigationRequest || message.method !== undefined) return false;
+          deferredNavigation = deliver;
+          return true;
+        },
+      };
+    },
+    goReferenceProbe: () => ({ deferred: !!deferredNavigation, cancelled: navigationCancelled }),
+    releaseGoReferences: releaseNavigation,
     action: (id: string, lineNumber: number, column: number) => {
       docs.editor.setPosition({ lineNumber, column });
       docs.editor.focus();

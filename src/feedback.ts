@@ -2,7 +2,7 @@ import { byId, element } from "./dialogs";
 import { icon, type Icon } from "./icons";
 import type { TaskEvent } from "./workspace";
 
-type Pane = "output" | "problems";
+type Pane = "output" | "problems" | "references";
 type Tone = "quiet" | "success" | "error" | "command";
 
 export class Feedback {

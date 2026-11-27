@@ -64,6 +64,18 @@ export interface DocumentEvents {
 
 export const bufferText = (model: monaco.editor.ITextModel) => model.getValue(undefined, true);
 
+export function exactModelRange(model: monaco.editor.ITextModel, range: monaco.IRange) {
+  const endpoint = (line: number, column: number) => {
+    if (!Number.isInteger(line) || !Number.isInteger(column) || line < 1 || line > model.getLineCount() ||
+        column < 1 || column > model.getLineMaxColumn(line)) return false;
+    const text = model.getLineContent(line);
+    const before = text.charCodeAt(column - 2);
+    const after = text.charCodeAt(column - 1);
+    return !(before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff);
+  };
+  return endpoint(range.startLineNumber, range.startColumn) && endpoint(range.endLineNumber, range.endColumn);
+}
+
 export function replaceBuffer(model: monaco.editor.ITextModel, text: string) {
   if (model.getValue() === text) return;
   model.pushStackElement();
@@ -188,13 +200,14 @@ export class Documents {
     return uri.path.startsWith(prefix) ? uri.path.slice(prefix.length) || undefined : undefined;
   }
 
-  async open(path: string, options: { focus?: boolean; activate?: boolean; target?: Target; current?: () => boolean } = {}) {
+  async open(path: string, options: { focus?: boolean; activate?: boolean; target?: Target; current?: () => boolean;
+    userNavigation?: boolean; validate?: (tab: DocumentTab) => void; beforeActivate?: () => void } = {}) {
     const folder = this.folder;
     const { focus = false, activate = true, target, current = () => true } = options;
     if (!folder || !current() || this.destinationReserved(path)) return;
     // A speculative Debug lookup must never invalidate a user's pending
     // navigation, even when the two callers share the same disk read.
-    const location = activate && !options.current ? ++this.location : this.location;
+    const location = activate && (!options.current || options.userNavigation) ? ++this.location : this.location;
     let tab = this.tabs.get(path);
     if (!tab) {
       let pending = this.opening.get(path);
@@ -209,6 +222,12 @@ export class Documents {
         tab = this.tabs.get(path);
         if (!tab) {
           const created = this.makeTab(folder, path, disk, disk);
+          try { options.validate?.(created); }
+          catch (error) {
+            created.subscription.dispose();
+            created.model.dispose();
+            throw error;
+          }
           this.tabs.set(path, created);
           this.events.opened(created);
           this.events.changed();
@@ -217,7 +236,11 @@ export class Documents {
       } catch (error) { if (folder === this.folder && current()) throw error; }
     }
     if (!tab || folder !== this.folder || !current()) return;
-    if (activate && location === this.location) this.activate(tab, focus, target);
+    if (activate && location === this.location) {
+      options.validate?.(tab);
+      options.beforeActivate?.();
+      this.activate(tab, focus, target);
+    }
     return tab;
   }
 

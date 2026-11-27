@@ -1294,6 +1294,7 @@ async function goSuite() {
 
   if (!capabilities.gopls) {
     for (const name of ["gopls publishes/clears real errors and completes a Go symbol", "gopls hover and definition work through Monaco",
+      "gopls symbol and reference navigation uses unsaved UTF-16 locations",
       "runs exactly one Go test from its editor action", "whole-line selection highlights the selected number, not its endpoint"]) {
       console.log(`  SKIP ${name} (gopls not installed)`);
       report.cases.push({ name, result: "skip", reason: "gopls not installed" });
@@ -1322,6 +1323,83 @@ async function goSuite() {
       }
       await setNativeTheme("dark");
       await replace(clean);
+    });
+    await record("gopls symbol and reference navigation uses unsaved UTF-16 locations", async () => {
+      const relative = "cmd/orbit/navigation.go";
+      const file = path.join(fixture, relative);
+      const disk = "package main\n\nvar onDisk = 1\n";
+      const line = 'var _ = "🚀"; var _ = status.NewReport';
+      const editorText = `package main\n\nimport "example.com/orbit/internal/status"\n\nvar inEditor = 1\n${line}\n`;
+      await writeFile(file, disk);
+      const main = (await current()).text.split("\n");
+      const origin = main.findIndex(text => text.includes("status.NewReport"));
+      const column = main[origin].indexOf("NewReport") + 1;
+      const invokeReferences = () => js(`
+        document.querySelector('#tabs [data-path="cmd/orbit/main.go"]').click();
+        window.__ironTest.position(arguments[0], arguments[1]);
+        document.querySelector('#quick-open').click();
+        const query = document.querySelector('#palette-text');
+        query.value = '>find references';
+        query.dispatchEvent(new Event('input', { bubbles: true }));
+        document.querySelector('#palette-options button').click();
+        return true;
+      `, origin + 1, column);
+      await eventually("navigation fixture becomes visible", () => js(`
+        return !!document.querySelector('#explorer [data-path="cmd/orbit/navigation.go"]');
+      `));
+      await click(`#explorer [data-path="${relative}"]`);
+      await eventually("the second Go document is active", current, state => state?.path === relative);
+      // Edit and invoke in one task so the other model's sync debounce cannot fire first.
+      await js(`window.__ironTest.replace(arguments[0]);
+        document.querySelector('#tabs [data-path="cmd/orbit/main.go"]').click();
+        window.__ironTest.position(arguments[1], arguments[2]);
+        document.querySelector('#quick-open').click();
+        const query = document.querySelector('#palette-text');
+        query.value = '>find references'; query.dispatchEvent(new Event('input', { bubbles: true }));
+        document.querySelector('#palette-options button').click(); return true;`, editorText, origin + 1, column);
+      const label = `navigation.go:6:${line.indexOf("NewReport") + 1}`;
+      const waitReferences = () => eventually("gopls groups unsaved use and declaration", () => text("#references-results"),
+        value => value.includes(label) && value.includes("internal/status/report.go"));
+      await waitReferences();
+      assert.equal(await js("return document.activeElement?.id;"), "close-references");
+      await js(`const results = document.querySelector('#references-results');
+        const group = [...results.querySelectorAll('h3')].find(item => item.textContent === 'internal/status/report.go');
+        group.nextElementSibling.click(); return true;`);
+      await eventually("a reference opens the previously closed declaration", current, state => state?.path === "internal/status/report.go");
+      await invokeReferences();
+      await waitReferences();
+      const selectUnsaved = () => js(`const result = [...document.querySelectorAll('#references-results button')]
+        .find(item => item.textContent.startsWith(arguments[0])); result.click(); return true;`, label);
+      await selectUnsaved();
+      await eventually("unsaved reference starts at its UTF-16 column", () => js("return window.__ironTest.gutterTrace().selection?.start;"),
+        value => value?.lineNumber === 6 && value.column === line.indexOf("NewReport") + 1);
+      assert.equal((await current()).text, editorText);
+      await chooseCommand("go to symbol in file");
+      await eventually("unsaved symbol is searchable", () => text("#go-symbol-results"), value => value.includes("inEditor") && !value.includes("onDisk"));
+      await set("#go-symbol-search", "ineditor");
+      await click("#go-symbol-results button");
+      await eventually("selecting the filtered symbol navigates to its line", () => text("#cursor"), value => value.startsWith("Ln 5,"));
+      await js("window.__ironTest.holdGoReferences(); return true;");
+      try {
+        await invokeReferences();
+        await eventually("the live reference reply is held", () => js("return window.__ironTest.goReferenceProbe().deferred;"));
+        await replace(main.join("\n") + "\n// invalidate outstanding navigation\n");
+        await eventually("editing cancels the outstanding request on the workbench transport", () => js("return window.__ironTest.goReferenceProbe().cancelled;"));
+        assert.match(await text("#references-results"), /out of date/i);
+      } finally { await js("window.__ironTest.releaseGoReferences(); return true;"); }
+      await replace(main.join("\n"));
+      await invokeReferences();
+      await waitReferences();
+      await js(`window.__oldReference = [...document.querySelectorAll('#references-results button')]
+        .find(item => item.textContent.startsWith(arguments[0])); return true;`, label);
+      await click('.tab[data-tab-path="cmd/orbit/navigation.go"] .tab-close');
+      await eventually("dirty Go target has a discard decision", () => js("return document.querySelector('#file-decision-dialog').open;"));
+      await click("#file-decision-discard");
+      await eventually("closing a model invalidates the displayed references", () => text("#references-results"), value => value.includes("out of date"));
+      await js("window.__oldReference.click(); return true;");
+      assert.equal(await js("return !!document.querySelector('#tabs [data-path=\"cmd/orbit/navigation.go\"]');"), false);
+      assert.equal(await readFile(file, "utf8"), disk);
+      await click("#close-references");
     });
     await record("gopls hover and definition work through Monaco", async () => {
       const source = (await current()).text.split("\n");

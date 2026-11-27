@@ -1,14 +1,22 @@
 import { AbstractMessageReader, AbstractMessageWriter, CancellationToken, createMessageConnection, type DataCallback, type Message, type MessageConnection } from "vscode-jsonrpc/lib/browser/main.js";
 import { SymbolKind, type CompletionItem, type CompletionList, type Diagnostic, type DocumentSymbol, type Hover, type Location, type LocationLink, type MarkedString, type MarkupContent, type Range, type SymbolInformation } from "vscode-languageserver-types";
 import { message } from "./dialogs";
-import { monaco, type DocumentTab, type Documents } from "./editor";
+import { exactModelRange, monaco, type DocumentTab, type Documents } from "./editor";
 import { host, type NativeFolder } from "./workspace";
 import { goTestAt, isGoTestFunction } from "./go-test-target";
+import { validateRelative } from "./project-model";
 
 export type LanguageState = "idle" | "missing" | "starting" | "ready" | "failed";
 const markerOwner = "gopls";
 export const runTestCommand = "irongo.runGoTest";
 export const debugTestCommand = "irongo.debugGoTest";
+
+export interface NavigationProbe {
+  sent(message: Message): void;
+  holdReply(message: unknown, deliver: () => void): boolean;
+}
+
+declare global { interface Window { __ironNavigationProbe?: NavigationProbe } }
 
 // Tauri carries decoded messages; vscode-jsonrpc owns request IDs, responses,
 // cancellation, and dispatch. Only this transport adapter knows about IPC.
@@ -18,13 +26,18 @@ class IpcReader extends AbstractMessageReader {
     this.callback = callback;
     return { dispose: () => { this.callback = undefined; } };
   }
-  receive(value: unknown) { this.callback?.(value as Message); }
+  receive(value: unknown) {
+    const deliver = () => this.callback?.(value as Message);
+    if (import.meta.env.VITE_IRON_E2E === "1" && window.__ironNavigationProbe?.holdReply(value, deliver)) return;
+    deliver();
+  }
 }
 
 class IpcWriter extends AbstractMessageWriter {
   private previous: Promise<void> = Promise.resolve();
   constructor(private readonly server: number) { super(); }
   write(value: Message) {
+    if (import.meta.env.VITE_IRON_E2E === "1") window.__ironNavigationProbe?.sent(value);
     const sent = this.previous.then(() => host.send(this.server, value));
     this.previous = sent.catch(error => { this.fireError(error, value, undefined); });
     return sent;
@@ -39,6 +52,28 @@ const completionKinds = [k.Text, k.Method, k.Function, k.Constructor, k.Field, k
 
 function fromRange(range: Range) {
   return new monaco.Range(range.start.line + 1, range.start.character + 1, range.end.line + 1, range.end.character + 1);
+}
+
+export interface GoLocation { path: string; range: monaco.IRange }
+export interface GoSymbol extends GoLocation { name: string; detail: string }
+
+function validRange(range: Range) {
+  return range && [range.start?.line, range.start?.character, range.end?.line, range.end?.character]
+    .every(value => Number.isInteger(value) && value >= 0) &&
+    (range.start.line < range.end.line || (range.start.line === range.end.line && range.start.character <= range.end.character));
+}
+
+function symbolKind(kind: number) {
+  switch (kind) {
+    case SymbolKind.Function: return "Function";
+    case SymbolKind.Method: return "Method";
+    case SymbolKind.Struct: return "Struct";
+    case SymbolKind.Interface: return "Interface";
+    case SymbolKind.Constant: return "Constant";
+    case SymbolKind.Variable: return "Variable";
+    case SymbolKind.Field: return "Field";
+    default: return "Symbol";
+  }
 }
 
 function markdown(content: MarkupContent | MarkedString): monaco.IMarkdownString {
@@ -203,6 +238,60 @@ export class GoLanguage {
 
   private symbols(model: monaco.editor.ITextModel, token: monaco.CancellationToken) {
     return this.request<(DocumentSymbol | SymbolInformation)[] | null>("textDocument/documentSymbol", model, undefined, token);
+  }
+
+  private workspaceLocation(uri: string, range: Range): GoLocation | undefined {
+    const rawPath = /^file:\/\/\/(?!\/)[^?#\\\s\u0000-\u001f\u007f-\u009f]+$/u;
+    if (!rawPath.test(uri) || /%2f|%5c|%(?![a-f0-9]{2})/i.test(uri) || !validRange(range)) return;
+    try {
+      decodeURIComponent(uri);
+      const parsed = monaco.Uri.parse(uri, true);
+      if (parsed.query || parsed.fragment) return;
+      const path = this.docs.relative(parsed);
+      if (!path) return;
+      validateRelative(path);
+      const location = fromRange(range);
+      const open = this.docs.tabs.get(path);
+      if (open && !exactModelRange(open.model, location)) return;
+      return { path, range: location };
+    } catch { return; }
+  }
+
+  async documentSymbols(model: monaco.editor.ITextModel, token: monaco.CancellationToken) {
+    const path = this.docs.relative(model.uri);
+    if (!path) return [];
+    const raw = await this.symbols(model, token) ?? [];
+    const results: GoSymbol[] = [];
+    const add = (items: (DocumentSymbol | SymbolInformation)[], parent = "") => {
+      for (const item of items) {
+        const detail = `${symbolKind(item.kind)}${parent ? ` · ${parent}` : ""}`;
+        if ("selectionRange" in item) {
+          if (validRange(item.selectionRange)) {
+            const range = fromRange(item.selectionRange);
+            if (exactModelRange(model, range)) results.push({ name: item.name, detail, path, range });
+          }
+          if (item.children) add(item.children, parent ? `${parent}.${item.name}` : item.name);
+        } else {
+          const location = this.workspaceLocation(item.location.uri, item.location.range);
+          if (location?.path === path) results.push({ name: item.name, detail, ...location });
+        }
+      }
+    };
+    add(raw);
+    return results;
+  }
+
+  async references(model: monaco.editor.ITextModel, position: monaco.Position, token: monaco.CancellationToken) {
+    for (const open of this.models.keys()) this.flush(open);
+    const raw = await this.request<Location[] | null>("textDocument/references", model, position, token,
+      { context: { includeDeclaration: true } }) ?? [];
+    const results = new Map<string, GoLocation>();
+    for (const item of raw) {
+      const location = this.workspaceLocation(item.uri, item.range);
+      if (location) results.set(JSON.stringify([location.path, location.range]), location);
+    }
+    return [...results.values()].sort((first, second) => first.path.localeCompare(second.path) ||
+      monaco.Range.compareRangesUsingStarts(first.range, second.range));
   }
 
   async namedTestAt(model: monaco.editor.ITextModel, position: monaco.Position) {
