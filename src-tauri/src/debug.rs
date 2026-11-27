@@ -1,16 +1,12 @@
-use std::{io, process::Stdio, time::Duration};
+use std::{fs::Permissions, os::unix::fs::PermissionsExt, process::Stdio, time::Duration};
 
 use serde::Serialize;
-use tauri::{ipc::Channel, AppHandle, Manager, State};
-use tokio::{
-    io::BufReader,
-    net::UnixListener,
-    sync::{mpsc, oneshot},
-};
+use tauri::{ipc::Channel, AppHandle, State};
+use tokio::{io::BufReader, net::UnixListener};
 
 use crate::{
-    lsp::{frame, write_frame, RunningServer, ServerEvent, MAX_MESSAGE},
-    tools::{command, ProcessGroup},
+    tool_transport::{self, ServerEvent, ToolKind},
+    tools::command,
     workspace::package_dir,
     CommandResult, Core,
 };
@@ -19,6 +15,14 @@ use crate::{
 pub struct DebugAdapter {
     server: u64,
     output: String,
+}
+
+fn private_socket_directory() -> CommandResult<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix("ig-dap-")
+        .permissions(Permissions::from_mode(0o700))
+        .tempdir()
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -41,12 +45,9 @@ pub async fn start_debug(
     let mut delve = command("dlv").map_err(|_| {
         "Install Delve with `brew install delve`, then check the tools in Settings."
     })?;
-    // Delve dials a private socket inside a 0700 directory. There is no
-    // debug port exposed to other users or the network.
-    let directory = tempfile::Builder::new()
-        .prefix("ig-dap-")
-        .tempdir()
-        .map_err(|error| error.to_string())?;
+    // Delve dials a private socket. The directory is already owner-only
+    // when the listener is bound, and there is no network port.
+    let directory = private_socket_directory()?;
     let endpoint = directory.path().join("d.sock");
     let output = directory
         .path()
@@ -56,7 +57,7 @@ pub async fn start_debug(
         .to_owned();
     let listener = UnixListener::bind(&endpoint)
         .map_err(|error| format!("Create private debugger socket: {error}"))?;
-    let mut child = delve
+    let child = delve
         .args([
             "dap",
             "--client-addr",
@@ -69,104 +70,49 @@ pub async fn start_debug(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("Start Delve: {error}"))?;
-    let group = ProcessGroup::from_pid(child.id().unwrap());
-    let (input, mut outgoing) = mpsc::channel::<String>(32);
-    let (stop, mut cancelled) = oneshot::channel();
-    let server = session.next_id();
-    session.debug = Some(RunningServer {
-        id: server,
-        input,
-        stop: Some(stop),
-        group: group.clone(),
-    });
-    tauri::async_runtime::spawn(async move {
-        let _directory = directory;
-        let connection = tokio::select! {
-            _ = &mut cancelled => Err("Debug session stopped".to_owned()),
-            status = child.wait() => {
-                group.disarm();
-                Err(format!("Delve stopped before connecting: {}", status.map_or_else(|e| e.to_string(), |s| s.to_string())))
-            },
-            connection = tokio::time::timeout(Duration::from_secs(8), listener.accept()) => connection
-                .map_err(|_| "Delve did not connect to its socket.".to_owned())
-                .and_then(|accepted| accepted.map(|(stream, _)| stream).map_err(|error| error.to_string())),
-        };
+    let connect = async move {
+        let accepted = tokio::time::timeout(Duration::from_secs(8), listener.accept()).await;
         drop(listener);
-        let reason = match connection {
-            Err(error) => error,
-            Ok(stream) => {
-                let (reader, mut writer) = stream.into_split();
-                let mut reader = BufReader::new(reader);
-                let send = async {
-                    while let Some(message) = outgoing.recv().await {
-                        write_frame(&mut writer, &message).await?;
-                    }
-                    Ok::<_, io::Error>(())
-                };
-                let read = async {
-                    while let Some(message) = frame(&mut reader).await? {
-                        events
-                            .send(ServerEvent::Message { message })
-                            .map_err(io::Error::other)?;
-                    }
-                    Ok::<_, io::Error>(())
-                };
-                tokio::select! {
-                    _ = cancelled => "Debug session stopped".to_owned(),
-                    result = child.wait() => {
-                        group.disarm();
-                        format!("Delve exited: {}", result.map_or_else(|e| e.to_string(), |s| s.to_string()))
-                    },
-                    result = send => result.err().map_or_else(|| "Delve input closed".to_owned(), |error| error.to_string()),
-                    result = read => result.err().map_or_else(|| "Delve disconnected".to_owned(), |error| error.to_string()),
-                }
-            }
-        };
-        group.kill();
-        let _ = child.wait().await;
-        let core = app.state::<Core>();
-        let mut session = core.0.lock().unwrap();
-        if session
-            .debug
-            .as_ref()
-            .is_some_and(|active| active.id == server)
-        {
-            session.debug.take();
-        }
-        drop(session);
-        let _ = events.send(ServerEvent::Closed { reason });
-    });
+        let (stream, _) = accepted
+            .map_err(|_| "Delve did not connect to its socket.".to_owned())?
+            .map_err(|error| error.to_string())?;
+        let (reader, writer) = stream.into_split();
+        Ok((BufReader::new(reader), writer))
+    };
+    let server = session.next_id();
+    session.debug = Some(tool_transport::start(
+        app,
+        ToolKind::Delve,
+        server,
+        child,
+        connect,
+        directory,
+        events,
+    ));
     Ok(DebugAdapter { server, output })
 }
 
 #[tauri::command]
 pub async fn send_debug(state: State<'_, Core>, server: u64, message: String) -> CommandResult<()> {
-    if message.len() > MAX_MESSAGE {
-        return Err("Debugger message is too large.".into());
-    }
-    let input = state
-        .0
-        .lock()
-        .unwrap()
-        .debug
-        .as_ref()
-        .filter(|active| active.id == server)
-        .map(|active| active.input.clone())
-        .ok_or("The debugger is not running.")?;
-    input
-        .send(message)
-        .await
-        .map_err(|_| "The debugger closed its input.".into())
+    tool_transport::send(&state, ToolKind::Delve, server, message).await
 }
 
 #[tauri::command]
 pub fn stop_debug(state: State<'_, Core>, server: u64) {
-    let mut session = state.0.lock().unwrap();
-    if session
-        .debug
-        .as_ref()
-        .is_some_and(|active| active.id == server)
-    {
-        session.debug.take();
-    }
+    tool_transport::stop(&state, ToolKind::Delve, server);
+}
+
+#[cfg(test)]
+#[test]
+fn debugger_socket_directory_is_owner_only() {
+    let directory = private_socket_directory().unwrap();
+    let mode = std::fs::metadata(directory.path())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "other users cannot reach the debugger socket"
+    );
 }

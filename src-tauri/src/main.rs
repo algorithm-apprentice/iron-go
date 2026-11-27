@@ -3,6 +3,7 @@ mod lsp;
 mod packages;
 mod quit;
 mod tasks;
+mod tool_transport;
 mod tools;
 mod workspace;
 
@@ -24,8 +25,8 @@ struct Session {
     workspace: Option<Workspace>,
     task: Option<tasks::RunningTask>,
     discovery: Option<packages::Discovery>,
-    lsp: Option<lsp::RunningServer>,
-    debug: Option<lsp::RunningServer>,
+    lsp: Option<tool_transport::RunningServer>,
+    debug: Option<tool_transport::RunningServer>,
 }
 
 impl Session {

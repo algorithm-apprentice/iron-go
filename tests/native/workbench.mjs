@@ -642,9 +642,51 @@ async function standardWorkbenchSmoke() {
         await click("#debug-continue");
         await eventually("debug test finished", () => text("#status"), value => /Debug session finished/i.test(value), 15_000);
       });
+      await record("Delve Stop and project switch retire a paused session and admit a fresh one", async () => {
+        const paused = async () => {
+          await clickCodeLens("Debug TestSummary");
+          await eventually("Delve paused", () => text("#status"), value => /Breakpoint hit.*report_test\.go:9/.test(value), 60_000);
+          return await eventually("owned Delve child", () => {
+            const processes = execFileSync("ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" });
+            for (const row of processes.split("\n")) {
+              const entry = row.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+              if (entry && Number(entry[2]) === app.child.pid && path.basename(entry[3]) === "dlv") return Number(entry[1]);
+            }
+          });
+        };
+        const gone = (label, pid) => eventually(label, () => {
+          try { process.kill(pid, 0); return false; } catch (error) { if (error.code === "ESRCH") return true; throw error; }
+        });
+
+        const stopped = await paused();
+        await click("#debug-stop");
+        await eventually("Debug Stop clears controls", () => js("return document.querySelector('#debug-controls').hidden && !document.querySelector('#run').disabled;"));
+        await gone("Debug Stop reaps Delve", stopped);
+
+        const switched = await paused();
+        await click("#open-folder");
+        await eventually("switch confirms active debug session", () => js("return document.querySelector('#project-transition-dialog').open;"));
+        assert.match(await text("#project-transition-description"), /debug session will be stopped/i);
+        await click("#project-transition-continue");
+        await eventually("replacement workspace resets debug and the active tab", current, state => state?.path === "cmd/orbit/main.go");
+        await eventually("switch clears debug controls and starts gopls", async () => ({ native: await current(), hidden: await js("return document.querySelector('#debug-controls').hidden;") }), state => state.native?.gopls === "ready" && state.hidden);
+        await gone("workspace switch reaps Delve", switched);
+
+        await click("#quick-open");
+        await set("#palette-text", "report_test.go");
+        await click("#palette-options button");
+        await eventually("new session test file", current, state => state?.path === "internal/status/report_test.go");
+        await placeBreakpoint(9);
+        const replacement = await paused();
+        await click("#debug-stop");
+        await eventually("replacement Debug Stop clears controls", () => js("return document.querySelector('#debug-controls').hidden && !document.querySelector('#run').disabled;"));
+        await gone("replacement Delve is reaped", replacement);
+      });
     }
   }
   await record("cancelling a dirty close preserves the buffer, accepting returns to welcome", async () => {
+    await eventually("wait target discovered", () => js("return [...document.querySelector('#run-target').options].some(option => option.value === './cmd/wait');"));
+    await js("const select = document.querySelector('#run-target'); select.value = './cmd/wait'; select.dispatchEvent(new Event('change')); return true;");
     await eventually("wait target can be run", () => js("return document.querySelector('#run-target').value === './cmd/wait' && !document.querySelector('#run').disabled;"));
     const previous = (await output()).match(/agent-ready (\d+)/)?.[1];
     await click("#run");

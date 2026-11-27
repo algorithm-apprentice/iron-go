@@ -457,14 +457,96 @@ output or package discovery into this transport.
 **Invariants:** Preserve message bounds, session IDs, and independent lifetimes.
 Final protocol messages and EOF are handled deliberately; old workers cannot
 clear new ones. Stop, early child exit, and connection failure have one cleanup
-path; no duplicate terminal state or orphan process. Delve retains its private
-socket and explicit process ownership.
+path and no duplicate terminal state. Explicit Stop, switch and quit signal
+live groups; the natural-leader-exit exception is detailed below. Delve
+retains its private socket and explicit process ownership.
 
 **Tests:** Focused bounded framing and fake transport/child teardown tests
 cover partial frames, EOF, oversized data, cancellation before connect,
 unexpected disconnect, and stale worker cleanup. Native gopls and Delve tests
 must still prove real hover/diagnostics and stop/step/continue/stop behavior,
 including project switch during debugging.
+
+**Batch 4 implementation design (independently approved):** Introduce a Rust
+`tool_transport` module with one bounded outbound queue, framed reader/writer,
+cancellation token and child/group owner for each server instance. Keep the
+public commands, `ServerEvent` shape, workspace admission rules and current
+message limits. A narrow kind selects the native slot and existing error
+wording; no LSP or DAP payload policy moves into the transport. `gopls` gives
+the worker already-open stdio. Delve gives it an asynchronous connection to
+the existing private Unix listener with its eight-second timeout; the worker
+creates the directory with owner-only permissions atomically (before bind),
+closes the listener once accept resolves, and retains the directory through
+child teardown. Directory deletion on app exit remains best effort if the
+runtime cannot poll cleanup. Stop before connect, child exit before connect
+and accept failure all feed the same cleanup path.
+
+Keep synchronous process-group kill on handle drop so switch and native app
+exit do not depend on async tasks getting another poll. The common worker
+owns the child and eventually reaps it; remove the session slot only if its
+ID still matches and send one terminal event on the original channel after
+cleanup. Old server events must not retire or notify a newer handle. Use a
+transport-specific group owner: both a synchronous signal (including the
+syscall, not just claiming the identifier) and each poll of the sole Tokio
+child wait hold the same short mutex. On successful wait, disarm within that
+poll before releasing the mutex; never disarm on a wait error. Do not hold a
+session lock while polling child wait, and release the group mutex before
+retiring the native session slot. Stop/switch/quit and abnormal I/O signal
+the live group before reaping. If the leader exits naturally first, we do
+not signal a numeric group after reaping: descendants may survive that case
+even if they stayed in the group. Inherited descriptors do not extend the
+drain budget. Go task and package discovery keep their existing behavior.
+On worker drop, signal/disarm before dropping the Tokio child, because its
+destructor may itself reap or transfer reaping.
+
+Distinguish a clean frame-boundary EOF from a partial header/body and reject
+duplicate `Content-Length` or values above the cap. Retain byte lengths and
+the 8 KiB header and 16 MiB body bounds. An explicit stop need not deliver
+buffered messages. Observed child exit or writer closure starts a bounded
+read drain with a single absolute deadline (300 ms); the later event must
+not reset it. Keep the frame future pinned across these events, so the drain
+continues a partially parsed frame instead of starting another read. Check
+cancellation and the deadline between delivered frames and yield so a
+continuously ready reader cannot starve them. Recheck both immediately before
+delivery: a single frame poll can do synchronous JSON parsing after select
+last checked cancellation. Clean read EOF while the child
+is still live ends the session and kills/reaps the group after already-read
+frames. Invalid input or IPC delivery failure ends delivery immediately.
+An explicit stop takes priority in all phases and can discard unread frames.
+Do not retry launches.
+
+First reproduce a truncated header being treated as clean EOF in a Rust
+test. Add deterministic in-memory framing/EOF/oversize and duplex drain
+tests, including a partial frame across exit, concurrent write closure and
+cancel during drain. Add disposable child tests for cancellation before
+connection, early exit, disconnect, and one cleanup notification. Verify the
+private socket directory mode and that an older worker cannot clear a newer
+slot or send a notification to its channel. In native acceptance
+retain the real gopls/Delve cases and add Stop and workspace switch while
+paused; verify the debug state is cleared and a fresh launch is admitted.
+
+**Batch 4 focused verification:** The baseline truncation test failed because
+an incomplete header returned `None`. The shared transport's 10 focused Rust
+tests pass, including the moved Unicode regression, partial header/body and
+bounded framing cases, in-flight frame preservation across child exit or a
+broken writer, cancellation between ready frames, a bounded dangling-reader
+drain, and test child reaping with ID/channel isolation.
+`npm run test:feedback` passed (15 TS, 29 Rust, Go fixture, 16 browser,
+18 standard native with gopls and Delve, and the standalone Quit probe).
+Native artifacts: `1795742134403-28075`, `1795742186410-29572`. The native
+Delve case observed the app's own child PID, verified its removal after
+Stop and workspace cutover while paused, then admitted and stopped a fresh
+session in the replacement workspace. A Rust check verified that the socket
+directory mode grants no permissions to other users or groups. Review found
+that cancellation arriving inside a frame read could still deliver it. The
+new regression reproduced one delivered frame; checking cancellation and
+the deadline again after the frame poll reduced the count to zero.
+
+**Batch 4 final verification:** `npm run test:feedback` passed with 30 Rust
+tests (11 focused transport), 15 TS, the Go fixture, 16 browser, 18 native
+with gopls and Delve, and the standalone Quit probe. Final native artifacts:
+`1795742341148-30605` and `1795742386125-32080`. Strict Clippy with `e2e`
+passed on the revised code, and independent code re-review approved it.
 
 ## 5. Improve test independence and diagnostics
 
