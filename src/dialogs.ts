@@ -54,6 +54,10 @@ export class Palette {
     this.input.setSelectionRange(initial.length, initial.length);
   }
 
+  refreshFiles() {
+    if (this.dialog.open && !this.input.value.startsWith(">")) this.update();
+  }
+
   private update() {
     this.options = this.choices(this.input.value);
     this.selected = 0;

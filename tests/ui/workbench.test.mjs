@@ -111,6 +111,56 @@ test("a delayed reload cannot replace a committed save's text or baseline", asyn
   });
 });
 
+test("an external observation cannot apply across a newer edit or save baseline", async () => {
+  await documentScenario("external-observation-races", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs, documentState } = window;
+      let disk = "original";
+      let observation = Promise.withResolvers();
+      docs.reset({ read: async () => disk, inspect: () => observation.promise, save: async (_path, _expected, text) => { disk = text; } });
+      const tab = await docs.open("data.txt");
+      const beforeEdit = docs.reconcile(tab);
+      tab.model.setValue("new edit");
+      observation.resolve({ kind: "text", text: "external" });
+      const editResult = await beforeEdit;
+      const beforeSave = docs.reconcile(tab);
+      await docs.save(tab);
+      const saveResult = await beforeSave;
+      observation = Promise.withResolvers();
+      observation.resolve({ kind: "text", text: disk });
+      await docs.reconcile(tab);
+      return { editResult, saveResult, diskChange: tab.diskChange ?? null, ...documentState(tab) };
+    });
+    assert.deepEqual(outcome, { editResult: false, saveResult: false, diskChange: null,
+      text: "new edit", disk: "new edit", dirty: false });
+  });
+});
+
+test("clean external reload is undoable against the new baseline and adopts a new encoding convention", async () => {
+  await documentScenario("external-reload-baseline", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs, documentState } = window;
+      let disk = "original\n";
+      docs.reset({ read: async () => disk, inspect: async () => ({ kind: "text", text: disk }) });
+      const tab = await docs.open("data.txt");
+      disk = "external\n";
+      await docs.reconcile(tab);
+      const reloaded = documentState(tab);
+      await tab.model.undo();
+      const undone = documentState(tab);
+      await tab.model.redo();
+      disk = "\ufeffdifferent\r\nlines\r\n";
+      await docs.reconcile(tab);
+      return { reloaded, undone, convention: documentState(tab) };
+    });
+    assert.deepEqual(outcome, {
+      reloaded: { text: "external\n", disk: "external\n", dirty: false },
+      undone: { text: "original\n", disk: "external\n", dirty: true },
+      convention: { text: "\ufeffdifferent\r\nlines\r\n", disk: "\ufeffdifferent\r\nlines\r\n", dirty: false },
+    });
+  });
+});
+
 test("save advances the baseline without discarding typing or reporting an invalidated reload error", async () => {
   await documentScenario("typed-while-saving", async page => {
     const outcome = await page.evaluate(async () => {

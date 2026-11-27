@@ -727,8 +727,8 @@ async function fileSuite() {
   await record("protects externally edited files from overwrite", async () => {
     const saved = await readFile(source, "utf8");
     const external = saved + "\n// External change\n";
-    await writeFile(source, external);
     await replace(saved + "\n// Unsaved buffer\n");
+    await writeFile(source, external);
     await click("#save");
     await eventually("save conflict message", () => text("#toast"), value => value.includes("changed on disk"));
     assert.equal(await readFile(source, "utf8"), external);
@@ -742,6 +742,77 @@ async function fileSuite() {
       await chooseCommand("reload file from disk");
       await eventually("confirmed reload reads the real disk", current, state => state?.text === external && !state.dirty);
     } finally { await js("window.confirm = window.__realConfirm; delete window.__realConfirm; return true;"); }
+  });
+  await record("native external edits reconcile clean, dirty, and missing tabs", async () => {
+    const readme = path.join(fixture, "README.md");
+    const readmeText = await readFile(readme, "utf8");
+    const savedGo = await readFile(source, "utf8");
+    const goPath = '#tabs [data-path="cmd/orbit/main.go"]';
+    const readmePath = '#tabs [data-path="README.md"]';
+    const select = async (selector, relative) => {
+      await click(selector);
+      await eventually(`${relative} is active`, current, state => state?.path === relative);
+    };
+    const diskState = (selector, state) => eventually(`tab marks ${state || "no"} disk change`, () => js(`
+      return document.querySelector(arguments[0])?.closest('.tab')?.dataset.diskChange ?? '';
+    `, selector), value => value === state);
+    const dirty = savedGo + "\n// Unsaved while another editor writes\n";
+    const externalGo = savedGo + "\n// Written by another editor\n";
+    const externalReadme = readmeText + "\nUpdated outside Iron Go.\n";
+    await select(goPath, "cmd/orbit/main.go");
+    await replace(dirty);
+    await select('#explorer [data-path="README.md"]', "README.md");
+    try {
+      await click("#quick-open");
+      await set("#palette-text", "externally-added.txt");
+      assert.match(await text("#palette-options"), /no matching entries/i);
+      await Promise.all([
+        writeFile(readme, externalReadme),
+        writeFile(source, externalGo),
+        writeFile(path.join(fixture, "externally-added.txt"), "Created outside Iron Go.\n"),
+      ]);
+      await eventually("clean buffer automatically reloads", current, state => state?.text === externalReadme && !state.dirty);
+      await eventually("the external file appears in the tree", () => js(`return !!document.querySelector('#explorer [data-path="externally-added.txt"]');`));
+      await eventually("the external file appears in the already open Quick Open", () => text("#palette-options"), value => value.includes("externally-added.txt"));
+      await click("#palette-options button");
+      await diskState(goPath, "changed");
+      await select(goPath, "cmd/orbit/main.go");
+      assert.equal((await current()).text, dirty);
+      assert.match(await text("#disk-change"), /changed on disk/i);
+      assert.equal(await readFile(source, "utf8"), externalGo);
+      await writeFile(source, savedGo);
+      await diskState(goPath, "");
+      await replace(savedGo);
+      await eventually("restoring the buffer makes it clean", current, state => !state.dirty);
+
+      await select(readmePath, "README.md");
+      await rename(readme, path.join(fixture, "external-readme-backup.md"));
+      await diskState(readmePath, "missing");
+      assert.equal((await current()).text, externalReadme);
+      await mkdir(readme);
+      await diskState(readmePath, "unavailable");
+      assert.equal((await current()).text, externalReadme);
+      await rename(readme, path.join(fixture, "external-readme-directory"));
+      await writeFile(readme, readmeText);
+      await eventually("the recreated clean file is adopted", current, state => state?.text === readmeText && !state.dirty);
+      await diskState(readmePath, "");
+    } finally { await select(goPath, "cmd/orbit/main.go"); }
+  });
+  await record("changing only go.work contents refreshes native run targets", async () => {
+    const nested = path.join(fixture, "nested-watch-module");
+    const workfile = path.join(fixture, "go.work");
+    const target = "./nested-watch-module";
+    await mkdir(nested);
+    await writeFile(path.join(nested, "go.mod"), "module example.com/watched\n\ngo 1.22\n");
+    await writeFile(path.join(nested, "main.go"), "package main\n\nfunc main() {}\n");
+    await writeFile(workfile, "go 1.22\n\nuse (\n\t.\n\t./nested-watch-module\n)\n");
+    const targets = () => js("return [...document.querySelector('#run-target').options].map(option => option.value);");
+    try {
+      await eventually("the nested run target is discovered", targets, values => values.includes(target));
+      await writeFile(workfile, "go 1.22\n\nuse .\n");
+      await eventually("editing go.work removes the target without losing the root program", targets,
+        values => values.includes("./cmd/orbit") && !values.includes(target));
+    } finally { await rename(workfile, path.join(fixture, "disabled-go-work.txt")); }
   });
   await record("native gutter grows for four digits, and line 1000 selects the whole line", async () => {
     for (const lines of [999, 1001]) {
@@ -772,6 +843,27 @@ async function fileSuite() {
     assert.deepEqual(sizes.map(size => [size.gap, size.lane, size.row]), [[24, 18, 18], [24, 18, 18]]);
     assert.ok(sizes[0].margin <= 66 && sizes[1].margin <= 74, JSON.stringify(sizes));
     await traceGutterClick(1000);
+  });
+  await record("native watcher detects a moved ancestor and rejects writes into a replacement root", async () => {
+    const parent = path.dirname(fixture);
+    const retired = `${parent}-retired`;
+    const buffer = (await current()).text;
+    await rename(parent, retired);
+    try {
+      await mkdir(fixture, { recursive: true });
+      await eventually("the old workspace becomes unavailable without a focus or refresh", () => text("#disk-change"),
+        value => value.includes("unavailable"));
+      assert.equal((await current()).text, buffer);
+      await click("#new-file");
+      await set("#form-path", "must-not-exist/file.txt");
+      await click("#form-submit");
+      await eventually("New File rejects the replaced workspace", () => text("#form-error"), value => value.includes("has been replaced"));
+      await assert.rejects(stat(path.join(fixture, "must-not-exist")), { code: "ENOENT" });
+      await click('[data-dialog-close="form-dialog"]');
+    } finally {
+      await rename(parent, `${parent}-replacement`);
+      await rename(retired, parent);
+    }
   });
 }
 

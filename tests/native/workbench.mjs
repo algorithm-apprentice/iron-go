@@ -180,6 +180,7 @@ async function runGroup(executable, env, group, quitHelper) {
       execFileSync("tar", ["-xf", "-", "-C", fixture], { input: snapshot, timeout: 60_000 });
     } else await cp(path.join(root, "tests/fixtures/orbit"), fixture, { recursive: true });
     const groupEnv = { ...env };
+    if (group === "files") groupEnv.GOWORK = "auto";
     if (!values.project) {
       groupEnv.GOPATH = path.join(fixtureRoot, "gopath");
       groupEnv.GOTMPDIR = path.join(fixtureRoot, "go-tmp");

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ExecutionLane } from "../src/execution.ts";
-import { ProjectWorkflow, publishProjectSnapshot } from "../src/project-workflow.ts";
+import { ProjectSnapshots, ProjectWorkflow } from "../src/project-workflow.ts";
 
 const clean = { revision: () => 0, save: async () => {}, dirty: () => false };
 
@@ -9,12 +9,13 @@ test("only the committed project's snapshot can publish data or errors", async (
   const old = { id: 1 }, next = { id: 2 };
   let project = old;
   const events = [];
+  const snapshots = new ProjectSnapshots();
   const open = Promise.withResolvers();
   const error = Promise.withResolvers();
   const result = Promise.withResolvers();
   const request = read => ({ current: () => project, read, apply: value => events.push(value), fail: error => events.push(error.message) });
-  const obsoleteError = publishProjectSnapshot(old, request(() => error.promise));
-  const obsoleteResult = publishProjectSnapshot(old, request(() => result.promise));
+  const obsoleteError = snapshots.refresh(old, request(() => error.promise));
+  const obsoleteResult = snapshots.refresh(old, request(() => result.promise));
   const workflow = new ProjectWorkflow(() => {});
   const switching = workflow.transition({ ready: () => true, confirm: async () => true, choose: () => open.promise,
     install: async target => { project = target; } });
@@ -24,9 +25,22 @@ test("only the committed project's snapshot can publish data or errors", async (
   result.resolve("old result");
   await Promise.all([obsoleteError, obsoleteResult]);
   assert.deepEqual(events, []);
-  await publishProjectSnapshot(next, request(async () => { throw new Error("current error"); }));
-  await publishProjectSnapshot(next, request(async () => "current result"));
+  await snapshots.refresh(next, request(async () => { throw new Error("current error"); }));
+  await snapshots.refresh(next, request(async () => "current result"));
   assert.deepEqual(events, ["current error", "current result"]);
+});
+
+test("an older snapshot cannot replace a newer snapshot of the same project", async () => {
+  const snapshots = new ProjectSnapshots();
+  const target = {};
+  const pending = Promise.withResolvers();
+  const published = [];
+  const request = read => ({ current: () => target, read, apply: value => published.push(value), fail: assert.fail });
+  const older = snapshots.refresh(target, request(() => pending.promise));
+  await snapshots.refresh(target, request(async () => "new tree"));
+  pending.resolve("old tree");
+  await older;
+  assert.deepEqual(published, ["new tree"]);
 });
 
 test("project transition reserves the editor; cancel and host failure never install", async () => {

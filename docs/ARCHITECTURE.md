@@ -9,6 +9,7 @@ Iron Go.app (macOS)
 ├── Tauri/Rust host (src-tauri/src)
 │   ├── main.rs           → workspace identity, dialogs, command registration
 │   ├── workspace.rs      → tree, paths, UTF-8 files, atomic saves, project search
+│   ├── workspace_disk.rs → bound directory identity, disk inspection, watch revisions
 │   ├── tools.rs          → tool discovery, gofmt, process group ownership
 │   ├── packages.rs       → cancellable Go module and run target discovery
 │   ├── tasks.rs          → go run/build/test, bounded output and cancellation
@@ -37,3 +38,6 @@ or close. Tool absence degrades capabilities separately from file editing.
 The acceptance fixture is `tests/fixtures/orbit`; automation only edits a copy.
 It is not bundled into the application.
 See [testing instructions](TESTING.md) for the feedback loop.
+
+See the proposed [daily Go workbench plan](design/daily-go-workbench.md) for
+the remaining workflows and their acceptance criteria.

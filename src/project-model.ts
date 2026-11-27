@@ -1,7 +1,7 @@
 export interface Entry { path: string; directory: boolean }
 export interface FileMatch { path: string; line: number; column: number; length: number; preview: string }
 export interface SearchResult { matches: FileMatch[]; truncated: boolean }
-export interface ProjectSnapshot { entries: Entry[]; truncated: boolean; module: string | null; goWork: boolean }
+export interface ProjectSnapshot { entries: Entry[]; truncated: boolean; module: string | null; goWork: boolean; packageRevision?: string }
 export interface TreeNode extends Entry { name: string; children: TreeNode[] }
 
 const excluded = new Set([".git", ".DS_Store", "node_modules"]);

@@ -37,16 +37,22 @@ export class ProjectWorkflow {
   }
 }
 
-export async function publishProjectSnapshot<P, S>(target: P, request: {
-  current(): P;
-  read(target: P): Promise<S>;
-  apply(snapshot: S): void;
-  fail(error: unknown): void;
-}) {
-  try {
-    const snapshot = await request.read(target);
-    if (request.current() === target) request.apply(snapshot);
-  } catch (error) {
-    if (request.current() === target) request.fail(error);
+export class ProjectSnapshots {
+  private revision = 0;
+
+  async refresh<P, S>(target: P, request: {
+    current(): P;
+    read(target: P): Promise<S>;
+    apply(snapshot: S): void;
+    fail(error: unknown): void;
+  }) {
+    const revision = ++this.revision;
+    const current = () => revision === this.revision && request.current() === target;
+    try {
+      const snapshot = await request.read(target);
+      if (current()) request.apply(snapshot);
+    } catch (error) {
+      if (current()) request.fail(error);
+    }
   }
 }

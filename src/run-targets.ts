@@ -37,7 +37,6 @@ export class RunTargets {
     this.scopePath.value = "./...";
     byId<HTMLDetailsElement>("advanced-targets").open = false;
     this.render("");
-    void this.refresh();
   }
 
   async refresh() {

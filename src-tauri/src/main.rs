@@ -9,6 +9,7 @@ mod tasks;
 mod tool_transport;
 mod tools;
 mod workspace;
+mod workspace_disk;
 
 use std::{path::PathBuf, sync::Mutex};
 use tauri::{Manager, State};
@@ -27,6 +28,7 @@ struct Core(
 struct Session {
     serial: u64,
     workspace: Option<Workspace>,
+    watcher: Option<workspace_disk::WorkspaceWatch>,
     task: Option<tasks::RunningTask>,
     discovery: Option<packages::Discovery>,
     lsp: Option<tool_transport::RunningServer>,
@@ -58,6 +60,12 @@ impl Session {
         self.lsp.take();
         self.debug.take();
     }
+
+    fn retire_workspace(&mut self) {
+        self.workspace.take();
+        self.watcher.take();
+        self.stop_processes();
+    }
 }
 
 async fn blocking<T: Send + 'static>(
@@ -82,7 +90,7 @@ fn install_workspace(
     let mut session = state.0.lock().unwrap();
     #[cfg(feature = "e2e")]
     session.acceptance.check()?;
-    session.stop_processes();
+    session.retire_workspace();
     workspace.info.id = session.next_id();
     let info = workspace.info.clone();
     session.workspace = Some(workspace);
@@ -136,8 +144,7 @@ async fn new_module(
 fn close_workspace(state: State<'_, Core>, id: u64) -> CommandResult<()> {
     let mut session = state.0.lock().unwrap();
     session.root(id)?;
-    session.stop_processes();
-    session.workspace = None;
+    session.retire_workspace();
     Ok(())
 }
 
@@ -173,6 +180,9 @@ fn main() {
             close_workspace,
             workspace::snapshot,
             workspace::read_file,
+            workspace::inspect_file,
+            workspace_disk::start_workspace_watch,
+            workspace_disk::wait_workspace_watch,
             workspace::save_file,
             workspace::create_file,
             workspace::search_files,
@@ -204,7 +214,7 @@ fn main() {
                 quit::request_termination();
             }
             tauri::WindowEvent::Destroyed => {
-                window.state::<Core>().0.lock().unwrap().stop_processes();
+                window.state::<Core>().0.lock().unwrap().retire_workspace();
             }
             _ => {}
         })
@@ -212,7 +222,7 @@ fn main() {
         .expect("could not initialize Iron Go")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
-                app.state::<Core>().0.lock().unwrap().stop_processes();
+                app.state::<Core>().0.lock().unwrap().retire_workspace();
             }
         });
 }

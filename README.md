@@ -21,6 +21,7 @@ When launched from Finder, Iron Go also searches common tool locations, includin
 ## Features
 
 - File tree, editor tabs, unsaved-change indicators, undo, save conflict protection, quick file navigation, and full-text search across saved files.
+- Native file watching updates the project tree and reloads open files without unsaved edits. Changed, missing, or unreadable files are indicated without overwriting unsaved buffers. **Refresh Project** also rechecks open files.
 - Go syntax highlighting in Monaco. `gofmt` formats the current buffer without saving it.
 - Dark and light themes, saved through **Settings → Color Theme** (`⌘,`).
 - `gopls` completion, hover documentation, workspace definition navigation, and diagnostics in the Problems panel. Run a named test through its **Run Test** CodeLens or **Go: Run Test at Cursor** in the command palette.
@@ -28,7 +29,7 @@ When launched from Finder, Iron Go also searches common tool locations, includin
 - `go build`, `go run`, and `go test` with live output, exit status, and task cancellation. Run only trusted projects.
 - Keyboard shortcuts: `⌘O` opens a project, `⌘P` opens a file, `⇧⌘P` opens the command palette, `⌘S` saves, `⇧⌘F` searches saved files, `⇧⌥F` formats, and `⌘↵` runs or stops a task. `⇧⌘[` and `⇧⌘]` cycle editors; `⌘B` and `⌘J` toggle the sidebar and bottom panel.
 
-Delve debugging is limited to named Go tests. Iron Go does not support arbitrary process attachment, an interactive terminal, automatic file watching, or Windows. `npm run dev` starts a browser preview; it cannot run local Go tools or write back to imported folders.
+Delve debugging is limited to named Go tests. Iron Go does not support arbitrary process attachment, an interactive terminal, or Windows. `npm run dev` starts a browser preview; it cannot run local Go tools, watch the filesystem, or write back to imported folders.
 
 ## Build and test
 

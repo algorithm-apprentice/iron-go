@@ -1,5 +1,7 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     fs::{self, File, Metadata, OpenOptions, TryLockError},
+    hash::{Hash, Hasher},
     io::{self, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
@@ -9,6 +11,7 @@ use regex::RegexBuilder;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
+use crate::workspace_disk::{DiskObservation, RootAnchor};
 use crate::{blocking, CommandResult, Core};
 
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -32,6 +35,7 @@ pub struct WorkspaceInfo {
 pub struct Workspace {
     pub info: WorkspaceInfo,
     pub root: PathBuf,
+    pub anchor: RootAnchor,
 }
 
 impl Workspace {
@@ -49,9 +53,11 @@ impl Workspace {
             .and_then(|name| name.to_str())
             .unwrap_or(&path)
             .to_owned();
+        let anchor = RootAnchor::new(&root).map_err(fail("Open workspace directory"))?;
         Ok(Self {
             info: WorkspaceInfo { id: 0, name, path },
             root,
+            anchor,
         })
     }
 }
@@ -90,13 +96,16 @@ fn direct_path(root: &Path, parts: &[&str]) -> CommandResult<PathBuf> {
 fn read_text(root: &Path, relative: &str, limit: u64) -> CommandResult<String> {
     let path = direct_path(root, &components(relative)?)?;
     let mut text = String::new();
-    let info = fs::metadata(&path).map_err(fail("Read file"))?;
-    if !info.is_file() || info.len() > limit {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_REGULAR)
+        .open(&path)
+        .map_err(fail("Open file"))?;
+    let info = regular_file(&file, "Read file")?;
+    if info.len() > limit {
         return Err("Open a regular text file smaller than the size limit (2 MB).".into());
     }
-    File::open(path)
-        .map_err(fail("Open file"))?
-        .take(limit + 1)
+    file.take(limit + 1)
         .read_to_string(&mut text)
         .map_err(fail("Read UTF-8 text"))?;
     if text.as_bytes().contains(&0) || text.len() as u64 > limit {
@@ -291,35 +300,12 @@ fn persist_text_impl(
     stage.persist(&path)
 }
 
-fn new_file(root: &Path, relative: &str) -> CommandResult<()> {
+fn new_file(root: &Path, anchor: &RootAnchor, relative: &str) -> CommandResult<()> {
     let parts = components(relative)?;
     if parts.iter().any(|part| HIDDEN.contains(part)) {
         return Err("This path is excluded from the workspace tree.".into());
     }
-    let (name, directories) = parts.split_last().unwrap();
-    let mut path = root.to_path_buf();
-    for directory in directories {
-        path.push(directory);
-        match fs::create_dir(&path) {
-            Ok(()) => (),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
-            Err(error) => return Err(fail("Create directory")(error)),
-        }
-        if !fs::symlink_metadata(&path)
-            .map_err(fail("Read directory"))?
-            .is_dir()
-        {
-            return Err(
-                "A parent segment is not a directory (symbolic links are excluded).".into(),
-            );
-        }
-    }
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path.join(name))
-        .map_err(fail("Create file"))?;
-    Ok(())
+    anchor.create_file(root, &parts)
 }
 
 pub fn validate_module(name: &str, module: &str) -> CommandResult<()> {
@@ -374,6 +360,11 @@ pub struct Snapshot {
     truncated: bool,
     module: Option<String>,
     go_work: bool,
+    package_revision: Option<String>,
+}
+
+pub fn excluded_name(name: &str) -> bool {
+    HIDDEN.contains(&name) || name.contains('\\') || name.starts_with(SAVE_STAGE_PREFIX)
 }
 
 fn collect(root: &Path) -> CommandResult<Snapshot> {
@@ -389,8 +380,7 @@ fn collect(root: &Path) -> CommandResult<Snapshot> {
         for item in batch.flatten() {
             let name = item.file_name();
             let Some(name) = name.to_str() else { continue };
-            if HIDDEN.contains(&name) || name.contains('\\') || name.starts_with(SAVE_STAGE_PREFIX)
-            {
+            if excluded_name(name) {
                 continue;
             }
             let Ok(kind) = item.file_type() else { continue };
@@ -440,7 +430,31 @@ fn collect(root: &Path) -> CommandResult<Snapshot> {
         truncated,
         module,
         go_work,
+        package_revision: None,
     })
+}
+
+fn package_revision(root: &Path, anchor: &RootAnchor, entries: &[Entry]) -> String {
+    let mut revision = DefaultHasher::new();
+    for name in ["go.mod", "go.work"] {
+        anchor.inspect(root, &[name], 64 * 1024).hash(&mut revision);
+    }
+    let mut modules = 0;
+    for entry in entries.iter().filter(|entry| !entry.directory) {
+        let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+        if name == "go.mod" && entry.path != "go.mod" {
+            entry.path.hash(&mut revision);
+            if modules < 128 {
+                if let Ok(parts) = components(&entry.path) {
+                    anchor.inspect(root, &parts, 64 * 1024).hash(&mut revision);
+                }
+                modules += 1;
+            }
+        } else if name.ends_with(".go") {
+            entry.path.hash(&mut revision);
+        }
+    }
+    format!("{:016x}", revision.finish())
 }
 
 #[derive(Serialize)]
@@ -527,14 +541,45 @@ pub fn package_dir(root: &Path, package: &str) -> CommandResult<()> {
 
 #[tauri::command]
 pub async fn snapshot(state: State<'_, Core>, id: u64) -> CommandResult<Snapshot> {
-    let root = state.0.lock().unwrap().root(id)?.to_path_buf();
-    blocking(move || collect(&root)).await
+    let (root, anchor) = observation_root(&state, id)?;
+    blocking(move || {
+        anchor.verify(&root)?;
+        let mut snapshot = collect(&root)?;
+        snapshot.package_revision = Some(package_revision(&root, &anchor, &snapshot.entries));
+        anchor.verify(&root)?;
+        Ok(snapshot)
+    })
+    .await
+}
+
+pub(crate) fn observation_root(state: &Core, id: u64) -> CommandResult<(PathBuf, RootAnchor)> {
+    let session = state.0.lock().unwrap();
+    let root = session.root(id)?.to_path_buf();
+    let anchor = session.workspace.as_ref().unwrap().anchor.clone();
+    Ok((root, anchor))
+}
+
+#[tauri::command]
+pub async fn inspect_file(
+    state: State<'_, Core>,
+    id: u64,
+    path: String,
+) -> CommandResult<DiskObservation> {
+    let (root, anchor) = observation_root(&state, id)?;
+    blocking(move || Ok(anchor.inspect(&root, &components(&path)?, MAX_FILE_BYTES))).await
 }
 
 #[tauri::command]
 pub async fn read_file(state: State<'_, Core>, id: u64, path: String) -> CommandResult<String> {
-    let root = state.0.lock().unwrap().root(id)?.to_path_buf();
-    blocking(move || read_text(&root, &path, MAX_FILE_BYTES)).await
+    use DiskObservation::*;
+    match inspect_file(state, id, path).await? {
+        Text { text } => Ok(text),
+        Missing => Err("The file no longer exists.".into()),
+        Unavailable => {
+            Err("The file is unavailable. Open a regular UTF-8 text file smaller than 2 MB.".into())
+        }
+        Retry => Err("The file changed while opening. Try again.".into()),
+    }
 }
 
 #[tauri::command]
@@ -546,14 +591,18 @@ pub async fn save_file(
     expected: String,
     text: String,
 ) -> CommandResult<()> {
-    let root = state.0.lock().unwrap().root(id)?.to_path_buf();
+    let (root, anchor) = observation_root(&state, id)?;
     let data_dir = app
         .path()
         .app_local_data_dir()
         .map_err(|error| format!("Resolve save lock directory: {error}"))?;
     #[cfg(feature = "e2e")]
     state.1.wait().await?;
-    blocking(move || persist_text(&root, &data_dir, &path, &expected, &text)).await
+    blocking(move || {
+        anchor.verify(&root)?;
+        persist_text(&root, &data_dir, &path, &expected, &text)
+    })
+    .await
 }
 
 #[cfg(feature = "e2e")]
@@ -605,8 +654,8 @@ pub fn test_hold_save(state: State<'_, Core>, hold: Option<bool>) -> bool {
 
 #[tauri::command]
 pub async fn create_file(state: State<'_, Core>, id: u64, path: String) -> CommandResult<()> {
-    let root = state.0.lock().unwrap().root(id)?.to_path_buf();
-    blocking(move || new_file(&root, &path)).await
+    let (root, anchor) = observation_root(&state, id)?;
+    blocking(move || new_file(&root, &anchor, &path)).await
 }
 
 #[tauri::command]
@@ -636,8 +685,8 @@ mod tests {
             collect(&project.root).unwrap().module.as_deref(),
             Some("example.com/hello-go")
         );
-        new_file(&project.root, "sub/file.go").unwrap();
-        assert!(new_file(&project.root, "sub/file.go").is_err());
+        new_file(&project.root, &project.anchor, "sub/file.go").unwrap();
+        assert!(new_file(&project.root, &project.anchor, "sub/file.go").is_err());
         let profile = dir.path().join("profile");
         persist_text(&project.root, &profile, "sub/file.go", "", "package sub\n").unwrap();
         assert!(persist_text(&project.root, &profile, "sub/file.go", "", "oops").is_err());
@@ -686,7 +735,8 @@ mod tests {
         assert!(collect(&root).unwrap().entries.is_empty());
         assert!(read_text(&root, "../secret.txt", 1024).is_err());
         assert!(read_text(&root, "escape/secret.txt", 1024).is_err());
-        assert!(new_file(&root, "escape/other.txt").is_err());
+        let workspace = Workspace::open(&root).unwrap();
+        assert!(new_file(&workspace.root, &workspace.anchor, "escape/other.txt").is_err());
         assert!(package_dir(&root, "./escape/...").is_err());
     }
 

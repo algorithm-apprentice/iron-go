@@ -46,6 +46,8 @@ export interface DocumentTab {
   dirty: boolean;
   saving: boolean;
   reloadRevision: number;
+  reloading?: number;
+  diskChange?: "changed" | "missing" | "unavailable";
   viewState: monaco.editor.ICodeEditorViewState | null;
   subscription: monaco.IDisposable;
 }
@@ -56,6 +58,7 @@ export interface DocumentEvents {
   closed(tab: DocumentTab): void;
   edited(tab: DocumentTab): void;
   saved(tab: DocumentTab): void;
+  fileSettled?(): void;
 }
 
 export const bufferText = (model: monaco.editor.ITextModel) => model.getValue(undefined, true);
@@ -77,6 +80,7 @@ export class Documents {
   private location = 0;
   private edits = 0;
   private opening = new Map<string, Promise<string>>();
+  private applyingDisk?: DocumentTab;
 
   get editRevision() { return this.edits; }
 
@@ -203,6 +207,7 @@ export class Documents {
              path, model, disk, clean: bufferText(model), dirty: false, saving: false, reloadRevision: 0, viewState: null,
              subscription: model.onDidChangeContent(() => {
               this.edits++;
+              if (this.applyingDisk === created) return;
               const dirty = bufferText(model) !== created.clean;
               if (dirty !== created.dirty) {
                 created.dirty = dirty;
@@ -292,6 +297,7 @@ export class Documents {
       tab.disk = text;
       tab.clean = text;
       tab.dirty = bufferText(tab.model) !== text;
+      tab.diskChange = undefined;
       this.events.saved(tab);
       return true;
     } catch (error) {
@@ -299,7 +305,10 @@ export class Documents {
       throw error;
     } finally {
       tab.saving = false;
-      if (this.isLive(folder, tab)) this.events.changed();
+      if (this.isLive(folder, tab)) {
+        this.events.changed();
+        this.events.fileSettled?.();
+      }
     }
   }
 
@@ -321,14 +330,60 @@ export class Documents {
     const folder = this.folder;
     if (!folder || !this.isLive(folder, tab) || tab.saving) return false;
     const revision = ++tab.reloadRevision;
-    return this.applyFileResult(tab, folder, () => folder.read(tab.path), disk => {
-      tab.model.setValue(disk);
+    tab.reloading = revision;
+    try {
+      return await this.applyFileResult(tab, folder, () => folder.read(tab.path), disk => {
+        this.adoptDisk(tab, disk, false);
+      }, () => revision === tab.reloadRevision);
+    } finally {
+      if (tab.reloading === revision) tab.reloading = undefined;
+      if (this.isLive(folder, tab)) this.events.fileSettled?.();
+    }
+  }
+
+  async reconcile(tab: DocumentTab) {
+    const folder = this.folder;
+    if (!folder?.inspect || !this.isLive(folder, tab) || tab.saving || tab.reloading !== undefined) return true;
+    const version = tab.model.getVersionId();
+    const revision = tab.reloadRevision;
+    const observed = await folder.inspect(tab.path);
+    if (!this.isLive(folder, tab)) return true;
+    if (version !== tab.model.getVersionId() || revision !== tab.reloadRevision || observed.kind === "retry") return false;
+
+    let change: DocumentTab["diskChange"];
+    if (observed.kind === "text") {
+      if (observed.text !== tab.disk) {
+        if (!tab.dirty) {
+          this.adoptDisk(tab, observed.text, true);
+          return true;
+        }
+        change = "changed";
+      }
+    } else { change = observed.kind; }
+    if (tab.diskChange !== change) {
+      tab.diskChange = change;
+      this.events.changed();
+    }
+    return true;
+  }
+
+  private adoptDisk(tab: DocumentTab, disk: string, automatic: boolean) {
+    const view = automatic && this.active === tab ? this.editor.saveViewState() : null;
+    const bom = disk.startsWith("\ufeff");
+    const sameConvention = bom === tab.clean.startsWith("\ufeff") &&
+      (disk.match(/\r\n|\r|\n/g) ?? []).every(ending => ending === tab.model.getEOL());
+    this.applyingDisk = tab;
+    try {
+      if (automatic && sameConvention) replaceBuffer(tab.model, bom ? disk.slice(1) : disk);
+      else tab.model.setValue(disk);
       tab.disk = disk;
       tab.clean = bufferText(tab.model);
       tab.dirty = false;
-      this.events.changed();
-      this.events.saved(tab);
-    }, () => revision === tab.reloadRevision);
+      tab.diskChange = undefined;
+    } finally { this.applyingDisk = undefined; }
+    if (view) this.editor.restoreViewState(view);
+    this.events.changed();
+    this.events.saved(tab);
   }
 
   async format(tab: DocumentTab, format: (text: string) => Promise<string>) {

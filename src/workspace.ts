@@ -14,6 +14,7 @@ export interface NativeFolder { id: number; name: string; path: string }
 export interface RunTarget { package: string; importPath: string }
 export interface GoPackages { targets: RunTarget[]; allScopes: string[] }
 export type ServerEvent = { type: "message"; message: unknown } | { type: "closed"; reason: string };
+export type DiskObservation = { kind: "text"; text: string } | { kind: "missing" | "unavailable" | "retry" };
 
 function channel<T>(handler: (event: T) => void) {
   const stream = new Channel<T>();
@@ -30,6 +31,8 @@ export const host = {
   tools: () => invoke<ToolStatus>("go_tools"),
   format: (text: string) => invoke<string>("format_go", { text }),
   discoverPackages: (id: number) => invoke<GoPackages>("discover_packages", { id }),
+  startWatch: (id: number) => invoke<void>("start_workspace_watch", { id }),
+  waitWatch: (id: number, revision: number) => invoke<number | null>("wait_workspace_watch", { id, revision }),
   task: (id: number, kind: TaskKind, packages: string[], testName: string | undefined, handle: (event: TaskEvent) => void) =>
     invoke<void>("start_task", { id, kind, packages, testName, events: channel(handle) }),
   stop: (id: number) => invoke<void>("stop_task", { id }),
@@ -48,6 +51,7 @@ export interface Project {
   readonly welcome?: boolean;
   snapshot(): Promise<ProjectSnapshot>;
   read(path: string): Promise<string>;
+  inspect?(path: string): Promise<DiskObservation>;
   save(path: string, expected: string, text: string): Promise<void>;
   createFile(path: string): Promise<void>;
   search(query: string, caseSensitive: boolean): Promise<SearchResult>;
@@ -59,6 +63,7 @@ export function nativeProject(native: NativeFolder): Project {
     name: native.name, native,
     snapshot: () => invoke<ProjectSnapshot>("snapshot", { id }),
     read: (path) => invoke<string>("read_file", { id, path }),
+    inspect: (path) => invoke<DiskObservation>("inspect_file", { id, path }),
     save: (path, expected, text) => invoke<void>("save_file", { id, path, expected, text }),
     createFile: (path) => invoke<void>("create_file", { id, path }),
     search: (query, caseSensitive) => invoke<SearchResult>("search_files", { id, query, caseSensitive }),

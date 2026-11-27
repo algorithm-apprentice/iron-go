@@ -113,6 +113,7 @@ kbd { font: 11px/1.35 var(--mono); color: var(--muted); padding: 1px 5px; backgr
 .tab:not(.active):not(:hover):not(.dirty) .tab-close:not(:focus-visible) { opacity: 0; }
 .tab.dirty .tab-close:not(:hover):not(:focus-visible) svg { opacity: 0; }
 .tab.dirty .tab-close:not(:hover):not(:focus-visible)::after { content: ""; position: absolute; width: 7px; height: 7px; inset: 50% auto auto 50%; transform: translate(-50%, -50%); border-radius: 50%; background: var(--accent); }
+.tab[data-disk-change] .tab-main span { text-decoration: underline dotted var(--warning); text-underline-offset: 3px; }
 .editor-actions { display: flex; flex: none; align-items: center; gap: var(--control-gap); padding: 0 10px; }
 #toggle-panel[aria-pressed="true"] { color: var(--text); }
 .breadcrumbs { height: 22px; flex: none; display: flex; align-items: center; gap: 6px; padding: 0 13px; overflow: hidden; color: var(--muted); font-size: 12px; }
@@ -169,6 +170,7 @@ kbd { font: 11px/1.35 var(--mono); color: var(--muted); padding: 1px 5px; backgr
 .status-notice, .status-detail { display: flex; align-items: center; padding: 0 7px; color: var(--muted); }
 .status-notice { display: block; line-height: 27px; }
 .status-detail { flex: none; }
+#disk-change { color: var(--warning); }
 .tool-status { margin-right: 4px; }
 .status-dot { height: 6px; width: 6px; border-radius: 50%; background: var(--quiet); }
 .tool-status.good .status-dot { background: var(--success); }

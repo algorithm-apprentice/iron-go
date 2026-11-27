@@ -11,7 +11,7 @@ import { bindColorTheme, chooseColorTheme } from "./theme";
 import { basename, dirname, initialWorkspaceFile, makeTree, quickFiles, validateRelative, type FileMatch, type ProjectSnapshot, type TreeNode } from "./project-model";
 import { decideExit } from "./quit-flow";
 import { ExecutionLane } from "./execution";
-import { publishProjectSnapshot } from "./project-workflow";
+import { ProjectSnapshots } from "./project-workflow";
 import { createCursorTestWorkflow } from "./cursor-test-workflow";
 import { handleEditorCycle } from "./editor-shortcuts";
 import { desktop, host, importedProject, nativeProject, welcomeProject, type NativeFolder, type Project, type TaskKind, type ToolStatus } from "./workspace";
@@ -53,13 +53,25 @@ let searchGeneration = 0;
 let searchTimer: number | undefined;
 let toastTimer: number | undefined;
 let renderedActive: string | undefined;
+const snapshots = new ProjectSnapshots();
+let refreshDisk: ((tree?: boolean) => Promise<void>) | undefined;
+
+const diskMessage = {
+  changed: "File changed on disk",
+  missing: "File missing on disk",
+  unavailable: "File unavailable on disk",
+};
 
 const docs = new Documents(byId("editor"), {
   changed: renderDocuments,
-  opened: tab => { breakpoints.open(tab); lsp?.opened(tab); },
-  edited: tab => lsp?.edited(tab),
+  opened: tab => { breakpoints.open(tab); lsp?.opened(tab); void refreshDisk?.(); },
+  edited: tab => {
+    lsp?.edited(tab);
+    if (!tab.dirty && tab.diskChange === "changed") void refreshDisk?.();
+  },
   closed: tab => { breakpoints.close(tab); lsp?.closed(tab); queueMicrotask(renderProblems); },
   saved: tab => lsp?.saved(tab),
+  fileSettled: () => { void refreshDisk?.(); },
 });
 const execution = new ExecutionLane<NativeFolder, DebugSession>(syncControls);
 const { lookup: cursorTestLookup, projectWorkflow } = createCursorTestWorkflow(docs.editor, reserved => {
@@ -79,8 +91,12 @@ const saveBarrier = {
   async save() { for (const tab of docs.tabs.values()) if (tab.dirty) await docs.save(tab); },
 };
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") docs.refreshView();
+  if (document.visibilityState === "visible") {
+    docs.refreshView();
+    void refreshDisk?.(true);
+  }
 });
+window.addEventListener("focus", () => { void refreshDisk?.(true); });
 
 function status(text: string) { byId("status").textContent = text; }
 function toast(text: string, error = false) {
@@ -173,11 +189,12 @@ function renderDocuments() {
   for (const tab of docs.tabs.values()) {
     const selected = tab === active;
     const row = element("div", `tab${selected ? " active" : ""}${tab.dirty ? " dirty" : ""}`);
+    if (tab.diskChange) row.dataset.diskChange = tab.diskChange;
     row.setAttribute("role", "presentation");
     const name = element("button", "tab-main");
     name.type = "button";
     name.dataset.path = tab.path;
-    name.title = tab.path;
+    name.title = tab.diskChange ? `${tab.path} — ${diskMessage[tab.diskChange]}` : tab.path;
     name.setAttribute("role", "tab");
     name.setAttribute("aria-selected", String(selected));
     name.innerHTML = fileIcon(tab.path);
@@ -221,6 +238,9 @@ function renderDocuments() {
   byId("editor-toolbar").hidden = !!project.welcome;
   byId("empty-editor").hidden = !!active || !!project.welcome;
   byId("breadcrumbs").hidden = !active;
+  const disk = byId("disk-change");
+  disk.textContent = active?.diskChange ? diskMessage[active.diskChange] : "";
+  disk.hidden = !disk.textContent;
   updateCursor();
   syncControls();
 }
@@ -331,15 +351,78 @@ async function formatActive() {
 }
 
 function refresh() {
-  return publishProjectSnapshot(project, {
+  return snapshots.refresh(project, {
     current: () => project,
     read: target => target.snapshot(),
     apply(result) {
+      const packagesChanged = snapshot.packageRevision !== undefined && result.packageRevision !== snapshot.packageRevision;
+      const treeChanged = result.truncated !== snapshot.truncated || result.module !== snapshot.module || result.goWork !== snapshot.goWork ||
+        result.entries.length !== snapshot.entries.length || result.entries.some((entry, index) => {
+          const previous = snapshot.entries[index];
+          return entry.path !== previous.path || entry.directory !== previous.directory;
+        });
       snapshot = result;
-      tree = makeTree(result.entries);
-      renderExplorer();
+      if (treeChanged) {
+        tree = makeTree(result.entries);
+        renderExplorer();
+        palette.refreshFiles();
+      }
+      if (packagesChanged) void runTargets.refresh();
     },
     fail: showError,
+  });
+}
+
+function watchProject(target: Project) {
+  const folder = target.native;
+  if (!folder) return;
+  let pending = false;
+  let treePending = false;
+  let running: Promise<void> | undefined;
+
+  function request(tree = false) {
+    if (project !== target) return Promise.resolve();
+    pending = true;
+    treePending ||= tree;
+    return running ??= reconcile();
+  }
+
+  async function reconcile() {
+    try {
+      await new Promise(resolve => window.setTimeout(resolve, 120));
+      if (project !== target) return;
+      pending = false;
+      const updateTree = treePending;
+      treePending = false;
+      if (updateTree) await refresh();
+      for (const tab of [...docs.tabs.values()]) {
+        if (project !== target) return;
+        if (!await docs.reconcile(tab)) pending = true;
+      }
+    } catch (error) {
+      if (project === target) showError(error);
+    } finally {
+      running = undefined;
+      if (pending && project === target) void request();
+    }
+  }
+
+  refreshDisk = request;
+  void (async () => {
+    await host.startWatch(folder.id);
+    let revision = 0;
+    while (project === target) {
+      await request(true);
+      if (project !== target) return;
+      const observed = await host.waitWatch(folder.id, revision);
+      if (observed === null) return;
+      revision = observed;
+    }
+  })().catch(error => {
+    if (project !== target) return;
+    feedback.row(message(error), "quiet", "info");
+    toast("File watching is unavailable. Use Refresh Project to check for changes.", true);
+    return request(true);
   });
 }
 
@@ -348,6 +431,7 @@ async function install(target: Project) {
   clearExecutionLine();
   breakpoints.reset();
   const previousLsp = lsp;
+  refreshDisk = undefined;
   lsp = undefined;
   project = target;
   previousLsp?.dispose();
@@ -375,6 +459,7 @@ async function install(target: Project) {
   status("Opening workspace…");
   await refresh();
   if (target !== project) return;
+  if (target.native) void runTargets.refresh();
   const initial = initialWorkspaceFile(snapshot.entries);
   if (initial) {
     try { await docs.open(initial); revealParents(initial); }
@@ -389,6 +474,7 @@ async function install(target: Project) {
   status(target.welcome ? "Open or create a project" : target.native ? "Ready" : "Browser copy");
   updateTools();
   maybeStartLsp();
+  watchProject(target);
 }
 
 const transitionReady = () => !filesBusy() && !execution.preparing;
@@ -711,7 +797,8 @@ function showSettings() { byId<HTMLDialogElement>("settings-dialog").showModal()
 
 function refreshProject() {
   if (projectWorkflow.busy || project.welcome) return;
-  void refresh();
+  if (refreshDisk) void refreshDisk(true);
+  else void refresh();
   void runTargets.refresh();
 }
 
@@ -742,12 +829,12 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Color Theme: Dark", icon: "settings", run: () => chooseColorTheme("dark") },
     { label: "Color Theme: Light", icon: "settings", run: () => chooseColorTheme("light") },
   ];
-  const paths = snapshot.entries.filter(entry => !entry.directory).map(entry => entry.path);
   palette.show(workspaceOnly ? "Project actions" : command ? "Type a command" : "Type a path to go to a file", query => {
     if (workspaceOnly || query.startsWith(">")) {
       const words = query.replace(/^>/, "").toLowerCase().trim().split(/\s+/);
       return actions.filter(action => (!workspaceOnly || action.workspace) && words.every(word => action.label.toLowerCase().includes(word)));
     }
+    const paths = snapshot.entries.filter(entry => !entry.directory).map(entry => entry.path);
     return quickFiles(paths, query).map(path => ({ label: basename(path), detail: dirname(path), icon: "file", path, run: () => { void openFile(path); } }));
   }, command && !workspaceOnly ? ">" : "");
 }
