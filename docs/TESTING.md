@@ -79,6 +79,14 @@ Start with the
 first failed assertion, not a blind retry. Save fixture changes as tests
 when they explain a regression.
 
+For geometry changes, test both the interactive target and the thing inside
+it. A correctly sized button can contain a misaligned SVG; a correctly
+aligned Monaco row can still have an oversized gutter. Include native
+WKWebView assertions for styling decisions that may differ from Chromium
+(for example a flex-sized grid button or a native select). Use compact
+real rendering fixtures and pass larger boundary values to the layout
+calculation rather than generating large files solely to exercise a formula.
+
 GitHub Actions runs the full feedback loop for pushes to `main` and pull
 requests on a macOS runner and attaches available diagnostics to the run.
 A separate Go 1.27.x workflow runs the Go and Debug groups weekly and on

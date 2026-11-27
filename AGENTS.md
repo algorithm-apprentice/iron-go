@@ -3,6 +3,10 @@
 Iron Go ships for **macOS only**. `../iron-cpp` is a read-only architecture,
 ADR, and native-acceptance reference, not a build dependency.
 
+Write source comments, user-facing strings, documentation, and commit
+messages in clear technical English. Keep intentional Unicode test data
+when it is needed to exercise editor behavior.
+
 ## Design and test first
 
 1. Read [the architecture](docs/ARCHITECTURE.md) and relevant [ADRs](docs/adr/README.md).

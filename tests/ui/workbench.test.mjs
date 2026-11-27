@@ -367,6 +367,178 @@ test("an imported test fixture uses the real workbench and quick open", async ()
   });
 });
 
+test("keyboard cycles open editors in order without dropping unsaved edits", async () => {
+  await scenario("keyboard-editor-cycle", async page => {
+    const active = name => page.getByRole("tab", { name, exact: true, selected: true }).waitFor({ timeout: 2500 });
+    await page.locator("#editor textarea.inputarea").focus();
+    await page.keyboard.insertText("// keyboard edit\n");
+    const savedCaret = await page.locator("#cursor").innerText();
+    await page.locator('#explorer [data-path="go.mod"]').click();
+    await active("go.mod");
+    await page.locator('#explorer [data-path="README.md"]').click();
+    await active("README.md");
+    await page.keyboard.press("Meta+Shift+BracketRight");
+    await active("main.go");
+    assert.equal(await page.locator('.tab.dirty [data-path="cmd/orbit/main.go"]').count(), 1);
+    assert.equal(await page.locator("#cursor").innerText(), savedCaret);
+    assert.equal(await page.locator("#editor textarea.inputarea").evaluate(input => input === document.activeElement), true);
+    assert.equal(await page.evaluate(() => !document.dispatchEvent(new KeyboardEvent("keydown", { code: "BracketRight", key: "[", metaKey: true, shiftKey: true, bubbles: true, cancelable: true }))), true);
+    await active("go.mod");
+    await page.keyboard.press("Meta+Shift+BracketRight");
+    await active("README.md");
+    await page.keyboard.press("Meta+Shift+BracketLeft");
+    await active("go.mod");
+    await page.locator("#settings").click();
+    assert.equal(await page.evaluate(() => document.dispatchEvent(new KeyboardEvent("keydown", { code: "BracketLeft", key: "[", metaKey: true, shiftKey: true, bubbles: true, cancelable: true }))), true);
+    await active("go.mod");
+  });
+});
+
+test("caret lookup wiring drops restored cursor, model and reservation intents before dispatch", async () => {
+  await documentScenario("caret-test-wiring", async page => {
+    const calls = await page.evaluate(async () => {
+      const { documents: docs, workflowFixture: { createCursorTestWorkflow, ExecutionLane } } = window;
+      const { lookup, projectWorkflow } = createCursorTestWorkflow(docs.editor, () => {});
+      const executions = new ExecutionLane(() => {});
+      const calls = [];
+      docs.reset({ read: async () => "package main\n\nfunc TestA() {}\n" });
+      await docs.open("first_test.go", { target: { lineNumber: 3, column: 1 } });
+      await docs.open("second_test.go");
+      docs.cycle(-1);
+      async function deferred(event, mayLaunch = () => true) {
+        const request = Promise.withResolvers();
+        const settled = lookup.resolve(() => request.promise, () => true, value => calls.push(value), {
+          available: mayLaunch, blocked: () => calls.push("busy"),
+        });
+        await event();
+        request.resolve("TestA");
+        await settled;
+      }
+      await deferred(() => {
+        docs.editor.setPosition({ lineNumber: 1, column: 1 });
+        docs.editor.setPosition({ lineNumber: 3, column: 1 });
+      });
+      await deferred(() => { docs.cycle(1); docs.cycle(-1); });
+      await deferred(() => projectWorkflow.transition({ ready: () => true, confirm: async () => false, choose: async () => undefined, install: async () => {} }));
+      await deferred(() => executions.start("project", "run", { revision: () => 0, save: async () => {}, dirty: () => false }, async () => {}), () => !executions.occupied);
+      return calls;
+    });
+    assert.deepEqual(calls, ["busy"]);
+  });
+});
+
+test("editor cycling wins activation over an earlier pending file read", async () => {
+  await documentScenario("cycle-supersedes-open", async page => {
+    const result = await page.evaluate(async () => {
+      const { documents: docs } = window;
+      const deferred = Promise.withResolvers();
+      docs.reset({ read: path => path === "later.go" ? deferred.promise : Promise.resolve(path) });
+      await docs.open("first.go");
+      const single = docs.cycle(1);
+      await docs.open("second.go");
+      const pending = docs.open("later.go", { focus: true });
+      const cycled = docs.cycle(1);
+      deferred.resolve("later.go");
+      await pending;
+      return { single, cycled, active: docs.active.path, open: [...docs.tabs.keys()] };
+    });
+    assert.deepEqual(result, { single: false, cycled: true, active: "first.go", open: ["first.go", "second.go", "later.go"] });
+  });
+});
+
+test("the gutter stays stable through 999 lines and expands one digit at a time through seven digits", async () => {
+  await documentScenario("line-number-gutter-width", async page => {
+    const { sizes, simulated } = await page.evaluate(async () => {
+      const { documents: docs } = window;
+      const sizes = [];
+      for (const lines of [9, 10, 99, 100, 999, 1000, 1001]) {
+        docs.reset({ read: async () => `package main${"\n".repeat(lines - 1)}// last line` });
+        await docs.open("gutter.go");
+        const editor = docs.editor;
+        editor.setScrollTop(0);
+        editor.render(true);
+        const { glyphMarginWidth, lineNumbersWidth, contentLeft } = editor.getLayoutInfo();
+        function edges() {
+          return [...editor.getDomNode().querySelectorAll(".margin-view-overlays .line-numbers")].map(number => {
+            const range = document.createRange();
+            range.selectNodeContents(number);
+            return { line: number.textContent, right: range.getBoundingClientRect().right,
+              cell: number.getBoundingClientRect().right, align: getComputedStyle(number).textAlign };
+          });
+        }
+        const selected = edges();
+        editor.setScrollTop(editor.getTopForLineNumber(lines), 1);
+        editor.render(true);
+        sizes.push({ lines, count: editor.getModel().getLineCount(), glyphMarginWidth, lineNumbersWidth, contentLeft, edges: [...selected, ...edges()] });
+      }
+      const simulated = [999, 1000, 9999, 10000, 99999, 100000, 999999, 1000000, 1000001].map(window.gutterLayoutForCount);
+      return { sizes, simulated };
+    });
+    const short = sizes.slice(0, 5);
+    const four = sizes.slice(5);
+    assert.ok(sizes.every(size => size.count === size.lines));
+    assert.ok(short.every(size => size.lineNumbersWidth === short[0].lineNumbersWidth));
+    const step = four[0].lineNumbersWidth - short[0].lineNumbersWidth;
+    assert.ok(step > 0 && step <= 9);
+    assert.equal(four[0].lineNumbersWidth, four[1].lineNumbersWidth);
+    assert.equal(four[0].contentLeft - short[0].contentLeft, step);
+    assert.ok(sizes.every(size => size.glyphMarginWidth === short[0].glyphMarginWidth &&
+      size.contentLeft - size.lineNumbersWidth - size.glyphMarginWidth === 24));
+    assert.equal(short[0].glyphMarginWidth, 18);
+    assert.ok(sizes.every(size => size.edges.length && size.edges.every(edge =>
+      edge.align === "right" && Math.abs(edge.right - edge.cell) <= 0.5)));
+    for (const target of ["9", "10", "99", "100", "999", "1000"]) {
+      assert.ok(sizes.some(size => size.edges.some(edge => edge.line === target)), `rendered ${target}`);
+    }
+    assert.equal(simulated[0].lineNumbersWidth, short[0].lineNumbersWidth);
+    assert.equal(simulated[1].lineNumbersWidth, four[0].lineNumbersWidth);
+    for (const [index, size] of simulated.entries()) {
+      assert.equal(size.contentLeft - size.lineNumbersWidth - size.glyphMarginWidth, 24);
+      if (index === 0) continue;
+      const previous = simulated[index - 1];
+      const increment = size.lineNumbersWidth - previous.lineNumbersWidth;
+      if ([1, 3, 5, 7].includes(index)) assert.ok(increment > 0 && increment <= 9);
+      else assert.equal(increment, 0);
+      assert.equal(size.contentLeft - previous.contentLeft, increment);
+    }
+  });
+});
+
+test("the tighter gutter still leaves the code fold control clickable", async () => {
+  await documentScenario("tight-gutter-fold", async page => {
+    await page.evaluate(async () => {
+      const docs = window.documents;
+      docs.reset({ read: async () => "package main\n\nfunc main() {\n\tprintln(1)\n\tprintln(2)\n}\n" });
+      const tab = await docs.open("fold.go");
+      const { monaco } = window.workflowFixture;
+      monaco.editor.setModelMarkers(tab.model, "fixture", [{ startLineNumber: 4, startColumn: 2, endLineNumber: 4,
+        endColumn: 9, message: "fixture marker", severity: monaco.MarkerSeverity.Error }]);
+    });
+    const expanded = page.locator("#editor .margin-view-overlays .codicon-folding-expanded").first();
+    await expanded.waitFor({ timeout: 5000 });
+    await expanded.hover();
+    await expanded.click({ position: { x: 6, y: 9 } });
+    const collapsed = page.locator("#editor .margin-view-overlays .codicon-folding-collapsed").first();
+    await collapsed.waitFor({ timeout: 5000 });
+    assert.equal(await page.locator("#editor .view-lines").innerText().then(text => text.includes("println(1)")), false);
+    await collapsed.click({ position: { x: 6, y: 9 } });
+    await expanded.waitFor({ timeout: 5000 });
+    assert.match(await page.locator("#editor .view-lines").innerText(), /println\(1\)/);
+    const underline = page.locator("#editor .squiggly-error").first();
+    await underline.waitFor({ timeout: 5000 });
+    assert.ok(await underline.evaluate(marker => {
+      const line = [...document.querySelectorAll("#editor .view-lines .view-line")].find(row => row.textContent.includes("println(1)"));
+      const row = line.getBoundingClientRect();
+      const lineInk = document.createRange();
+      lineInk.selectNodeContents(line.firstElementChild);
+      const ink = lineInk.getBoundingClientRect();
+      const squiggle = marker.getBoundingClientRect();
+      return row.height === 18 && ink.top >= row.top && ink.bottom <= row.bottom &&
+        squiggle.width > 0 && squiggle.bottom <= row.bottom;
+    }));
+  });
+});
+
 test("an imported file becomes dirty, saves in memory, and is searchable", async () => {
   await scenario("edit-save-search", async page => {
     await page.locator('#explorer [data-path="README.md"]').click();
@@ -465,7 +637,7 @@ test("adjacent workbench controls and visible dividers use a one-pixel gap", asy
       for (const gap of gaps) assert.ok(Math.abs(gap - 1) < 0.1, `${group} gap: expected 1px, got ${gap}px`);
     };
     const horizontalGroups = [".title-actions", ".editor-actions", ".panel-tabs", ".panel-actions", "#explorer-view .inline-actions"];
-    for (const group of horizontalGroups) await check(group);
+    for (const group of horizontalGroups) await check(group, false, "button, select, input, .run-picker-field");
     await page.locator('#explorer [data-path="go.mod"]').click();
     await page.getByRole("tab", { name: "go.mod", selected: true }).waitFor();
     await check("#tabs", false, ".tab");
@@ -481,7 +653,7 @@ test("adjacent workbench controls and visible dividers use a one-pixel gap", asy
     await check("#form-dialog .dialog-actions");
     await page.getByRole("button", { name: "Cancel", exact: true }).click();
     await page.setViewportSize({ width: 650, height: 560 });
-    for (const group of horizontalGroups) await check(group);
+    for (const group of horizontalGroups) await check(group, false, "button, select, input, .run-picker-field");
     assert.equal((await page.locator("#sidebar-resize").boundingBox()).width, 1);
   });
 });
@@ -498,5 +670,112 @@ test("the app title bar stays 36 pixels at normal and compact widths", async () 
       assert.ok(command.y >= bounds.y && command.y + command.height <= bounds.y + bounds.height);
       assert.ok(Math.abs((command.x + command.width / 2) - (bounds.x + bounds.width / 2)) < 1);
     }
+  });
+});
+
+test("compact chrome returns room to code without shrinking button targets", async () => {
+  await scenario("compact-chrome-bounds", async page => {
+    const box = selector => page.locator(selector).first().boundingBox();
+    for (const [width, height, rail, side, panelHeight, editorHeight] of [[1320, 820, 44, 220, 188.2, 512.8], [760, 600, 36, 196, 120, 361], [650, 560, 34, 175, 112, 332]]) {
+      await page.setViewportSize({ width, height });
+      assert.equal((await box(".activity-bar")).width, rail);
+      const action = await box(".activity");
+      assert.ok(action.width >= rail - 1 && action.height >= 36);
+      assert.equal((await box("#sidebar")).width, side);
+      assert.equal((await box("#explorer-view .side-header")).height, 32);
+      assert.equal((await box("#new-file")).height, 25);
+      assert.equal((await box(".tree-row")).height, 27);
+      assert.equal((await box("#sidebar-resize")).width, 1);
+      const editor = await box("#editor");
+      assert.equal(editor.width, width - rail - side - 1);
+      assert.ok(Math.abs(editor.height - editorHeight) < 0.1, `editor height at ${width}: ${editor.height}`);
+      assert.equal((await box("#editor-toolbar")).height, 32);
+      assert.equal((await box("#breadcrumbs")).height, 22);
+      assert.equal((await box(".panel-header")).height, 32);
+      assert.ok(Math.abs((await box("#panel")).height - panelHeight) < 0.1);
+      assert.equal((await box("#run-target")).height, 26);
+      assert.equal((await box(".tab-close")).width, 24);
+      assert.equal((await box(".tab-close")).height, 24);
+      await page.locator("#toggle-sidebar").click();
+      assert.equal(await box("#sidebar-resize"), null);
+      assert.equal((await box("#editor")).width, width - rail);
+      await page.locator("#settings").focus();
+      await page.keyboard.press("Tab");
+      assert.equal(await page.evaluate(() => !!document.activeElement?.closest("#sidebar,#sidebar-resize")), false);
+      await page.getByRole("button", { name: "Search", exact: true }).focus();
+      await page.keyboard.press("Enter");
+      assert.equal(await page.locator("#search-text").evaluate(el => el === document.activeElement), true);
+      assert.equal((await box("#search-case")).height, 24);
+      await page.getByRole("button", { name: "Run and Test", exact: true }).click();
+      for (const control of ["#refresh-targets", "#package-scope", "[data-task=test]"]) {
+        const bounds = await box(control);
+        const sidebar = await box("#sidebar");
+        assert.ok(bounds.x >= sidebar.x && bounds.x + bounds.width <= sidebar.x + sidebar.width);
+      }
+      await page.getByRole("button", { name: "Project", exact: true }).click();
+    }
+    const header = await box(".panel-header");
+    for (const selector of ["#output-tab", "#problems-tab", "#clear-output", "#hide-panel"]) {
+      const bounds = await box(selector);
+      assert.ok(bounds.y >= header.y && bounds.y + bounds.height <= header.y + header.height);
+    }
+    assert.ok(await page.locator("#output-pane").evaluate(pane => {
+      pane.querySelector("#output-log").append(document.createTextNode("sample output\n".repeat(30)));
+      pane.scrollTop = pane.scrollHeight;
+      return pane.clientHeight > 0 && pane.scrollTop > 0;
+    }));
+  });
+});
+
+test("Run Target's disabled styling dims the field and the chevron in both themes", async () => {
+  await scenario("disabled-run-target-style", async page => {
+    const picker = page.locator("#run-target");
+    const appearance = () => picker.evaluate(select => {
+      const wrapper = select.parentElement;
+      const arrow = getComputedStyle(wrapper, "::after");
+      return { opacity: Number(getComputedStyle(wrapper).opacity), caret: arrow.borderRightColor, disabled: select.disabled };
+    });
+    const dark = await appearance();
+    await page.locator("#settings").click();
+    await page.locator("#theme-setting").selectOption("light");
+    await page.locator('[data-dialog-close="settings-dialog"]').click();
+    const light = await appearance();
+    assert.ok(dark.disabled && light.disabled);
+    assert.ok(dark.opacity < 1 && light.opacity < 1);
+    assert.notEqual(dark.caret, light.caret);
+  });
+});
+
+test("resized chrome keeps its chosen dimensions across hiding and reopening", async () => {
+  await scenario("compact-chrome-resize", async page => {
+    await page.setViewportSize({ width: 760, height: 600 });
+    const width = selector => page.locator(selector).boundingBox().then(box => box.width);
+    const height = selector => page.locator(selector).boundingBox().then(box => box.height);
+    const divider = page.locator("#sidebar-resize");
+    const start = await divider.boundingBox();
+    const initialEditor = await width("#editor");
+    await page.mouse.move(start.x + .5, start.y + 100);
+    await page.mouse.down();
+    await page.mouse.move(start.x + 20, start.y + 100);
+    await page.mouse.up();
+    const dragged = await width("#sidebar");
+    assert.ok(dragged > 196);
+    await divider.focus();
+    await page.keyboard.press("ArrowRight");
+    const chosen = await width("#sidebar");
+    assert.equal(chosen, dragged + 14);
+    assert.equal(await width("#editor"), initialEditor - (chosen - 196));
+    await page.locator("#toggle-sidebar").click();
+    await page.locator("#toggle-sidebar").click();
+    assert.equal(await width("#sidebar"), chosen);
+    await page.locator("#panel-resize").focus();
+    const panel = await height("#panel");
+    const editor = await height("#editor");
+    await page.keyboard.press("ArrowUp");
+    assert.equal(await height("#panel"), panel + 14);
+    assert.equal(await height("#editor"), editor - 14);
+    await page.locator("#toggle-panel").click();
+    await page.locator("#toggle-panel").click();
+    assert.equal(await height("#panel"), panel + 14);
   });
 });

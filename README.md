@@ -1,10 +1,10 @@
 # Iron Go
 
-Iron Go 是一款面向 **macOS** 的轻量 Go IDE。工作台参考 VS Code，桌面架构沿用 Iron C++ 的 Tauri 2 + Monaco 思路，Go 模块和工具链由 Go 自身管理。
+Iron Go is a lightweight Go IDE for **macOS**. Its workbench takes cues from VS Code and follows Iron C++'s Tauri 2 and Monaco architecture. The Go toolchain owns module and workspace management.
 
-## 快速开始
+## Quick start
 
-环境：macOS 15+、Node.js 24+、Rust stable、Xcode Command Line Tools、Go。`gopls` 可选，安装后启用语言服务。Go 1.25 可使用 `gopls@v0.20.0`；使用较新的 Go 工具链时也可安装 `gopls@latest`。
+Requirements: macOS 15 or later, Node.js 24 or later, stable Rust, Xcode Command Line Tools, and Go. Install the optional `gopls` language server for completion and other language services. Go 1.25 works with `gopls@v0.20.0`; with a newer Go toolchain, you can install `gopls@latest`.
 
 ```sh
 npm ci
@@ -12,34 +12,34 @@ go install golang.org/x/tools/gopls@v0.20.0
 npm run tauri dev
 ```
 
-启动后，从欢迎页选择 **Open Project** 打开 Go 模块或 `go.work` 工作区，或点 **New Project** 创建 Go 模块。右上角会自动选中项目中唯一的可执行目标；有多个时，请先选择。**Run and Test** 默认构建或测试所有本地包，也可选当前包，或在 **Advanced** 手动填路径。要返回欢迎页，在项目菜单或命令面板选择 **Close Project**。
+From the welcome screen, select **Open Project** to open a Go module or `go.work` workspace, or **New Project** to create a module. The editor toolbar selects the executable automatically if there is only one; otherwise, choose a run target. **Run and Test** builds or tests all local packages by default. You can also use the current package or enter a custom scope under **Advanced**. To return to the welcome screen, choose **Close Project** from the project menu or command palette.
 
-对没有可执行包的 Go 库，右上角会显示 **Test**，直接运行选定范围的测试。
+For libraries without an executable package, the toolbar offers **Test** to run tests in the selected scope.
 
-从 Finder 启动时也会查找 Homebrew、Go 官方安装路径和 `~/go/bin` 等常见位置。在右下角的工具状态中可以重新检测。
+When launched from Finder, Iron Go also searches common tool locations, including Homebrew, the official Go installation path, and `~/go/bin`. Select the tool status in the bottom-right corner, then **Check tools**, to probe again.
 
-## 当前功能
+## Features
 
-- 文件树、多标签、脏状态、撤销、保存冲突保护、文件名快速打开与已保存文件全文搜索。
-- Monaco Go 高亮；`gofmt` 格式化当前缓冲区，不自动保存。
-- Dark / Light 配色，可在 **Settings → Color Theme**（`⌘,`）切换并记住选择。
-- `gopls` 补全、悬停文档、工作区内定义跳转及 Problems 面板。`_test.go` 文件中的测试函数旁可以点 **Run Test** 单独运行。
-- Go 测试调试：`brew install delve` 后，在设置里重新检测工具。点击 Go 行号左侧或按 `F9` 设置断点，再从测试函数旁点 **Debug Test**；支持继续、单步跳过和停止。
-- `go build` / `go run` / `go test`，真实输出、退出状态和进程停止。仅在显式运行任务时执行项目代码，请只运行可信项目。
-- 快捷键：`⌘O` 打开项目，`⌘P` 快速打开，`⇧⌘P` 命令面板，`⌘S` 保存，`⇧⌘F` 搜索，`⇧⌥F` 格式化，`⌘↵` 运行/停止，`⌘B` 侧栏，`⌘J` 底部面板。
+- File tree, editor tabs, unsaved-change indicators, undo, save conflict protection, quick file navigation, and full-text search across saved files.
+- Go syntax highlighting in Monaco. `gofmt` formats the current buffer without saving it.
+- Dark and light themes, saved through **Settings → Color Theme** (`⌘,`).
+- `gopls` completion, hover documentation, workspace definition navigation, and diagnostics in the Problems panel. Run a named test through its **Run Test** CodeLens or **Go: Run Test at Cursor** in the command palette.
+- Go test debugging with Delve. Install it with `brew install delve` and probe for tools again in Settings. Set a breakpoint to the left of a Go line number or press `F9`, then use **Debug Test** or **Go: Debug Test at Cursor**. Continue, step over, and stop are supported.
+- `go build`, `go run`, and `go test` with live output, exit status, and task cancellation. Run only trusted projects.
+- Keyboard shortcuts: `⌘O` opens a project, `⌘P` opens a file, `⇧⌘P` opens the command palette, `⌘S` saves, `⇧⌘F` searches saved files, `⇧⌥F` formats, and `⌘↵` runs or stops a task. `⇧⌘[` and `⇧⌘]` cycle editors; `⌘B` and `⌘J` toggle the sidebar and bottom panel.
 
-目前的 Delve 调试仅支持命名的 Go 测试，没有任意进程附加、交互式终端、自动文件监控或 Windows 支持。`npm run dev` 仅启动浏览器预览，不能执行本机 Go 工具，也不会写回导入的本地目录。
+Delve debugging is limited to named Go tests. Iron Go does not support arbitrary process attachment, an interactive terminal, automatic file watching, or Windows. `npm run dev` starts a browser preview; it cannot run local Go tools or write back to imported folders.
 
-## 构建与测试
+## Build and test
 
 ```sh
-npm run tauri build -- --bundles app  # 本机 .app，未配置签名和公证
-npx playwright install chromium      # 首次运行 UI 测试时安装
-npm run test:feedback                # 单元 + 无头工作台 + 原生 macOS 验收
+npm run tauri build -- --bundles app  # Local .app; signing and notarization are not configured
+npx playwright install chromium      # Install before the first UI test run
+npm run test:feedback                # Unit, headless workbench, and native macOS acceptance tests
 ```
 
-各层测试命令及失败产物见 [测试说明](docs/TESTING.md)。开发约定是先写设计和验收条件、再以失败测试驱动实现：见 [AGENTS.md](AGENTS.md)、[架构](docs/ARCHITECTURE.md) 和 [ADR](docs/adr/README.md)。
+See the [testing guide](docs/TESTING.md) for individual test commands and failure artifacts. Write the design and acceptance criteria before implementation, then start with a failing regression test. See [AGENTS.md](AGENTS.md), the [architecture](docs/ARCHITECTURE.md), and the [architecture decision records](docs/adr/README.md).
 
-## 许可证
+## License
 
-Iron Go 源代码按 [Apache License 2.0](LICENSE) 发布。第三方依赖仍适用各自的许可证；重新分发应用时须遵守适用的第三方许可和声明要求。
+Iron Go source code is available under the [Apache License 2.0](LICENSE). Third-party dependencies retain their own licenses. Redistribution must comply with applicable third-party license and notice requirements.

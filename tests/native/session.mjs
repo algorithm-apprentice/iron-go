@@ -51,6 +51,15 @@ async function chooseCommand(command) {
   await click("#palette-options button");
 }
 
+async function prepareKeyboardCommand(command) {
+  await js("document.dispatchEvent(new KeyboardEvent('keydown', { key: 'P', metaKey: true, shiftKey: true, bubbles: true, cancelable: true })); return true;");
+  await eventually("keyboard command palette focused", () => js("return document.activeElement?.id === 'palette-text';"));
+  await set("#palette-text", `>${command}`);
+  await eventually("keyboard command selected", () => js("return document.querySelector('#palette-options [aria-current=true]')?.textContent?.toLowerCase();"), value => value?.includes(command));
+}
+
+const enterKeyboardCommand = () => js("document.querySelector('#palette-text').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); return true;");
+
 async function assertLineAlignment() {
   const { text: source } = await current();
   const lines = source.split(/\r?\n/);
@@ -113,6 +122,25 @@ async function placeBreakpoint(line) {
     if (document.querySelector('#editor .debug-breakpoint')) return true;
     return { scroll: window.scrollY, viewport: window.innerHeight, editor: document.querySelector('#editor').getBoundingClientRect().toJSON(), visible:document.querySelectorAll('.view-line').length, gutters:document.querySelectorAll('.line-numbers').length, cursor:document.querySelector('#cursor').textContent };
   `), value => value === true);
+}
+
+async function clickGlyphBreakpoint(line) {
+  const hit = await js(`
+    const line = arguments[0];
+    window.__ironTest.revealLine(line);
+    const gutter = document.querySelector('#editor .glyph-margin').getBoundingClientRect();
+    const number = [...document.querySelectorAll('#editor .line-numbers')].find(row => row.textContent.trim() === String(line))?.getBoundingClientRect();
+    if (!number) return null;
+    const x = gutter.left + gutter.width / 2;
+    const y = number.top + number.height / 2;
+    const target = document.elementFromPoint(x, y);
+    const options = { bubbles: true, cancelable: true, view: window, button: 0, clientX: x, clientY: y };
+    target.dispatchEvent(new MouseEvent('mousedown', { ...options, buttons: 1 }));
+    target.dispatchEvent(new MouseEvent('mouseup', { ...options, buttons: 0 }));
+    return { width: gutter.width, hit: window.__ironTest.gutterTrace().hit };
+  `, line);
+  assert.deepEqual(hit, { width: 18, hit: { line, type: "GUTTER_GLYPH_MARGIN" } });
+  await eventually("clicked glyph created breakpoint", () => js("return !!document.querySelector('#editor .debug-breakpoint');"));
 }
 
 async function traceGutterClick(line) {
@@ -471,14 +499,16 @@ async function lifecycleSuite() {
       const keys = [
         {key:'r',metaKey:true}, {key:'R',metaKey:true,shiftKey:true}, {key:'F5'},
         {key:'l',metaKey:true}, {key:'=',metaKey:true}, {key:'-',metaKey:true}, {key:'0',metaKey:true},
-        {key:'f',metaKey:true}, {key:'[',metaKey:true}, {key:'c',metaKey:true}, {key:'ArrowLeft',altKey:true},
+        {key:'=',code:'Equal',metaKey:true,shiftKey:true}, {key:'+',code:'Equal',metaKey:true,shiftKey:true},
+        {key:'-',code:'Minus',metaKey:true,shiftKey:true}, {key:'f',metaKey:true}, {key:'[',metaKey:true},
+        {key:'c',metaKey:true}, {key:'ArrowLeft',altKey:true},
       ];
       return keys.map(options => {
         const event = new KeyboardEvent('keydown', {...options,bubbles:true,cancelable:true});
         document.dispatchEvent(event); return event.defaultPrevented;
       });
     `);
-    assert.deepEqual(result, [true, true, true, true, true, true, true, false, false, false, false]);
+    assert.deepEqual(result, [true, true, true, true, true, true, true, true, true, false, false, false, false, false]);
   });
   await record("native workbench opens a disposable folder", async () => {
     const state = await openOrbit();
@@ -498,6 +528,58 @@ async function fileSuite() {
   const profileLock = path.join(home, "Library/Application Support/dev.irongo.e2e/save.lock");
   let lockInode;
   await openOrbit();
+  await record("native compact chrome gives the editor more room without clipping controls", async () => {
+    const assertIconCenters = async () => {
+      const positions = await js(`return [...document.querySelectorAll('button.activity, button.icon-button')].flatMap(button => {
+        const svg = button.querySelector('svg');
+        const rect = button.getBoundingClientRect();
+        if (!svg || !rect.width || !rect.height) return [];
+        const icon = svg.getBoundingClientRect();
+        return [{ name: button.id || button.getAttribute('aria-label'), activity: button.matches('.activity'), height: rect.height,
+          x: icon.x + icon.width / 2 - rect.x - rect.width / 2,
+          y: icon.y + icon.height / 2 - rect.y - rect.height / 2 }];
+      });`);
+      assert.equal(positions.filter(icon => icon.activity).length, 4, "measure every activity icon");
+      for (const { name, activity, height, x, y } of positions) {
+        if (activity) assert.equal(height, 36, `${name}: button keeps its 36px hit area`);
+        assert.ok(Math.abs(x) <= 0.5 && Math.abs(y) <= 0.5,
+          `${name}: icon is ${x}px horizontally and ${y}px vertically from center`);
+      }
+    };
+    const dimensions = () => js(`
+      const box = selector => document.querySelector(selector).getBoundingClientRect();
+      const editor = box('#editor');
+      return { viewport: innerWidth, height: innerHeight, rail: box('.activity-bar').width, side: box('#sidebar').width,
+        divider: box('#sidebar-resize').width, editor: [editor.width, editor.height], header: box('#editor-toolbar').height,
+        breadcrumb: box('#breadcrumbs').height, panelHeader: box('.panel-header').height, select: box('#run-target').height,
+        close: [box('.tab-close').width, box('.tab-close').height], panel: box('#panel').height };
+    `);
+    for (const [width, height, rail, side, editorWidth] of [[1320, 820, 44, 220, 1055], [760, 600, 36, 196, 527]]) {
+      await js("void window.__ironTest.resize(arguments[0], arguments[1]); return true;", width, height);
+      // macOS may cap the height to the current display's available frame.
+      const size = await eventually("window reaches requested width", dimensions, r => r.viewport === width && r.height <= height);
+      const panel = Math.max(112, Math.min(214, size.height * .31 - 66));
+      const editorHeight = size.height - 36 - 28 - 32 - 22 - panel - 1;
+      assert.equal(size.rail, rail);
+      assert.equal(size.side, side);
+      assert.equal(size.divider, 1);
+      assert.equal(size.editor[0], editorWidth);
+      assert.ok(Math.abs(size.editor[1] - editorHeight) < 0.1);
+      assert.ok(Math.abs(size.panel - panel) < 0.1);
+      assert.deepEqual([size.header, size.breadcrumb, size.panelHeader, size.select, ...size.close], [32, 22, 32, 26, 24, 24]);
+      await assertIconCenters();
+    }
+    await click("#toggle-sidebar");
+    const collapsed = await dimensions();
+    assert.deepEqual([collapsed.rail, collapsed.side, collapsed.divider, collapsed.editor[0]], [36, 0, 0, 724]);
+    await assertIconCenters();
+    await assertLineAlignment();
+    await click("#toggle-sidebar");
+    await assertLineAlignment();
+    await click('[data-view="search"]');
+    assert.equal(await js("return document.querySelector('#search-case').getBoundingClientRect().height;"), 24);
+    await click('[data-view="explorer"]');
+  });
   await checkTheme();
 
   await record("formats only the buffer, then saves actual disk bytes", async () => {
@@ -537,6 +619,36 @@ async function fileSuite() {
       await chooseCommand("reload file from disk");
       await eventually("confirmed reload reads the real disk", current, state => state?.text === external && !state.dirty);
     } finally { await js("window.confirm = window.__realConfirm; delete window.__realConfirm; return true;"); }
+  });
+  await record("native gutter grows for four digits, and line 1000 selects the whole line", async () => {
+    for (const lines of [999, 1001]) {
+      const source = ["package main", ...Array.from({ length: lines - 1 }, (_, index) => `// line ${index + 2}`)].join("\n");
+      await writeFile(path.join(fixture, `gutter${lines}.go`), source);
+    }
+    await click("#refresh-files");
+    await eventually("gutter fixtures in the tree", () => js("return !!document.querySelector('#explorer [data-path=\"gutter1001.go\"]');"));
+    const sizes = [];
+    for (const lines of [999, 1001]) {
+      const name = `gutter${lines}.go`;
+      await click(`#explorer [data-path="${name}"]`);
+      const state = await eventually("gutter fixture active", current, state => state?.path === name);
+      assert.equal(state.text.split("\n").length, lines);
+      sizes.push(await eventually("visible native gutter columns", () => js(`
+        const editor = document.querySelector('#editor .monaco-editor');
+        const number = [...editor.querySelectorAll('.line-numbers')].find(row => row.textContent.trim() === '1');
+        const code = [...editor.querySelectorAll('.view-line')].find(row => row.textContent.startsWith('package'));
+        if (!number || !code) return null;
+        const rect = number.getBoundingClientRect();
+        return { width: rect.width, gap: code.getBoundingClientRect().left - rect.right,
+          margin: code.getBoundingClientRect().left - editor.getBoundingClientRect().left,
+          lane: editor.querySelector('.glyph-margin').getBoundingClientRect().width, row: code.getBoundingClientRect().height };
+      `)));
+    }
+    const step = sizes[1].width - sizes[0].width;
+    assert.ok(step > 0 && step <= 9);
+    assert.deepEqual(sizes.map(size => [size.gap, size.lane, size.row]), [[24, 18, 18], [24, 18, 18]]);
+    assert.ok(sizes[0].margin <= 66 && sizes[1].margin <= 74, JSON.stringify(sizes));
+    await traceGutterClick(1000);
   });
 }
 
@@ -634,6 +746,26 @@ async function goSuite() {
     await record("whole-line selection highlights the selected number, not its endpoint", () => traceGutterClick(9));
   }
   await goScopeCases();
+  if (capabilities.gopls) {
+    await record("keyboard command runs only the test at a dirty renamed declaration", async () => {
+      await openTestFile();
+      const before = await current();
+      assert.match(before.text, /func TestSummary/);
+      assert.match(before.text, /func TestAnother/);
+      await prepareKeyboardCommand("run test at cursor");
+      await js(`
+        window.__ironTest.replace(arguments[0]);
+        window.__ironTest.revealLine(9);
+        document.querySelector('#palette-text').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+        return true;
+      `, before.text.replace("func TestSummary(", "func TestKeyboardRenamed("));
+      const result = await eventually("renamed test executes through keyboard command", output,
+        value => /PASS: TestKeyboardRenamed[\s\S]*exit code 0/.test(value), 30_000);
+      assert.doesNotMatch(result, /PASS: TestAnother|PASS: TestSummary/);
+    });
+  } else {
+    report.cases.push({ name: "keyboard command runs only the test at a dirty renamed declaration", result: "skip", reason: "gopls not installed" });
+  }
 }
 
 async function openTestFile() {
@@ -663,9 +795,12 @@ async function debugSuite() {
   await probeTools({ gopls: true, delve: true });
   await openOrbit();
   await openTestFile();
-      await record("Delve pauses at a real editor breakpoint and continues the test", async () => {
-        await placeBreakpoint(9);
-        await clickCodeLens("Debug TestSummary");
+      await record("Debug Test at Cursor pauses at a real breakpoint and continues the test", async () => {
+        await clickGlyphBreakpoint(9);
+        await eventually("gopls ready for caret test", current, state => state?.gopls === "ready", 30_000);
+        await js("window.__ironTest.revealLine(9); return true;");
+        await prepareKeyboardCommand("debug test at cursor");
+        await enterKeyboardCommand();
         await eventually("debuggee stops on line 9", () => text("#status"), value => /Breakpoint hit.*report_test\.go:9/.test(value), 60_000);
         await click("#debug-next");
         await eventually("stepped to the next source line", () => text("#status"), value => /Paused.*report_test\.go:(10|11)/.test(value), 15_000);

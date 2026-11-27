@@ -66,7 +66,7 @@ export class Documents {
       model: null, theme: "vs-dark", automaticLayout: true, editContext: false,
       accessibilitySupport: "off", ariaLabel: "Code editor content", fontSize: 13,
       fontFamily: '"SF Mono", Menlo, Monaco, Consolas, monospace', fontLigatures: false,
-      lineHeight: 22, lineNumbersMinChars: 4, padding: { top: 10, bottom: 8 },
+      lineHeight: 18, lineNumbersMinChars: 3, lineDecorationsWidth: 8, padding: { top: 10, bottom: 8 },
       glyphMargin: true,
       renderLineHighlight: "all", scrollBeyondLastLine: false, roundedSelection: false,
       minimap: { enabled: true, renderCharacters: false, showSlider: "mouseover", maxColumn: 75 },
@@ -223,6 +223,16 @@ export class Documents {
       }
     }
     if (focus) this.editor.focus();
+  }
+
+  cycle(direction: 1 | -1) {
+    if (!this.active || this.tabs.size < 2) return false;
+    const tabs = [...this.tabs.values()];
+    const index = tabs.indexOf(this.active);
+    if (index < 0) return false;
+    this.location++;
+    this.activate(tabs[(index + direction + tabs.length) % tabs.length], true);
+    return true;
   }
 
   private remove(tab: DocumentTab) {

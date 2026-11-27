@@ -3,14 +3,26 @@
 <title>Document operation fixture</title>
 <div id="editor" style="width: 800px; height: 600px"></div>
 <script type="module">
-  import { Documents, bufferText } from "../../../src/editor.ts";
+  import { Documents, bufferText, monaco } from "../../../src/editor.ts";
+  import { EditorLayoutInfoComputer } from "monaco-editor/editor/common/config/editorOptions.js";
   import { DebugSession } from "../../../src/debugger.ts";
   import { ExecutionLane } from "../../../src/execution.ts";
+  import { createCursorTestWorkflow } from "../../../src/cursor-test-workflow.ts";
 
   const notify = () => {};
   window.documents = new Documents(document.querySelector("#editor"), {
     changed: notify, opened: notify, closed: notify, edited: notify, saved: notify,
   });
   window.documentState = tab => ({ text: bufferText(tab.model), disk: tab.disk, dirty: tab.dirty });
-  window.workflowFixture = { DebugSession, ExecutionLane };
+  window.gutterLayoutForCount = count => {
+    const editor = window.documents.editor;
+    const { width, height } = editor.getLayoutInfo();
+    const font = editor.getOption(monaco.editor.EditorOption.fontInfo);
+    return EditorLayoutInfoComputer.computeLayout(editor.getOptions(), {
+      outerWidth: width, outerHeight: height, lineHeight: font.lineHeight, lineNumbersDigitCount: String(count).length,
+      typicalHalfwidthCharacterWidth: font.typicalHalfwidthCharacterWidth, maxDigitWidth: font.maxDigitWidth,
+      pixelRatio: devicePixelRatio, viewLineCount: count, isDominatedByLongLines: false, glyphMarginDecorationLaneCount: 1,
+    });
+  };
+  window.workflowFixture = { DebugSession, ExecutionLane, createCursorTestWorkflow, monaco };
 </script>

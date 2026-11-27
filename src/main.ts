@@ -11,7 +11,9 @@ import { bindColorTheme, chooseColorTheme } from "./theme";
 import { basename, dirname, initialWorkspaceFile, makeTree, quickFiles, validateRelative, type FileMatch, type ProjectSnapshot, type TreeNode } from "./project-model";
 import { decideExit } from "./quit-flow";
 import { ExecutionLane } from "./execution";
-import { ProjectWorkflow, publishProjectSnapshot } from "./project-workflow";
+import { publishProjectSnapshot } from "./project-workflow";
+import { createCursorTestWorkflow } from "./cursor-test-workflow";
+import { handleEditorCycle } from "./editor-shortcuts";
 import { desktop, host, importedProject, nativeProject, welcomeProject, type NativeFolder, type Project, type TaskKind, type ToolStatus } from "./workspace";
 
 type View = "explorer" | "search" | "tasks";
@@ -60,10 +62,14 @@ const docs = new Documents(byId("editor"), {
   saved: tab => lsp?.saved(tab),
 });
 const execution = new ExecutionLane<NativeFolder, DebugSession>(syncControls);
-const projectWorkflow = new ProjectWorkflow(reserved => {
+const { lookup: cursorTestLookup, projectWorkflow } = createCursorTestWorkflow(docs.editor, reserved => {
   docs.editor.updateOptions({ readOnly: reserved });
   syncControls();
 });
+
+function cycleEditor(direction: 1 | -1) {
+  return !projectWorkflow.busy && docs.cycle(direction);
+}
 
 const filesBusy = () => docs.saving || formatting || fileMutations !== 0;
 const fileActionsBlocked = () => projectWorkflow.busy || execution.preparing;
@@ -631,6 +637,28 @@ async function stopTask() {
   catch (error) { showError(error); }
 }
 
+async function testAtCursor(kind: "run" | "debug") {
+  cursorTestLookup.invalidate();
+  const target = project;
+  const tab = docs.active;
+  const caret = docs.editor.getPosition();
+  const language = lsp;
+  if (!target.native) { toast("Running or debugging Go tests requires an open native project."); return; }
+  if (!tab?.path.endsWith("_test.go") || !caret) { toast("Place the cursor inside a Go test function."); return; }
+  if (!language || gopls !== "ready") { toast("Go test lookup needs gopls to be ready."); return; }
+  const available = () => !execution.occupied && !projectWorkflow.busy && !filesBusy();
+  const blocked = () => toast("Wait for the current operation before launching a test.");
+  if (!available()) { blocked(); return; }
+  const version = tab.model.getVersionId();
+  await cursorTestLookup.resolve(() => language.namedTestAt(tab.model, caret),
+    () => project === target && docs.active === tab && lsp === language && !tab.model.isDisposed() && version === tab.model.getVersionId(),
+    name => {
+      if (!name) { toast("No Go test function at the cursor."); return; }
+      if (kind === "run") void runTask("test", { path: tab.path, name });
+      else void debugTest(tab.path, name);
+    }, { available, blocked });
+}
+
 function updateTools() {
   const toolStatus = btn("tool-status");
   const version = tools?.goVersion?.replace(/^go/, "Go ");
@@ -686,6 +714,8 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Open Project…", detail: "⌘O", icon: "folderOpen", run: openFolder, workspace: true },
     { label: "New Project…", icon: "package", run: newModule, workspace: true },
     { label: "Close Project", icon: "close", run: closeProject, workspace: true },
+    { label: "Next Editor", detail: "⇧⌘]", icon: "files", run: () => cycleEditor(1) },
+    { label: "Previous Editor", detail: "⇧⌘[", icon: "files", run: () => cycleEditor(-1) },
     { label: "New File…", icon: "filePlus", run: newFile, workspace: true },
     { label: "Refresh Project", icon: "refresh", run: () => { void refresh(); }, workspace: true },
     { label: "Collapse Folders", icon: "folder", run: () => { opened.clear(); renderExplorer(); }, workspace: true },
@@ -697,6 +727,8 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Go: Choose Run Target", icon: "package", run: () => runTargets.picker.focus() },
     { label: "Go: Build Packages", icon: "hammer", run: () => { void runTask("build"); } },
     { label: "Go: Run Tests", icon: "flask", run: () => { void runTask("test"); } },
+    { label: "Go: Run Test at Cursor", icon: "flask", run: () => { void testAtCursor("run"); } },
+    { label: "Go: Debug Test at Cursor", icon: "play", run: () => { void testAtCursor("debug"); } },
     { label: "Go: Stop Task", icon: "stop", run: stopTask },
     { label: "Toggle Sidebar", detail: "⌘B", icon: "files", run: toggleSidebar },
     { label: "Toggle Bottom Panel", detail: "⌘J", icon: "layout", run: () => feedback.toggle() },
@@ -825,7 +857,8 @@ function nativeBrowserShortcut(event: KeyboardEvent) {
   if (event.altKey || event.ctrlKey) return false;
   if (!event.metaKey) return event.key === "F5";
   const key = event.key.toLowerCase();
-  if (key === "r" || key === "+") return true;
+  // WKWebView can report Command-Shift-Plus as the unshifted Equal key.
+  if (key === "r" || key === "+" || (key === "=" && event.code === "Equal" && event.shiftKey)) return true;
   return !event.shiftKey && ["l", "=", "-", "0"].includes(key);
 }
 
@@ -836,7 +869,9 @@ document.addEventListener("keydown", event => {
     event.stopPropagation();
     return;
   }
-  if (document.querySelector("dialog[open]") && event.key !== "Escape") return;
+  const modal = !!document.querySelector("dialog[open]");
+  if (handleEditorCycle(event, modal || projectWorkflow.busy, direction => docs.cycle(direction))) return;
+  if (modal && event.key !== "Escape") return;
   const key = event.key.toLowerCase();
   const cmd = event.metaKey || (!desktop && event.ctrlKey);
   let apply: (() => unknown) | undefined;

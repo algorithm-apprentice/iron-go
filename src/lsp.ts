@@ -1,17 +1,14 @@
-import { AbstractMessageReader, AbstractMessageWriter, createMessageConnection, type DataCallback, type Message, type MessageConnection } from "vscode-jsonrpc/lib/browser/main.js";
+import { AbstractMessageReader, AbstractMessageWriter, CancellationToken, createMessageConnection, type DataCallback, type Message, type MessageConnection } from "vscode-jsonrpc/lib/browser/main.js";
 import { SymbolKind, type CompletionItem, type CompletionList, type Diagnostic, type DocumentSymbol, type Hover, type Location, type LocationLink, type MarkedString, type MarkupContent, type Range, type SymbolInformation } from "vscode-languageserver-types";
 import { message } from "./dialogs";
 import { monaco, type DocumentTab, type Documents } from "./editor";
 import { host, type NativeFolder } from "./workspace";
+import { goTestAt, isGoTestFunction } from "./go-test-target";
 
 export type LanguageState = "idle" | "missing" | "starting" | "ready" | "failed";
 const markerOwner = "gopls";
 export const runTestCommand = "irongo.runGoTest";
 export const debugTestCommand = "irongo.debugGoTest";
-
-function isTestFunction(name: string) {
-  return /^Test[\p{L}\p{Nd}_]*$/u.test(name) && !/^Test\p{Ll}/u.test(name);
-}
 
 // Tauri carries decoded messages; vscode-jsonrpc owns request IDs, responses,
 // cancellation, and dispatch. Only this transport adapter knows about IPC.
@@ -204,6 +201,15 @@ export class GoLanguage {
     } catch { return undefined; }
   }
 
+  private symbols(model: monaco.editor.ITextModel, token: monaco.CancellationToken) {
+    return this.request<(DocumentSymbol | SymbolInformation)[] | null>("textDocument/documentSymbol", model, undefined, token);
+  }
+
+  async namedTestAt(model: monaco.editor.ITextModel, position: monaco.Position) {
+    const symbols = await this.symbols(model, CancellationToken.None);
+    return goTestAt(symbols ?? [], { line: position.lineNumber - 1, character: position.column - 1 });
+  }
+
   private registerProviders(triggers: string[]) {
     this.providers.push(monaco.languages.registerCompletionItemProvider("go", {
       triggerCharacters: triggers,
@@ -238,9 +244,9 @@ export class GoLanguage {
       provideCodeLenses: async (model, token) => {
         const path = this.docs.relative(model.uri);
         if (!path?.endsWith("_test.go")) return { lenses: [] };
-        const symbols = await this.request<(DocumentSymbol | SymbolInformation)[] | null>("textDocument/documentSymbol", model, undefined, token);
+        const symbols = await this.symbols(model, token);
         return { lenses: (symbols ?? []).flatMap(symbol => {
-          if (symbol.kind !== SymbolKind.Function || !isTestFunction(symbol.name)) return [];
+          if (symbol.kind !== SymbolKind.Function || !isGoTestFunction(symbol.name)) return [];
           const range = fromRange("selectionRange" in symbol ? symbol.selectionRange : symbol.location.range);
           const args = [this.folder.id, path, symbol.name];
           return [
