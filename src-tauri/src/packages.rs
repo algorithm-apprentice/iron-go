@@ -14,7 +14,8 @@ use tokio::{
 };
 
 use crate::{
-    tools::{command, ProcessGroup},
+    process_owner::{OwnedChild, ProcessGroup},
+    tools::command,
     CommandResult, Core,
 };
 
@@ -40,14 +41,6 @@ impl Drop for Discovery {
         if let Some(group) = slot.group.take() {
             group.kill();
         }
-    }
-}
-
-struct ListProcess(Arc<ProcessGroup>);
-
-impl Drop for ListProcess {
-    fn drop(&mut self) {
-        self.0.kill();
     }
 }
 
@@ -110,7 +103,7 @@ async fn list<T: DeserializeOwned>(
     processes: &Processes,
     args: &[&str],
 ) -> CommandResult<Vec<T>> {
-    let (mut child, guard) = {
+    let mut child = {
         let mut slot = processes.lock().unwrap();
         if slot.cancelled {
             return Err("Package discovery stopped.".into());
@@ -124,21 +117,17 @@ async fn list<T: DeserializeOwned>(
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("Start go list: {error}"))?;
-        let group = ProcessGroup::from_pid(child.id().unwrap());
-        slot.group = Some(group.clone());
-        (child, ListProcess(group))
+        let child = OwnedChild::new(child);
+        slot.group = Some(child.group.clone());
+        child
     };
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let stdout = child.child.stdout.take().unwrap();
+    let stderr = child.child.stderr.take().unwrap();
     let (stdout, stderr, status) = tokio::time::timeout(Duration::from_secs(8), async {
         tokio::try_join!(
             bounded(stdout, MAX_METADATA),
             bounded(stderr, 64 * 1024),
-            async {
-                let result = child.wait().await.map_err(|error| error.to_string());
-                guard.0.disarm();
-                result
-            }
+            async { child.wait().await.map_err(|error| error.to_string()) }
         )
     })
     .await

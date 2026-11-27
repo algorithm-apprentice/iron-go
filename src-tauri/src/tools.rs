@@ -1,19 +1,18 @@
 use std::{
-    env, fs,
+    env, fs, io,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
-    process::Stdio,
-    sync::{
-        atomic::{AtomicI32, Ordering},
-        Arc,
-    },
+    process::{Output, Stdio},
     time::Duration,
 };
 
 use serde::Serialize;
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::{self as async_io, AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 
-use crate::{workspace::MAX_FILE_BYTES, CommandResult};
+use crate::{process_owner::OwnedChild, workspace::MAX_FILE_BYTES, CommandResult, Core};
 
 pub fn command(tool: &str) -> CommandResult<Command> {
     let mut paths = env::split_paths(&env::var_os("PATH").unwrap_or_default())
@@ -56,26 +55,88 @@ pub fn command(tool: &str) -> CommandResult<Command> {
     Ok(command)
 }
 
-// Go Run starts a compiled program underneath the toolchain process. Stop the
-// whole group, not just `go`, and allow workspace switch/quit to kill it even
-// when the async runtime is about to shut down.
-pub struct ProcessGroup(AtomicI32);
-
-impl ProcessGroup {
-    pub fn from_pid(pid: u32) -> Arc<Self> {
-        Arc::new(Self(AtomicI32::new(pid as i32)))
-    }
-
-    pub fn kill(&self) {
-        let pid = self.0.swap(0, Ordering::AcqRel);
-        if pid > 0 {
-            // SAFETY: a positive child pid, negated to address its process group.
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
+pub(crate) async fn short_output(
+    _core: &Core,
+    command: &mut Command,
+    input: Option<String>,
+    deadline: Duration,
+    tool: &str,
+) -> CommandResult<Output> {
+    #[cfg(feature = "e2e")]
+    let mut lease = crate::acceptance::ShortTool::admit(_core)?;
+    let child = command
+        .process_group(0)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Start {tool}: {error}"))?;
+    let mut child = OwnedChild::new(child);
+    #[cfg(feature = "e2e")]
+    lease.require_proof();
+    let stdin = child.child.stdin.take();
+    let mut stdout = child.child.stdout.take().unwrap();
+    let mut stderr = child.child.stderr.take().unwrap();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let result = tokio::time::timeout(deadline, async {
+        let (written, read_out, read_err) = tokio::join!(
+            async move {
+                if let (Some(mut pipe), Some(text)) = (stdin, input) {
+                    pipe.write_all(text.as_bytes()).await?;
+                }
+                Ok::<_, io::Error>(())
+            },
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err),
+        );
+        read_out.and(read_err)?;
+        // Keep the leader unreaped until EOF on both pipes. On a timeout
+        // an inherited pipe can still belong to a live member of this group.
+        Ok::<_, io::Error>((written, child.wait().await?))
+    })
+    .await;
+    match result {
+        Ok(Ok((written, status))) => {
+            #[cfg(feature = "e2e")]
+            lease.confirm_cleanup();
+            if status.success() {
+                written.map_err(|error| error.to_string())?;
+            }
+            Ok(Output {
+                status,
+                stdout: out,
+                stderr: err,
+            })
         }
-    }
-
-    pub fn disarm(&self) {
-        self.0.store(0, Ordering::Release);
+        failure => {
+            child.group.kill();
+            let cleanup = tokio::time::timeout(Duration::from_secs(1), async {
+                let mut out_sink = async_io::sink();
+                let mut err_sink = async_io::sink();
+                tokio::try_join!(
+                    child.wait(),
+                    async_io::copy(&mut stdout, &mut out_sink),
+                    async_io::copy(&mut stderr, &mut err_sink)
+                )
+            })
+            .await;
+            match cleanup {
+                Ok(Ok(_)) => {
+                    #[cfg(feature = "e2e")]
+                    lease.confirm_cleanup();
+                }
+                _ => return Err(format!("Could not verify {tool} cleanup.")),
+            }
+            Err(match failure {
+                Ok(Err(error)) => error.to_string(),
+                _ => format!("{tool} timed out."),
+            })
+        }
     }
 }
 
@@ -89,54 +150,49 @@ pub struct GoTools {
 }
 
 #[tauri::command]
-pub async fn go_tools() -> GoTools {
+pub async fn go_tools(_state: tauri::State<'_, crate::Core>) -> CommandResult<GoTools> {
+    #[cfg(feature = "e2e")]
+    _state.0.lock().unwrap().acceptance.check()?;
     let go_version = if let Ok(mut go) = command("go") {
-        tokio::time::timeout(
-            Duration::from_secs(3),
-            go.env("GOTOOLCHAIN", "local").arg("version").output(),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|text| text.split_whitespace().nth(2).map(str::to_owned))
+        go.env("GOTOOLCHAIN", "local").arg("version");
+        short_output(&_state, &mut go, None, Duration::from_secs(3), "go version")
+            .await
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .and_then(|text| text.split_whitespace().nth(2).map(str::to_owned))
     } else {
         None
     };
-    GoTools {
+    Ok(GoTools {
         go_version,
         gofmt: command("gofmt").is_ok(),
         gopls: command("gopls").is_ok(),
         delve: command("dlv").is_ok(),
-    }
+    })
 }
 
 #[tauri::command]
-pub async fn format_go(text: String) -> CommandResult<String> {
+pub async fn format_go(state: tauri::State<'_, Core>, text: String) -> CommandResult<String> {
+    format_text(&state, text).await
+}
+
+async fn format_text(core: &Core, text: String) -> CommandResult<String> {
     if text.len() as u64 > MAX_FILE_BYTES {
         return Err("The buffer is too large to format.".into());
     }
-    let mut child = command("gofmt")?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Start gofmt: {error}"))?;
-    let mut stdin = child.stdin.take().unwrap();
-    let output = tokio::time::timeout(Duration::from_secs(8), async {
-        let (written, output) = tokio::join!(
-            async move { stdin.write_all(text.as_bytes()).await },
-            child.wait_with_output(),
-        );
-        let output = output.map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-        }
-        written.map_err(|error| error.to_string())?;
-        String::from_utf8(output.stdout).map_err(|error| error.to_string())
-    });
-    output.await.map_err(|_| "gofmt timed out.".to_owned())?
+    let output = short_output(
+        core,
+        &mut command("gofmt")?,
+        Some(text),
+        Duration::from_secs(8),
+        "gofmt",
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    String::from_utf8(output.stdout).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -146,13 +202,14 @@ mod tests {
         if super::command("gofmt").is_err() {
             return;
         }
+        let core = crate::Core::default();
         assert_eq!(
-            super::format_go("package main\nfunc main(){ }".into())
+            super::format_text(&core, "package main\nfunc main(){ }".into())
                 .await
                 .unwrap(),
             "package main\n\nfunc main() {}\n"
         );
-        assert!(super::format_go("package main\nfunc {".into())
+        assert!(super::format_text(&core, "package main\nfunc {".into())
             .await
             .is_err());
     }

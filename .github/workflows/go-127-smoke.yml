@@ -1,0 +1,49 @@
+name: macOS Go 1.27 smoke
+
+on:
+  schedule:
+    - cron: '27 9 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Install compatible Go tools
+        run: |
+          go install golang.org/x/tools/gopls@v0.24.0
+          go install github.com/go-delve/delve/cmd/dlv@v1.27.2
+      - name: Log resolved tool versions
+        run: |
+          go version
+          "$(go env GOPATH)/bin/gopls" version
+          "$(go env GOPATH)/bin/dlv" version
+      - run: npm ci
+      - name: Run isolated Go and Debug groups
+        run: npm run test:native -- --group go --group debug --require-gopls --require-delve
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-go-127-smoke
+          path: test-results/
+          if-no-files-found: ignore

@@ -3,27 +3,28 @@ import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { bufferText, monaco, replaceBuffer, type Documents } from "./editor";
 import type { LanguageState } from "./lsp";
+import { host } from "./workspace";
+
+declare global {
+  interface Window { __ironTestRuntimeErrors?: () => { kind: string; detail: string }[] }
+}
 
 export function installAcceptance(docs: Documents, workbench: {
   root(): string | undefined;
   gopls(): LanguageState;
   quitRequests(): number;
 }) {
-  const runtimeErrors: string[] = [];
   let gutterHit: { line: number | null; type: string } | undefined;
   let selectionSource: string | undefined;
   docs.editor.onMouseDown(event => {
     gutterHit = { line: event.target.position?.lineNumber ?? null, type: monaco.editor.MouseTargetType[event.target.type] };
   });
   docs.editor.onDidChangeCursorSelection(event => { selectionSource = event.source; });
-  window.addEventListener("error", event => {
-    runtimeErrors.push(`${event.message} ${event.error?.stack ?? ""}`);
-    if (runtimeErrors.length > 10) runtimeErrors.shift();
-  });
   Object.assign(window, { __ironTest: {
     snapshot: () => ({ root: workbench.root(), path: docs.active?.path, text: docs.active && bufferText(docs.active.model), dirty: docs.active?.dirty,
       markers: docs.active ? monaco.editor.getModelMarkers({ resource: docs.active.model.uri }) : [], gopls: workbench.gopls(),
-      editor: { width: docs.editor.getLayoutInfo().width, height: docs.editor.getLayoutInfo().height, scrollTop: docs.editor.getScrollTop(), contentHeight: docs.editor.getContentHeight(), runtimeErrors } }),
+      editor: { width: docs.editor.getLayoutInfo().width, height: docs.editor.getLayoutInfo().height, scrollTop: docs.editor.getScrollTop(), contentHeight: docs.editor.getContentHeight(), runtimeErrors: window.__ironTestRuntimeErrors?.() } }),
+    toolProbe: host.tools,
     replace: (value: string) => { if (docs.active) replaceBuffer(docs.active.model, value); },
     gutterTrace: (inspect: number[] = []) => {
       const selection = docs.editor.getSelection();

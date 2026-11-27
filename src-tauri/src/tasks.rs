@@ -2,10 +2,11 @@ use std::{io, process::Stdio, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::Channel, AppHandle, Manager, State};
-use tokio::{io::AsyncReadExt, process::Child, sync::oneshot};
+use tokio::{io::AsyncReadExt, sync::oneshot};
 
 use crate::{
-    tools::{command, ProcessGroup},
+    process_owner::{OwnedChild, ProcessGroup},
+    tools::command,
     workspace::package_dir,
     CommandResult, Core,
 };
@@ -133,19 +134,19 @@ pub async fn start_task(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("Start Go task: {error}"))?;
-    let group = ProcessGroup::from_pid(child.id().unwrap());
+    let child = OwnedChild::new(child);
     let (send, receive) = oneshot::channel();
     let task_id = session.next_id();
     session.task = Some(RunningTask {
         id: task_id,
         stop: Some(send),
-        group: group.clone(),
+        group: child.group.clone(),
     });
     tauri::async_runtime::spawn(async move {
         let _ = events.send(TaskEvent::Started {
             command: format!("go {}{flags} {}", kind.verb(), packages.join(" ")),
         });
-        let finished = supervise(child, receive, &group, |event| {
+        let finished = supervise(child, receive, |event| {
             let _ = events.send(event);
         })
         .await;
@@ -189,20 +190,19 @@ fn output(emit: &mut impl FnMut(TaskEvent), budget: &mut usize, bytes: &[u8], st
 }
 
 async fn supervise(
-    mut child: Child,
+    mut child: OwnedChild,
     mut stop: oneshot::Receiver<()>,
-    group: &ProcessGroup,
     mut emit: impl FnMut(TaskEvent),
 ) -> TaskEvent {
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
+    let mut stdout = child.child.stdout.take().unwrap();
+    let mut stderr = child.child.stderr.take().unwrap();
     let (mut out, mut err) = ([0; 4096], [0; 4096]);
     let (mut has_stdout, mut has_stderr) = (true, true);
     let mut budget = MAX_OUTPUT;
     let (status, cancelled) = loop {
         tokio::select! {
             _ = &mut stop => {
-                group.kill();
+                child.group.kill();
                 break (child.wait().await, true);
             }
             status = child.wait() => break (status, false),
@@ -214,7 +214,6 @@ async fn supervise(
             }
         }
     };
-    group.disarm();
     if !cancelled {
         // Drain output written just before exit, without waiting forever for
         // an unrelated process that inherited the descriptors.
@@ -300,10 +299,9 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let group = ProcessGroup::from_pid(child.id().unwrap());
         let (_send, receive) = oneshot::channel();
         let mut bytes = vec![];
-        let event = supervise(child, receive, &group, |event| {
+        let event = supervise(OwnedChild::new(child), receive, |event| {
             if let TaskEvent::Output { bytes: data, .. } = event {
                 bytes.extend(data);
             }
@@ -327,12 +325,11 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let group = ProcessGroup::from_pid(child.id().unwrap());
         let (send, receive) = oneshot::channel();
         send.send(()).unwrap();
         let event = tokio::time::timeout(
             Duration::from_secs(2),
-            supervise(child, receive, &group, |_| {}),
+            supervise(OwnedChild::new(child), receive, |_| {}),
         )
         .await
         .unwrap();

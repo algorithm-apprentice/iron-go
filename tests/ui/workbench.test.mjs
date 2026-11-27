@@ -6,6 +6,7 @@ import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { build, preview } from "vite";
+import { runtimeClean } from "../native/plan.mjs";
 
 let server, browser, url, assets;
 const fixture = fileURLToPath(new URL("../fixtures/orbit", import.meta.url));
@@ -55,6 +56,24 @@ async function scenario(name, run, withProject = true, entry = "") {
     await context.close();
   }
 }
+
+test("the native startup oracle rejects real uncaught errors and promise rejections", async () => {
+  const page = await browser.newPage();
+  try {
+    await page.addInitScript({ path: fileURLToPath(new URL("../native/acceptance-errors.js", import.meta.url)) });
+    await page.goto(url);
+    runtimeClean(await page.evaluate(() => window.__ironTestRuntimeErrors()));
+    await page.evaluate(() => {
+      setTimeout(() => { throw new Error("fixture uncaught exception"); });
+      void Promise.reject(new Error("fixture unhandled rejection"));
+    });
+    await page.waitForFunction(() => window.__ironTestRuntimeErrors().length === 2);
+    const observed = await page.evaluate(() => window.__ironTestRuntimeErrors());
+    assert.match(observed.find(entry => entry.kind === "error").detail, /fixture uncaught exception/);
+    assert.match(observed.find(entry => entry.kind === "unhandledrejection").detail, /fixture unhandled rejection/);
+    assert.throws(() => runtimeClean(observed), /Unexpected WebView errors/);
+  } finally { await page.close(); }
+});
 
 function documentScenario(name, run) {
   return scenario(name, async page => {

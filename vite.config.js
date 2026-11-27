@@ -1,7 +1,9 @@
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 
 const sanitizer = fileURLToPath(import.meta.resolve("dompurify"));
+const acceptance = process.env.VITE_IRON_E2E === "1";
 
 export default defineConfig({
   clearScreen: false,
@@ -11,7 +13,16 @@ export default defineConfig({
       replacement: sanitizer,
     }],
   },
-  plugins: [{
+  plugins: [...(acceptance ? [{
+    name: "acceptance-startup-errors",
+    apply: "build",
+    buildStart() {
+      this.emitFile({ type: "asset", fileName: "acceptance-errors.js", source: readFileSync(new URL("./tests/native/acceptance-errors.js", import.meta.url)) });
+    },
+    transformIndexHtml() {
+      return [{ tag: "script", attrs: { src: "/acceptance-errors.js" }, injectTo: "head-prepend" }];
+    },
+  }] : []), {
     name: "verify-monaco-sanitizer",
     generateBundle() {
       const modules = [...this.getModuleIds()];
@@ -27,6 +38,6 @@ export default defineConfig({
     strictPort: true,
     watch: { ignored: ["**/src-tauri/**", "**/dist/**", "**/dist-e2e/**", "**/test-results/**"] },
   },
-  build: { target: "es2022", outDir: process.env.VITE_IRON_E2E === "1" ? "dist-e2e" : "dist" },
+  build: { target: "es2022", outDir: acceptance ? "dist-e2e" : "dist" },
   worker: { format: "es" },
 });

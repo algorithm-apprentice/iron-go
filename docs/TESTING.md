@@ -35,6 +35,23 @@ copy of `tests/fixtures/orbit`. No existing IDE instance or manual folder
 selection is needed. It requires a working macOS app session. For repeat
 runs with an unchanged test build, use `npm run test:native -- --skip-build`.
 
+One native build serves isolated `lifecycle`, `files`, `go`, `debug`, and
+`quit` groups. Each selected group gets its own app, worker, workspace and
+home. Select groups with repeatable `--group` (for example `--group files`);
+the default includes all except `debug`, which `--require-delve` adds.
+Explicit Debug requires gopls and Delve. Go's language-service cases skip
+only when its capability probe confirms gopls is absent and it was not
+required. Group selection is exclusive with `--quit-only` and external
+snapshot mode. After a group's failure, later independent groups still run.
+
+For a teardown diagnostic, `npm run test:native -- --skip-build --probe-runner-crash`
+intentionally kills a group worker with a disposable Go child running.
+The command is expected to exit nonzero. Read `crash/cleanup.json` and the
+root `report.json` to verify the app and observed Go child disappeared and
+the later `files` group ran. An unverified cleanup is a failure and preserves
+the disposable paths printed in the report. Never point the runner at an
+installed app or use a live checkout as its fixture.
+
 To check a real Git project without using or modifying its working tree:
 
 ```sh
@@ -54,12 +71,18 @@ On headless UI failure, inspect `test-results/ui/<case>/browser.log`,
 `workbench.png`, and open `trace.zip` with `npx playwright show-trace`.
 Native runs print a `test-results/native/<run>/` path containing the per-case
 `report.json` and the build/app logs; on native failure the runner also
-attempts to capture a screenshot and a workbench snapshot. Start with the
+attempts to capture a screenshot and a workbench snapshot under the group
+directory. Successful live cases assert that the WebView has reported no
+uncaught exceptions or unhandled rejections since startup. Quit cases record
+the last live snapshot before requesting exit, then check process/disk results.
+Start with the
 first failed assertion, not a blind retry. Save fixture changes as tests
 when they explain a regression.
 
 GitHub Actions runs the full feedback loop for pushes to `main` and pull
 requests on a macOS runner and attaches available diagnostics to the run.
+A separate Go 1.27.x workflow runs the Go and Debug groups weekly and on
+manual dispatch; it is not part of PR feedback.
 The optional picker smoke runs locally after `npm run tauri build -- --bundles app`;
 its disposable process is independent of any currently open Iron Go window.
 For a mixed-DPI setup, use `npm run test:picker -- --retina-probe` to put the

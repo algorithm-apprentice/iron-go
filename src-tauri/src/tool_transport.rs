@@ -1,9 +1,8 @@
 use std::{
-    future::{pending, poll_fn, Future},
+    future::{pending, Future},
     io,
     process::ExitStatus,
-    sync::{Arc, Mutex},
-    task::Poll,
+    sync::Arc,
     time::Duration,
 };
 
@@ -17,7 +16,10 @@ use tokio::{
     time::{sleep_until, Instant},
 };
 
-use crate::{CommandResult, Core, Session};
+use crate::{
+    process_owner::{OwnedChild, ProcessGroup},
+    CommandResult, Core, Session,
+};
 
 const MAX_HEADER: u64 = 8192;
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
@@ -74,63 +76,11 @@ impl ToolKind {
     }
 }
 
-// Every kill syscall and the poll that can reap the leader share this lock.
-// Never signal a numeric group ID after the leader has been reaped.
-struct ServerGroup(Mutex<Option<i32>>);
-
-impl ServerGroup {
-    fn kill(&self) {
-        let mut group = self.0.lock().unwrap();
-        if let Some(pid) = group.take() {
-            // SAFETY: this is the group of the child we own and have not yet
-            // reaped. The lock prevents a concurrent reap during the syscall.
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
-        }
-    }
-}
-
-struct OwnedChild {
-    child: Child,
-    group: Arc<ServerGroup>,
-}
-
-impl OwnedChild {
-    fn new(child: Child) -> Self {
-        let pid = child.id().expect("new protocol child has a pid") as i32;
-        Self {
-            child,
-            group: Arc::new(ServerGroup(Mutex::new(Some(pid)))),
-        }
-    }
-
-    async fn wait(&mut self) -> io::Result<ExitStatus> {
-        let wait = self.child.wait();
-        tokio::pin!(wait);
-        poll_fn(|cx| {
-            let mut group = self.group.0.lock().unwrap();
-            let result = wait.as_mut().poll(cx);
-            if matches!(result, Poll::Ready(Ok(_))) {
-                *group = None;
-            }
-            result
-        })
-        .await
-    }
-}
-
-impl Drop for OwnedChild {
-    fn drop(&mut self) {
-        // Tokio's Child destructor may reap or hand off reaping. Disarm by
-        // signaling first, even if the worker future was never polled.
-        self.group.kill();
-    }
-}
-
 pub struct RunningServer {
     id: u64,
     input: mpsc::Sender<String>,
     stop: Option<oneshot::Sender<()>>,
-    group: Arc<ServerGroup>,
+    group: Arc<ProcessGroup>,
 }
 
 impl Drop for RunningServer {

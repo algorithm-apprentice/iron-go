@@ -1,5 +1,10 @@
 use super::*;
-use std::{os::unix::process::ExitStatusExt, pin::Pin, process::Stdio, task::Context};
+use std::{
+    os::unix::process::ExitStatusExt,
+    pin::Pin,
+    process::Stdio,
+    task::{Context, Poll},
+};
 use tokio::{
     io::{self as async_io, AsyncRead, BufReader, Empty, ReadBuf, Sink},
     process::Command,
@@ -366,7 +371,7 @@ fn obsolete_worker_notifies_only_its_original_channel() {
         id: 2,
         input,
         stop: None,
-        group: Arc::new(ServerGroup(Mutex::new(None))),
+        group: ProcessGroup::unarmed(),
     });
     let (replaced, old) = std::sync::mpsc::channel();
     let (_current, new) = std::sync::mpsc::channel::<ServerEvent>();

@@ -1,6 +1,9 @@
+#[cfg(feature = "e2e")]
+mod acceptance;
 mod debug;
 mod lsp;
 mod packages;
+mod process_owner;
 mod quit;
 mod tasks;
 mod tool_transport;
@@ -17,6 +20,7 @@ type CommandResult<T> = Result<T, String>;
 struct Core(
     Mutex<Session>,
     #[cfg(feature = "e2e")] workspace::TestSaveHold,
+    #[cfg(feature = "e2e")] std::sync::Condvar,
 );
 
 #[derive(Default)]
@@ -27,6 +31,8 @@ struct Session {
     discovery: Option<packages::Discovery>,
     lsp: Option<tool_transport::RunningServer>,
     debug: Option<tool_transport::RunningServer>,
+    #[cfg(feature = "e2e")]
+    acceptance: acceptance::Admission,
 }
 
 impl Session {
@@ -36,6 +42,8 @@ impl Session {
     }
 
     fn root(&self, id: u64) -> CommandResult<&std::path::Path> {
+        #[cfg(feature = "e2e")]
+        self.acceptance.check()?;
         self.workspace
             .as_ref()
             .filter(|workspace| workspace.info.id == id)
@@ -67,13 +75,18 @@ async fn pick_folder(title: &'static str) -> CommandResult<Option<PathBuf>> {
     blocking(move || Ok(rfd::FileDialog::new().set_title(title).pick_folder())).await
 }
 
-fn install_workspace(state: &Core, mut workspace: Workspace) -> workspace::WorkspaceInfo {
+fn install_workspace(
+    state: &Core,
+    mut workspace: Workspace,
+) -> CommandResult<workspace::WorkspaceInfo> {
     let mut session = state.0.lock().unwrap();
+    #[cfg(feature = "e2e")]
+    session.acceptance.check()?;
     session.stop_processes();
     workspace.info.id = session.next_id();
     let info = workspace.info.clone();
     session.workspace = Some(workspace);
-    info
+    Ok(info)
 }
 
 #[tauri::command]
@@ -90,7 +103,7 @@ async fn open_workspace(state: State<'_, Core>) -> CommandResult<Option<workspac
         return Ok(None);
     };
     let workspace = blocking(move || Workspace::open(&root)).await?;
-    Ok(Some(install_workspace(&state, workspace)))
+    install_workspace(&state, workspace).map(Some)
 }
 
 #[tauri::command]
@@ -116,7 +129,7 @@ async fn new_module(
         return Ok(None);
     };
     let workspace = blocking(move || workspace::create_module(&parent, &name, &module)).await?;
-    Ok(Some(install_workspace(&state, workspace)))
+    install_workspace(&state, workspace).map(Some)
 }
 
 #[tauri::command]
@@ -148,7 +161,12 @@ fn main() {
     builder
         .manage(Core::default())
         .manage(quit::ExitGate::default())
-        .setup(|app| quit::install(app.handle()).map_err(Into::into))
+        .setup(|app| {
+            quit::install(app.handle())?;
+            #[cfg(feature = "e2e")]
+            acceptance::watch(app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             open_workspace,
             new_module,

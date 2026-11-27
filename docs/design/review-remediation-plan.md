@@ -569,6 +569,146 @@ and the existing opt-in external Raft probe.
   require the user's checkout for CI. Missing tools, locked-console picker
   cases, and separately gated profiles must be distinguished from passes.
 
+**Batch 5 implementation design (independently approved):** Keep `npm run test:native`
+as the parent CLI. Build the acceptance binary once, then run `lifecycle`,
+`files`, `go`, `debug`, and `quit` sequentially in independent runner
+processes, each driving an app owned directly by the parent against a
+disposable workspace and home. Group modules use shared runner, WebDriver
+and editor probes, with no shared live app, fixture paths, ports, launch
+state or report objects. Redirect fixture `GOCACHE`, `GOMODCACHE`, `GOPATH`
+and `GOTMPDIR` to created temporary directories inside the parent run; turn
+off the inherited Go environment file, Go workspace and external cache
+program. Reuse only disposable compiler/module caches across groups; the
+explicit external snapshot mode keeps its documented host-cache behavior.
+Keep the existing
+`--skip-build`, `--quit-only`, `--project`, editor tracing, tool requirements
+and real-project options. Add repeatable `--group` to select native groups.
+`--require-delve` includes the Debug group in the default full run; choosing
+Debug explicitly requires working gopls and Delve. Preserve optional gopls
+skips with explicit reasons when not required. Run the default dirty Quit
+group within the one-build feedback command; `--quit-only` remains usable.
+Reject unknown or duplicate names. `--group`, `--quit-only` and `--project`
+are mutually exclusive. In an explicit group selection, `--require-gopls`
+requires `go` or `debug`, and `--require-delve` requires `debug`. Reject
+requirements in Quit-only mode. External `--test-file` implies working
+gopls; `--debug-test` additionally implies working Delve. Reject external
+require flags not paired with the corresponding coverage flags. An
+optional LSP skip requires a positively confirmed absent executable from
+a successful tools probe; a failed probe/startup or broken installed
+gopls is a failure, and every LSP-dependent case skipped for absence is
+accounted for. Explicit Debug always requires working gopls and Delve.
+
+The parent owns group directories, the app `Child` handle and an stdin
+supervision pipe; a worker owns the browser-driving session only. On worker
+success, crash, deadline, or parent SIGINT/SIGTERM, close that app's pipe
+and wait a bounded time. An acceptance-only Rust watchdog reacts to EOF
+independent of the WebView: synchronously drop the app's owned Go tool and
+task handles, acknowledge that those signals were issued, then request app
+exit. Under the same session lock used by task, debugger, gopls, discovery
+and workspace-install admission, EOF first seals admission irreversibly
+and drops those owned handles, including discovery, before any acknowledgement.
+Already-admitted short Go version and format invocations hold an
+acceptance-only lease and must finish before the acknowledgement; after
+sealing, the same lock refuses new leases. A deadline without those proofs
+is a cleanup failure, not a shutdown acknowledgement. Test refusal of a
+queued admission after the seal. Opt in with an acceptance env flag only
+alongside fixture and driver
+routing; native Quit tests use real platform actions and leave the pipe
+alone until the terminal result. The parent verifies app exit and observed
+test-owned descendant disappearance; a normal terminal case proves its
+shutdown via process exit instead of an EOF acknowledgement. A hung app
+may be terminated via its direct child handle only; never sweep processes
+by name or send signals to guessed/reused descendant PIDs. Missing teardown
+proof or remaining observed descendants is a cleanup failure; preserve
+the affected disposable paths and diagnostics for investigation rather than
+deleting files under a potentially live process. Parent crash/kill closes
+its pipes at the OS boundary; a killed parent cannot write a summary. Run
+an opt-in runner probe that kills the worker abruptly with an actual Go
+child alive, checks parent cleanup and PID disappearance, and verifies a
+later independent group still runs; the probe reports the worker failure
+as a failure even when recovery succeeds.
+
+Code review found that invoking task/discovery handle drops from the watchdog
+requires the same signal/reap fence as the tool transport. Promote that
+owner to the shared native process helper and use it in these paths, without
+changing task commands, selection, or discovery behavior. Only the owner
+polls wait; the process-group signal syscall and successful reaping share a
+mutex. Owner drop signals before the Tokio child destructor can reap. Test
+the signal/reap exclusion with controlled concurrent calls. Short Go tools
+use the same execution path in production and acceptance, with an
+acceptance-only lease. Read their pipes before polling the sole child wait;
+on timeout signal while the group's unreaped leader still reserves its ID,
+then bound reaping and pipe-drain proof. If proof is missing, do not
+acknowledge cleanup. Reproduce a leader exiting while a same-group child
+keeps stdout open, and verify that the timeout stops it or withholds proof.
+
+A root report aggregates process exit status and per-group cases, while the
+build log and each group's app log, screenshot, state, and output stay under
+its own artifact directory. A failed group marks the overall result failed
+but does not stop independent groups; a dependent case may abort its own
+group. Record startup, build and cleanup failures instead of counting work
+that did not run as passed; identify groups not run separately from voluntary
+skips. Require a matching, structurally valid terminal report to pass a
+selected group, even when its worker exits zero. Any signal, nonzero exit,
+timeout, or cleanup failure overrides a green case report, and secondary
+capture/cleanup errors must not overwrite the primary failure. Test these
+policies with a fake failed group, zero-exit/no-report, and later success.
+For `lifecycle` and `quit`, a successful report must have the proper live
+checkpoint, and the parent must have independently observed normal AppKit
+exit before it closes the supervision pipe. EOF cleanup cannot satisfy that
+oracle. A report containing only skips cannot mark a selected group passed.
+Keep command-line validation before launch and
+ensure that direct external Git tests still read `git archive HEAD` into a
+copy, never the existing checkout. Inputs from the test launcher do not
+become new production commands or capabilities.
+
+Capture `error` and `unhandledrejection` with an acceptance-build-only classic
+script loaded in the page head before the workbench module. Serve it from
+the existing origin without relaxing CSP; do not emit it in production.
+Include errors in the artifacts. Assert an empty list after successful
+nonterminal cases, and at the final live checkpoint in cases that expect
+process exit, before asking it to exit, persisting the last live snapshot and
+output. Explicitly label the observation ends there in the terminal report;
+exit code and disk oracles cover what follows. Regression checks throw an
+uncaught exception and create a real unhandled rejection in a disposable
+browser, and pass their observed data through the native case oracle.
+Exercise
+current/custom Go scopes and stale DAP responses at the lowest meaningful
+layer; reuse the earlier controlled editor/debug cases where they already
+prove the behavior.
+
+Retain the Go 1.25.x feedback workflow on pushes/PRs. Add a compact Go
+1.27.x macOS smoke in a separate weekly/manual workflow with gopls `v0.24.0`
+and Delve `v1.27.2`, using `npm run test:native -- --group go --group debug
+--require-gopls --require-delve`. Log tool versions and upload diagnostics
+on failure; keep this job out of PRs. Run the same group command
+locally on installed tools; do not claim hosted workflow execution from a
+local run. Report separately any missing or hardware-only acceptance.
+
+**Batch 5 initial evidence:** The old runner rejected `--group` as unknown.
+The first grouped feedback run (`1795743074415-33406`) failed one lifecycle
+case because its New Project path expectation still used the old fixture
+layout; files, Go, Debug and Quit still ran and passed. The opt-in crash
+probe (`1795743191667-35238`) observed the worker's `SIGKILL` as an overall
+failure, the app's EOF acknowledgement and normal exit, and zero remaining
+observed child identities, including the actual Go inferior. It then ran
+the independent files group successfully. Browser fault injection exercised
+the collector with a real exception and an unhandled rejection. The e2e
+Rust admission test verifies the seal rejects new or replacement work.
+
+**Batch 5 final verification:** `npm run test:feedback` passed (19 TS, 31
+Rust, Go fixture, 17 browser, and 20 native cases across five isolated
+groups; `1795743641177-38238`). With `e2e`, 34 Rust tests passed, including
+the retained-pipe regression and simulated concurrent signal/reap check;
+strict Clippy with `e2e` passed. The retained-pipe and early-success report
+regressions were both red before the review amendments. The rebuilt crash
+probe (`1795743705391-40068`) exited 1 as intended, with the worker reported
+as `SIGKILL`, the app's EOF acknowledgement and normal exit, the observed
+Go inferior gone and the later files group passing. The generated E2E HTML
+loads its error collector before the workbench module. The release `.app`
+build contains neither the startup collector nor the stdin watchdog,
+acceptance bridge or fixtures. Independent code re-review approved this batch.
+
 **Acceptance for the runner:** Select one group without rebuilding; force one
 controlled failing group and verify subsequent independent groups still report,
 overall status is nonzero, and the disposable process/files are reaped. Verify
