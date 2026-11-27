@@ -438,7 +438,9 @@ async function nativeQuitSmoke() {
       await cancelled("Native window close");
 
       requestNativeQuit();
-      await eventually("unanswered Quit dialog is shown", () => js("return document.querySelector('#quit-dialog')?.open === true;"));
+      await eventually("unanswered Quit dialog is usable", () => js(`
+        return document.querySelector('#quit-dialog').open && !document.querySelector('#quit-discard').disabled;
+      `));
       await eventually("the real timeout dismisses the dialog and restores editing", () => js("return !document.querySelector('#quit-dialog').open && !document.querySelector('#open-folder').disabled;"));
       assert.equal((await current()).text, unsaved);
       assert.equal(alive(), true, "expiry leaves the Go process alone");

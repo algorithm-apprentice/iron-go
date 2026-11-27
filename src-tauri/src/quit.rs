@@ -13,7 +13,10 @@ use objc2::{
 };
 use objc2_app_kit::{NSApplication, NSApplicationTerminateReply};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::oneshot;
+use tokio::{
+    sync::oneshot,
+    time::{sleep, timeout_at, Instant},
+};
 
 use crate::CommandResult;
 
@@ -155,43 +158,82 @@ pub fn request_termination() {
     });
 }
 
-#[tauri::command]
-pub async fn present_app_exit(app: AppHandle, ticket: u64) -> CommandResult<bool> {
+async fn wait_for_presentation<F>(
+    deadline: Instant,
+    mut sample: impl FnMut(bool) -> F,
+) -> CommandResult<bool>
+where
+    F: std::future::Future<Output = CommandResult<Option<bool>>>,
+{
+    let mut restore = true;
+    while Instant::now() < deadline {
+        match timeout_at(deadline, sample(restore)).await {
+            Ok(Ok(Some(true))) if Instant::now() < deadline => return Ok(true),
+            Ok(Ok(Some(false))) => {
+                restore = false;
+                sleep(Duration::from_millis(25)).await;
+            }
+            Ok(Err(error)) => return Err(error),
+            _ => break,
+        }
+    }
+    Ok(false)
+}
+
+async fn sample_presentation(
+    app: AppHandle,
+    ticket: u64,
+    deadline: Instant,
+    restore: bool,
+) -> CommandResult<Option<bool>> {
     let (send, receive) = oneshot::channel();
     queue_on_main(move || {
-        let pending = app
-            .state::<ExitGate>()
-            .0
-            .lock()
-            .is_ok_and(|gate| gate.pending == Some(ticket));
-        let result = if pending {
-            MainThreadMarker::new()
-                .ok_or_else(|| "Present the Quit dialog on the main thread.".into())
-                .and_then(|mtm| {
-                    with_main_window(&app, |window| {
-                        let native = NSApplication::sharedApplication(mtm);
-                        if native.isHidden() {
-                            native.unhide(None);
-                        }
-                        if window.isMiniaturized() {
-                            window.deminiaturize(None);
-                        }
-                        native.activate();
-                        window.makeKeyAndOrderFront(None);
-                        // Activation is cooperative. Show the confirmation even
-                        // if another app retains activation for the moment.
-                        if !native.isActive() {
-                            window.orderFrontRegardless();
-                        }
-                        !native.isHidden() && !window.isMiniaturized() && window.isVisible()
-                    })
-                })
-        } else {
-            Ok(false)
+        let current = || {
+            Instant::now() < deadline
+                && app
+                    .state::<ExitGate>()
+                    .0
+                    .lock()
+                    .is_ok_and(|gate| gate.pending == Some(ticket))
         };
+        let result = (|| {
+            if !current() {
+                return Ok(None);
+            }
+            let mtm =
+                MainThreadMarker::new().ok_or("Present the Quit dialog on the main thread.")?;
+            let ready = with_main_window(&app, |window| {
+                let native = NSApplication::sharedApplication(mtm);
+                if restore {
+                    if native.isHidden() {
+                        native.unhide(None);
+                    }
+                    if window.isMiniaturized() {
+                        window.deminiaturize(None);
+                    }
+                    native.activate();
+                    window.makeKeyAndOrderFront(None);
+                    // Activation is cooperative; the window can still be shown.
+                    if !native.isActive() {
+                        window.orderFrontRegardless();
+                    }
+                }
+                !native.isHidden() && !window.isMiniaturized() && window.isVisible()
+            })?;
+            Ok(current().then_some(ready))
+        })();
         let _ = send.send(result);
     });
     receive.await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn present_app_exit(app: AppHandle, ticket: u64) -> CommandResult<bool> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    wait_for_presentation(deadline, |restore| {
+        sample_presentation(app.clone(), ticket, deadline, restore)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -288,7 +330,41 @@ pub async fn test_perform_window_close(app: AppHandle) -> CommandResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Ticket;
+    use super::{wait_for_presentation, Duration, Instant, Ticket};
+    use std::{cell::RefCell, future::ready};
+
+    #[tokio::test]
+    async fn presentation_waits_for_visibility_without_restoring_twice() {
+        let calls = RefCell::new(Vec::new());
+        let presented = wait_for_presentation(Instant::now() + Duration::from_secs(2), |restore| {
+            calls.borrow_mut().push(restore);
+            ready(Ok(Some(!restore)))
+        })
+        .await
+        .unwrap();
+        assert!(presented);
+        assert_eq!(calls.into_inner(), [true, false]);
+    }
+
+    #[tokio::test]
+    async fn presentation_wait_stops_on_ticket_invalidation_or_timeout() {
+        let calls = RefCell::new(Vec::new());
+        let presented = wait_for_presentation(Instant::now() + Duration::from_secs(2), |restore| {
+            calls.borrow_mut().push(restore);
+            ready(Ok(restore.then_some(false)))
+        })
+        .await
+        .unwrap();
+        assert!(!presented);
+        assert_eq!(calls.into_inner(), [true, false]);
+
+        let presented = wait_for_presentation(Instant::now() + Duration::from_millis(10), |_| {
+            std::future::pending()
+        })
+        .await
+        .unwrap();
+        assert!(!presented);
+    }
 
     #[test]
     fn tickets_coalesce_and_cannot_approve_a_later_attempt() {

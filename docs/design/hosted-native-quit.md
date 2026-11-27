@@ -58,3 +58,32 @@ shows one fresh renderer request and a transition from minimized/invisible
 to restored/visible while the real confirmation was usable. Cancel then
 preserved the buffer, disk bytes, and Go child. The compiled helper rejected
 an invalid PID with a nonzero exit. Hosted verification remains pending.
+
+## Follow-up: Wait for AppKit presentation to settle
+
+Hosted run `45945953305` received a fresh renderer request (2 → 3) and
+ended with a restored, visible window, but no open dialog and Discard
+still disabled. The host currently samples visibility in the same main
+queue callback that initiates restoration. If AppKit has not yet finished
+that transition, the host returns false and the renderer cancels. The
+artifact supports this race but does not contain the initial visibility
+sample.
+
+Request restoration once. If the first sample is not ready, yield to
+AppKit and sample visibility on the main queue for up to two seconds.
+Check the pending ticket on every sample; retire immediately if it was
+cancelled or expired. Do not retry activation, approve exit from the host,
+modify the ticket lifetime, or keep Discard enabled on failure. Use the
+same behavior in production and acceptance. A deterministic Rust regression
+simulates a window visible only on a later observation, and checks cancelled
+tickets stop the wait. Keep the existing hosted recreation with a real
+minimized window. Verify an unanswered dialog becomes usable before
+asserting its eventual dismissal, so presentation failure cannot count
+as a ticket expiry pass.
+
+The focused regression failed with a single visibility sample and passed
+with the bounded wait. The final local `npm run test:feedback` passed
+(23 TypeScript, 33 Rust, Go fixture, 28 browser, and 27 native cases;
+`test-results/native/1795758126098-89587`). This includes the real minimized
+Quit workflow and the usable-then-expired dialog. Hosted verification of
+the follow-up remains pending.
