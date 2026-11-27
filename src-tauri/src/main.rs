@@ -1,6 +1,7 @@
 mod debug;
 mod lsp;
 mod packages;
+mod quit;
 mod tasks;
 mod tools;
 mod workspace;
@@ -12,7 +13,10 @@ use workspace::Workspace;
 type CommandResult<T> = Result<T, String>;
 
 #[derive(Default)]
-struct Core(Mutex<Session>);
+struct Core(
+    Mutex<Session>,
+    #[cfg(feature = "e2e")] workspace::TestSaveHold,
+);
 
 #[derive(Default)]
 struct Session {
@@ -142,6 +146,8 @@ fn main() {
 
     builder
         .manage(Core::default())
+        .manage(quit::ExitGate::default())
+        .setup(|app| quit::install(app.handle()).map_err(Into::into))
         .invoke_handler(tauri::generate_handler![
             open_workspace,
             new_module,
@@ -162,11 +168,26 @@ fn main() {
             debug::start_debug,
             debug::send_debug,
             debug::stop_debug,
+            quit::resolve_app_exit,
+            quit::present_app_exit,
+            #[cfg(feature = "e2e")]
+            quit::test_quit_menu_action,
+            #[cfg(feature = "e2e")]
+            quit::test_perform_window_close,
+            #[cfg(feature = "e2e")]
+            quit::test_quit_window_state,
+            #[cfg(feature = "e2e")]
+            workspace::test_hold_save,
         ])
-        .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::Destroyed) {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
+                api.prevent_close();
+                quit::request_termination();
+            }
+            tauri::WindowEvent::Destroyed => {
                 window.state::<Core>().0.lock().unwrap().stop_processes();
             }
+            _ => {}
         })
         .build(tauri::generate_context!())
         .expect("could not initialize Iron Go")

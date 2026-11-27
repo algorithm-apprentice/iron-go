@@ -181,6 +181,16 @@
       <label class="settings-row"><div><strong>Word wrap</strong><small>Wrap long lines to the editor width.</small></div><input id="wrap-setting" type="checkbox" /></label>
       <div class="settings-tools"><h3>Go Toolchain</h3><div id="settings-tools-info" class="view-note"></div><button id="probe-tools" class="button quiet"><span data-icon="refresh"></span>Check tools</button></div>
     </dialog>
+    <dialog id="quit-dialog" class="form-dialog" aria-labelledby="quit-title" aria-describedby="quit-description">
+      <form method="dialog">
+        <div class="dialog-header"><h2 id="quit-title">Quit Iron Go?</h2></div>
+        <p id="quit-description">Unsaved changes will be lost if you quit.</p>
+        <div class="dialog-actions">
+          <button id="quit-cancel" class="button primary" value="cancel" autofocus>Cancel</button>
+          <button id="quit-discard" class="button quiet" value="discard">Discard and Quit</button>
+        </div>
+      </form>
+    </dialog>
     <input id="import-folder" type="file" webkitdirectory multiple hidden />
     <div id="toast" class="toast" role="alert" hidden></div>
     <script type="module" src="/src/main.ts"></script>

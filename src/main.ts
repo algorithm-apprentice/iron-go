@@ -1,5 +1,6 @@
 import "./styles.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { byId, element, Forms, message, Palette } from "./dialogs";
 import { bufferText, Documents, monaco, replaceBuffer, type DocumentTab } from "./editor";
@@ -10,6 +11,7 @@ import { Breakpoints, DebugSession } from "./debugger";
 import { packageForFile, RunTargets } from "./run-targets";
 import { bindColorTheme, chooseColorTheme } from "./theme";
 import { basename, dirname, initialWorkspaceFile, makeTree, quickFiles, validateRelative, type FileMatch, type ProjectSnapshot, type TreeNode } from "./project-model";
+import { decideExit } from "./quit-flow";
 import { desktop, host, importedProject, nativeProject, welcomeProject, type Project, type TaskKind, type ToolStatus } from "./workspace";
 
 type View = "explorer" | "search" | "tasks";
@@ -42,6 +44,10 @@ const breakpoints = new Breakpoints();
 let executionLine: { model: monaco.editor.ITextModel; ids: string[] } | undefined;
 let stopPending = false;
 let formatting = false;
+let fileMutations = 0;
+let testQuitRequests = 0;
+let quitDialogTicket: number | undefined;
+let lastExpiredQuitTicket = 0;
 let tools: ToolStatus | undefined;
 let lsp: GoLanguage | undefined;
 let gopls: LanguageState = "idle";
@@ -261,7 +267,7 @@ function renderProblems() {
 }
 
 function closeTab(tab: DocumentTab) {
-  if (!tab.saving && (!tab.dirty || window.confirm(`Discard unsaved changes to ${basename(tab.path)}?`))) docs.close(tab);
+  if (!busy && !tab.saving && (!tab.dirty || window.confirm(`Discard unsaved changes to ${basename(tab.path)}?`))) docs.close(tab);
 }
 
 async function saveActive() {
@@ -283,8 +289,10 @@ async function saveActive() {
 async function reloadActive() {
   const tab = docs.active;
   if (!tab || tab.saving || busy || (tab.dirty && !window.confirm(`Discard unsaved changes and reload ${basename(tab.path)}?`))) return;
+  fileMutations++;
   try { if (await docs.reload(tab)) status(`Reloaded ${basename(tab.path)}`); }
   catch (error) { showError(error); }
+  finally { fileMutations--; }
 }
 
 async function formatActive() {
@@ -423,12 +431,16 @@ function newFile() {
     title: "New File", description: `Create a file inside ${project.name}. Include a folder prefix to create missing folders.`,
     fields: [{ name: "path", label: "Relative file path", placeholder: "pkg/example.go" }],
     async run({ path }) {
+      if (busy) return false;
       if (target !== project) throw new Error("This workspace has changed.");
       validateRelative(path);
-      await target.createFile(path);
-      await refresh();
-      await openFile(path);
-      status(`Created ${path}`);
+      fileMutations++;
+      try {
+        await target.createFile(path);
+        await refresh();
+        await openFile(path);
+        status(`Created ${path}`);
+      } finally { fileMutations--; }
     },
   });
 }
@@ -842,11 +854,46 @@ monaco.editor.onDidChangeMarkers(renderProblems);
 bindLayout();
 bindSettings();
 if (desktop) {
-  void getCurrentWindow().onCloseRequested(event => {
-    event.preventDefault();
-    if (!docs.saving && !busy && (!docs.dirty || window.confirm("Quit and discard unsaved changes?"))) {
-      void getCurrentWindow().destroy().catch(showError);
-    }
+  const quitDialog = byId<HTMLDialogElement>("quit-dialog");
+  const discardQuit = byId<HTMLButtonElement>("quit-discard");
+  const cancelQuitDialog = (ticket: number) => {
+    if (quitDialogTicket === ticket && quitDialog.open) quitDialog.close("cancel");
+  };
+  const confirmQuit = (ticket: number) => new Promise<boolean>(resolve => {
+    quitDialogTicket = ticket;
+    quitDialog.returnValue = "cancel";
+    discardQuit.disabled = true;
+    quitDialog.addEventListener("close", () => {
+      quitDialogTicket = undefined;
+      resolve(!discardQuit.disabled && quitDialog.returnValue === "discard");
+    }, { once: true });
+    quitDialog.showModal();
+    void host.presentExit(ticket).then(presented => {
+      if (!presented) cancelQuitDialog(ticket);
+      else if (quitDialogTicket === ticket && quitDialog.open) discardQuit.disabled = false;
+    }).catch(error => {
+      cancelQuitDialog(ticket);
+      showError(error);
+    });
+  });
+  void getCurrentWindow().listen<number>("iron-go-exit-expired", event => {
+    lastExpiredQuitTicket = Math.max(lastExpiredQuitTicket, event.payload);
+    cancelQuitDialog(event.payload);
+  }).catch(showError);
+  void getCurrentWindow().listen<number>("iron-go-exit-requested", event => {
+    if (event.payload <= lastExpiredQuitTicket) return;
+    if (import.meta.env.VITE_IRON_E2E === "1") testQuitRequests++;
+    void decideExit({
+      canDecide: () => !busy && !docs.saving && !formatting && fileMutations === 0,
+      hasUnsavedChanges: () => docs.dirty,
+      confirmDiscard: () => confirmQuit(event.payload),
+      freeze: frozen => {
+        busy = frozen;
+        docs.editor.updateOptions({ readOnly: frozen });
+        syncControls();
+      },
+      reply: approve => host.resolveExit(event.payload, approve),
+    }).catch(showError);
   }).catch(showError);
 } else {
   window.addEventListener("beforeunload", event => {
@@ -912,6 +959,13 @@ if (import.meta.env.VITE_IRON_E2E === "1") {
       docs.editor.trigger("iron-test", id, {});
     },
     quit: () => { void getCurrentWindow().destroy(); },
+    closeWindow: () => invoke<void>("test_perform_window_close"),
+    quitWindowState: (minimize = false) => invoke<[boolean, boolean]>("test_quit_window_state", { minimize }),
+    quitMenu: () => invoke<boolean>("test_quit_menu_action"),
+    quitRequests: () => testQuitRequests,
+    holdSave: (hold?: boolean) => invoke<boolean>("test_hold_save", { hold }),
+    saving: () => docs.saving,
+    tryType: (text: string) => docs.editor.trigger("keyboard", "type", { text }),
   } });
 }
 

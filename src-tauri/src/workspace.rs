@@ -375,7 +375,56 @@ pub async fn save_file(
     text: String,
 ) -> CommandResult<()> {
     let root = state.0.lock().unwrap().root(id)?.to_path_buf();
+    #[cfg(feature = "e2e")]
+    state.1.wait().await?;
     blocking(move || persist_text(&root, &path, &expected, &text)).await
+}
+
+#[cfg(feature = "e2e")]
+pub struct TestSaveHold {
+    gate: tokio::sync::watch::Sender<bool>,
+    waiting: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "e2e")]
+impl Default for TestSaveHold {
+    fn default() -> Self {
+        Self {
+            gate: tokio::sync::watch::channel(false).0,
+            waiting: false.into(),
+        }
+    }
+}
+
+#[cfg(feature = "e2e")]
+impl TestSaveHold {
+    async fn wait(&self) -> CommandResult<()> {
+        use std::sync::atomic::Ordering;
+        let mut held = self.gate.subscribe();
+        if !*held.borrow() {
+            return Ok(());
+        }
+        self.waiting.store(true, Ordering::SeqCst);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            held.wait_for(|hold| !*hold),
+        )
+        .await;
+        self.waiting.store(false, Ordering::SeqCst);
+        outcome
+            .map_err(|_| "Test did not release the pending save.")?
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "e2e")]
+#[tauri::command]
+pub fn test_hold_save(state: State<'_, Core>, hold: Option<bool>) -> bool {
+    if let Some(hold) = hold {
+        state.1.gate.send_replace(hold);
+    }
+    state.1.waiting.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[tauri::command]

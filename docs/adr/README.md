@@ -12,3 +12,4 @@ record detailed behavior, alternatives, implementation order, and acceptance.
 | [0005](0005-goland-run-and-test.md) | GoLand-inspired run target and test workflows | Accepted |
 | [0006](0006-project-first-welcome.md) | Project-first welcome; Orbit is test-only | Accepted |
 | [0007](0007-delve-test-debugging.md) | Delve DAP over a private socket for named Go tests | Accepted |
+| [0008](0008-appkit-quit-guard.md) | Send ordinary macOS Quit and window close through one AppKit guard | Accepted |

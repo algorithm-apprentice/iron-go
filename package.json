@@ -17,7 +17,7 @@
     "test:native": "node tests/native/workbench.mjs",
     "test:picker": "swift tests/native/picker.swift",
     "check": "npm run typecheck && npm test && cargo fmt --manifest-path src-tauri/Cargo.toml --check && npm run test:rust && npm run test:fixture",
-    "test:feedback": "npm run check && npm run test:ui && npm run test:native -- --require-gopls --require-delve"
+    "test:feedback": "npm run check && npm run test:ui && npm run test:native -- --require-gopls --require-delve && npm run test:native -- --skip-build --quit-only"
   },
   "dependencies": {
     "@tauri-apps/api": "2.12.4",

@@ -9,6 +9,7 @@ ADR, and native-acceptance reference, not a build dependency.
    For a new feature or behavior change, first update or add `docs/design/` with
    scope, invariants, alternatives, and concrete acceptance checks. Record durable
    decisions under `docs/adr/NNNN-*.md`; don't rewrite accepted history silently.
+   Get an independent design review before starting implementation.
 2. Add a focused regression test at the cheapest meaningful layer. Observe it
    fail for the intended reason before changing product code. Use a disposable
    fixture when tests touch disk or launch processes.
@@ -21,6 +22,8 @@ ADR, and native-acceptance reference, not a build dependency.
    [testing instructions](docs/TESTING.md) for failure artifacts and setup.
 5. Update the design with actual verification and any remaining gaps. Never
    require a user to click through a scenario an agent can exercise itself.
+6. Get independent code review of the exact diff and evidence before committing
+   or pushing. Resolve review blockers and re-review affected changes first.
 
 Keep runner code and fixture routing out of shipped builds. Do not use an
 existing user workspace, modify the sibling repository, or report a skipped

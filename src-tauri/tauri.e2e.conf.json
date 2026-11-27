@@ -5,6 +5,6 @@
   "build": { "frontendDist": "../dist-e2e" },
   "app": { "security": { "capabilities": [
     "main-window",
-    { "identifier": "acceptance-window", "windows": ["main"], "permissions": ["core:window:allow-set-size"] }
+    { "identifier": "acceptance-window", "windows": ["main"], "permissions": ["core:window:allow-set-size", "core:window:allow-destroy"] }
   ] } }
 }

@@ -191,7 +191,7 @@ test("adjacent workbench controls and visible dividers use a one-pixel gap", asy
     await check(".search-field");
     await page.getByRole("button", { name: "Project", exact: true }).click();
     await page.getByRole("button", { name: "New File", exact: true }).click();
-    await check(".dialog-actions");
+    await check("#form-dialog .dialog-actions");
     await page.getByRole("button", { name: "Cancel", exact: true }).click();
     await page.setViewportSize({ width: 650, height: 560 });
     for (const group of horizontalGroups) await check(group);

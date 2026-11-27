@@ -22,6 +22,14 @@ to run the debug acceptance. macOS must allow debugging a local Go child process
 | `npm run test:feedback` | All three layers; requires gopls and real Delve debug acceptance. |
 | `npm run test:picker` | Checks native title-bar placement at the default and minimum widths, then opens and cancels the real macOS project picker. Requires a built `.app` and Accessibility permission for the calling terminal. |
 
+`npm run test:native -- --quit-only` drives AppKit/system Quit, the real
+Quit menu item and native Close in a separate disposable app. It verifies
+presentation of the dirty confirmation with a minimized window, dirty-buffer
+and child-process preservation on cancellation, retries after an unanswered
+dialog, and refusal while a native save is pending. Approved Discard stops the
+child without writing the unsaved buffer. The full feedback command runs it
+after the standard native suite, reusing the acceptance binary, not a released app.
+
 The native suite builds `iron-go-acceptance` and opens a temporary
 copy of `tests/fixtures/orbit`. No existing IDE instance or manual folder
 selection is needed. It requires a working macOS app session. For repeat

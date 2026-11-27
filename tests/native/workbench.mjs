@@ -14,9 +14,11 @@ const { values } = parseArgs({ options: {
   "require-delve": { type: "boolean" },
   "trace-editor": { type: "boolean" },
   "gutter-line": { type: "string" },
+  "quit-only": { type: "boolean" },
   project: { type: "string" }, "test-file": { type: "string" }, "debug-test": { type: "string" },
 } });
 if (process.platform !== "darwin") throw new Error("Native acceptance requires macOS.");
+if (values["quit-only"] && values.project) throw new Error("--quit-only uses the disposable Orbit fixture.");
 if (values["debug-test"] && (!values.project || !values["test-file"])) throw new Error("--debug-test requires --project and --test-file.");
 if (values["gutter-line"] && (!values.project || !values["test-file"] || !/^[1-9]\d*$/.test(values["gutter-line"]))) {
   throw new Error("--gutter-line requires a positive line number, --project and --test-file.");
@@ -299,12 +301,14 @@ try {
   app = await processLogged(executable, [], "app.log", {
     ...goTestEnv, PATH: searchPath, HOME: home, CFFIXED_USER_HOME: home,
     IRON_GO_E2E_WORKSPACE: fixture, TAURI_WEBDRIVER_PORT: String(available),
+    ...(values["quit-only"] ? { IRON_GO_E2E_EXIT_TIMEOUT_MS: "2000" } : {}),
   });
   await eventually("embedded macOS WebDriver", () => w3c("/status"), value => value?.ready);
   ({ sessionId: sid } = await w3c("/session", { capabilities: { alwaysMatch: {} } }));
   await eventually("workbench test adapter", () => js("return !!window.__ironTest;"));
 
   if (values.project) await externalProjectSmoke();
+  else if (values["quit-only"]) await nativeQuitSmoke();
   else await standardWorkbenchSmoke();
 } catch (error) {
   report.failure = error.stack;
@@ -330,6 +334,116 @@ try {
   }
   await rm(temporary, { recursive: true, force: true });
   await writeFile(path.join(artifacts, "report.json"), JSON.stringify(report, null, 2));
+}
+
+function requestNativeQuit() {
+  const requested = execFileSync("swift", ["-e", 'import AppKit; let pid = Int32(CommandLine.arguments[1])!; print(NSRunningApplication(processIdentifier: pid)?.terminate() ?? false)', String(app.child.pid)], { encoding: "utf8", timeout: 10_000 }).trim();
+  assert.equal(requested, "true", "macOS should accept the native Quit request");
+}
+
+async function nativeQuitSmoke() {
+  await record("native Quit asks before discarding a dirty Go buffer", async () => {
+    const source = path.join(fixture, "cmd/orbit/main.go");
+    await writeFile(source, 'package main\nimport ("fmt"; "os"; "time")\nfunc main(){fmt.Printf("quit-child-ready %d\\n",os.Getpid());time.Sleep(time.Minute)}\n');
+    await click("#open-folder");
+    const initial = await eventually("disposable project open", current, state => state?.path === "cmd/orbit/main.go");
+    await eventually("Go target ready", () => js("return document.querySelector('#run-target').value === './cmd/orbit' && !document.querySelector('#run').disabled;"));
+    await click("#run");
+    const ready = await eventually("fixture child is running", output, value => /quit-child-ready \d+/.test(value), 30_000);
+    const pid = Number(ready.match(/quit-child-ready (\d+)/)[1]);
+    const saved = `${initial.text}\n// saved after the held IPC\n`;
+    const unsaved = `${saved}\n// unsaved native quit\n`;
+    const alive = () => { try { process.kill(pid, 0); return true; } catch (error) { if (error.code === "ESRCH") return false; throw error; } };
+    async function cancelled(label, restored = false) {
+      await Promise.race([
+        eventually(`${label}: display the real confirmation`, () => js("return document.querySelector('#quit-dialog')?.open === true;")),
+        app.exited.then(() => { throw new Error(`${label}: exited before confirming the unsaved buffer.`); }),
+      ]);
+      if (restored) {
+        await eventually(`${label}: AppKit restored a visible window with the confirmation open`, () => js(`
+          void window.__ironTest.quitWindowState().then(state => window.__nativeWindowState = state);
+          return { state: window.__nativeWindowState, ready: document.querySelector('#quit-dialog').open && !document.querySelector('#quit-discard').disabled };
+        `), result => result?.ready && result.state?.[0] === false && result.state[1] === true);
+      }
+      await js("window.__ironTest.tryType('unexpected edit'); return true;");
+      assert.equal((await current()).text, unsaved, `${label}: the pending decision must prevent typing`);
+      await click("#quit-cancel");
+      await eventually(`${label}: editing re-enabled`, () => js("return !document.querySelector('#open-folder').disabled;"));
+      const state = await current();
+      assert.equal(state.text, unsaved);
+      assert.equal(state.dirty, true);
+      assert.equal(await readFile(source, "utf8"), saved);
+      assert.equal(alive(), true, `${label}: cancelling must not stop the Go child`);
+      console.log(`    ${label}: Cancel preserved the buffer and child`);
+    }
+    try {
+      await js("window.__saveHoldReady = false; void window.__ironTest.holdSave(true).then(() => window.__saveHoldReady = true); return true;");
+      await eventually("native save barrier armed", () => js("return window.__saveHoldReady;"));
+      await replace(saved);
+      await click("#save");
+      await eventually("save_file IPC has reached its native barrier", () => js(`
+        if (!window.__saveAtBarrier) void window.__ironTest.holdSave().then(waiting => window.__saveAtBarrier = waiting);
+        return window.__saveAtBarrier === true && window.__ironTest.saving();
+      `));
+      const beforeSaveQuit = await js("return window.__ironTest.quitRequests();");
+      requestNativeQuit();
+      await Promise.race([
+        eventually("Quit reaches the workbench during a held save", () => js("return window.__ironTest.quitRequests();"), count => count === beforeSaveQuit + 1),
+        app.exited.then(() => { throw new Error("An in-flight save must veto application exit."); }),
+      ]);
+      assert.equal(await js("return document.querySelector('#quit-dialog').open;"), false);
+      assert.equal(await js("return window.__ironTest.saving();"), true);
+      assert.equal(await readFile(source, "utf8"), initial.text);
+      await js("void window.__ironTest.holdSave(false); return true;");
+      await eventually("held save completes after Quit was refused", current, state => state?.text === saved && !state.dirty);
+      assert.equal(await readFile(source, "utf8"), saved);
+      console.log("    Quit during the held native save was refused");
+
+      await replace(unsaved);
+      await eventually("buffer is dirty", current, state => state?.dirty);
+      requestNativeQuit();
+      await cancelled("System Quit");
+
+      await js("void window.__ironTest.quitWindowState(true); return true;");
+      await eventually("AppKit minimized the dirty window", () => js(`
+        void window.__ironTest.quitWindowState().then(state => window.__nativeWindowState = state);
+        return window.__nativeWindowState;
+      `), state => state?.[0] === true);
+      requestNativeQuit();
+      await cancelled("System Quit with minimized window", true);
+
+      await js("window.__menuQuit = null; void window.__ironTest.quitMenu().then(found => window.__menuQuit = found).catch(error => window.__menuQuit = String(error)); return true;");
+      await eventually("default AppKit Quit menu action invoked", () => js("return { result: window.__menuQuit, requests: window.__ironTest.quitRequests(), dialog: document.querySelector('#quit-dialog').open };"), state => state?.result === true);
+      await cancelled("Quit menu");
+
+      await js("void window.__ironTest.closeWindow(); return true;");
+      await cancelled("Native window close");
+
+      requestNativeQuit();
+      await eventually("unanswered Quit dialog is shown", () => js("return document.querySelector('#quit-dialog')?.open === true;"));
+      await eventually("the real timeout dismisses the dialog and restores editing", () => js("return !document.querySelector('#quit-dialog').open && !document.querySelector('#open-folder').disabled;"));
+      assert.equal((await current()).text, unsaved);
+      assert.equal(alive(), true, "expiry leaves the Go process alone");
+      requestNativeQuit();
+      await cancelled("Retry after missing reply");
+
+      requestNativeQuit();
+      await eventually("Discard is available", () => js("return document.querySelector('#quit-dialog').open && !document.querySelector('#quit-discard').disabled;"));
+      try { await click("#quit-discard"); }
+      catch (error) {
+        // A successful Discard can exit before the embedded driver sends
+        // the HTTP acknowledgement. Only allow that transport shutdown
+        // here, and still require the real child process to exit with 0.
+        if (error.cause?.code !== "UND_ERR_SOCKET") throw error;
+      }
+      const result = await Promise.race([app.exited, delay(6000, { code: null, timedOut: true })]);
+      assert.equal(result.code, 0, "approving Discard should exit normally");
+      assert.equal(await readFile(source, "utf8"), saved);
+      await eventually("approved exit stops the Go child", () => !alive());
+    } finally {
+      if (alive()) process.kill(pid, "SIGTERM");
+    }
+  });
 }
 
 async function standardWorkbenchSmoke() {
@@ -565,5 +679,11 @@ async function standardWorkbenchSmoke() {
     await eventually("new main package selected", () => js("return document.querySelector('#run-target').value === '.' && !document.querySelector('#run').disabled;"));
     await click("#run");
     await eventually("new project executes", output, value => /Hello from Iron Go![\s\S]*exit code 0/.test(value));
+  });
+  await record("a clean editor exits normally on system Quit", async () => {
+    assert.equal((await current()).dirty, false);
+    requestNativeQuit();
+    const result = await Promise.race([app.exited, delay(6000, { code: null, timedOut: true })]);
+    assert.equal(result.code, 0);
   });
 }

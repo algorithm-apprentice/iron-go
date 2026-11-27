@@ -12,7 +12,10 @@ e2e = ["dep:tauri-plugin-wdio-webdriver"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+dispatch2 = "0.3"
 libc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSWindow"] }
 regex = "1"
 rfd = { version = "0.17", default-features = false }
 serde = { version = "1", features = ["derive"] }
