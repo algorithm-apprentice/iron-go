@@ -728,3 +728,42 @@ Deliver a finding-by-finding report with regression evidence, status, and
 remaining limits. The final review approves the actual diff and results, not
 merely the fact that the plan was followed. No commit or push before the
 applicable review gate.
+
+### Final acceptance record
+
+Local toolchain: Go 1.27.4 (`darwin/arm64`), gopls 0.24.0, Delve 1.27.2.
+The Go 1.25.x hosted workflow remains in place; a local Go 1.27 run is
+not evidence that either hosted workflow executed.
+
+The first final Go/Debug smoke found a runner race (`1795743867890-40659`):
+the initial editor was open but package discovery was incomplete when the
+isolated Go group clicked Build. The failure snapshot showed `Still
+discovering Go packages`; Debug still passed. The runner now waits for
+the workbench's tool version and the discovered Orbit run target before
+its first task. This is a runner-only change, not a bypass of Go admission.
+On the corrected runner, the local Go 1.27 grouped smoke passed all nine
+Go/Debug cases (`1795743995933-42205`), and the disposable Raft Git snapshot
+passed all seven cases (`1795744014119-43446`), including the real
+`TestLeaderElection` breakpoint and Monaco row alignment checks. The
+user's working checkout and installed app were not used as fixtures.
+The final `npm run test:feedback` passed (19 TS, 31 Rust, the Go fixture,
+17 browser, and 20 native cases across five groups; `1795744040654-43924`).
+
+The release `.app` and `.dmg` built with `npm run tauri build -- --bundles
+app,dmg`. The image's internal checksum verified; it was mounted read-only
+and detached after inspection. The mounted `.app` was `arm64`, version
+`0.1.0`, identifier `dev.irongo.ide`, had the `/Applications` link, and its
+executable matched the standalone bundle. The release executable and assets
+did not include acceptance fixtures, WebDriver markers, or watchdog hooks.
+The DMG SHA-256 was
+`e5f6fe112112c6da163e59c6f2c608d5d94fa344a404e383fbf7bad0c708299a`.
+The production `.app` started from a disposable profile, did not start a
+gopls or Delve child at welcome, and accepted clean system Quit (exit 0).
+
+Picker/Accessibility and physical Retina/mixed-DPI rendering were not
+verified in this round: the macOS console reported locked. The known
+mixed-DPI picker sharpness issue stays outside this remediation. The Quit
+tests prove minimized-window presentation, not separate native coverage of
+the hidden-application branch. Force Quit, writes by uncooperative editors
+after the final save check, and descendants surviving a naturally reaped
+process-group leader remain outside the respective guarantees.

@@ -543,6 +543,10 @@ async function fileSuite() {
 async function goSuite() {
   const capabilities = await probeTools({ gopls: !!values["require-gopls"] });
   await openOrbit();
+  // Monaco can open before the independent package/tool probes finish. A
+  // click during discovery is correctly rejected by the workbench.
+  await eventually("Go toolchain reported", () => text("#tool-version"), value => /go?\s*\d+\.\d+/i.test(value));
+  await eventually("Go package discovery selected the Orbit target", () => js("return document.querySelector('#run-target')?.value;"), value => value === "./cmd/orbit");
   await record("builds, runs, and tests the actual Go module", async () => {
     await click('[data-view="tasks"]');
     await click('[data-task="build"]');
