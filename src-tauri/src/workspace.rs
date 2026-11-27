@@ -1,6 +1,6 @@
 use std::{
     collections::hash_map::DefaultHasher,
-    ffi::CString,
+    ffi::{CStr, CString, OsStr},
     fs::{self, File, Metadata, OpenOptions, TryLockError},
     hash::{Hash, Hasher},
     io::{self, Read, Write},
@@ -204,17 +204,63 @@ impl SaveStage {
         }
     }
 
-    fn persist(mut self, leaf: &str) -> CommandResult<()> {
+    fn persist(&mut self, leaf: &str, exclusive: bool) -> CommandResult<()> {
         let leaf = CString::new(leaf).expect("validated destination name");
         let parent = self.parent.as_raw_fd();
         // Both names are resolved inside the same open destination directory.
-        if unsafe { libc::renameat(parent, self.name.as_ptr(), parent, leaf.as_ptr()) } == 0 {
+        let result = unsafe {
+            if exclusive {
+                libc::renameatx_np(
+                    parent,
+                    self.name.as_ptr(),
+                    parent,
+                    leaf.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            } else {
+                libc::renameat(parent, self.name.as_ptr(), parent, leaf.as_ptr())
+            }
+        };
+        if result == 0 {
             self.committed = true;
             Ok(())
         } else {
             Err(fail("Save file")(io::Error::last_os_error()))
         }
     }
+}
+
+fn open_save_lock(data_dir: &Path) -> CommandResult<File> {
+    fs::create_dir_all(data_dir).map_err(fail("Prepare save lock directory"))?;
+    // Keep this file and inode stable for all cooperating writers in the
+    // profile, including when a workspace encloses the data directory.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(OPEN_REGULAR)
+        .open(data_dir.join(SAVE_LOCK))
+        .map_err(fail("Open save lock"))
+}
+
+fn verify_save_directory(
+    root: &Path,
+    anchor: &RootAnchor,
+    parents: &[&str],
+    parent: &File,
+) -> CommandResult<()> {
+    anchor.verify(root)?;
+    let expected = parent.metadata().map_err(fail("Read save directory"))?;
+    let current = anchor
+        .open_directory(parents)
+        .and_then(|dir| dir.metadata())
+        .map_err(fail("Read save directory"))?;
+    if file_identity(&current) != file_identity(&expected) {
+        return Err("The save directory has been replaced.".into());
+    }
+    Ok(())
 }
 
 impl Drop for SaveStage {
@@ -278,18 +324,7 @@ fn persist_text_impl(
     let parent = anchor
         .open_directory(parents)
         .map_err(fail("Open save directory"))?;
-    let parent_identity = file_identity(&parent.metadata().map_err(fail("Read save directory"))?);
-    let verify_parent = || -> CommandResult<()> {
-        anchor.verify(root)?;
-        let current = anchor
-            .open_directory(parents)
-            .and_then(|dir| dir.metadata())
-            .map_err(fail("Read save directory"))?;
-        if file_identity(&current) != parent_identity {
-            return Err("The save directory has been replaced.".into());
-        }
-        Ok(())
-    };
+    let verify_parent = || verify_save_directory(root, anchor, parents, &parent);
     let open_target = || {
         let file = open_at(&parent, leaf.as_bytes(), libc::O_NONBLOCK)
             .map_err(fail("Open save target"))?;
@@ -301,18 +336,7 @@ fn persist_text_impl(
     } else {
         SAVE_CONFLICT
     };
-    fs::create_dir_all(data_dir).map_err(fail("Prepare save lock directory"))?;
-    // Keep this file and inode stable for all cooperating writers in the
-    // profile, including when a workspace encloses the data directory.
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(OPEN_REGULAR)
-        .open(data_dir.join(SAVE_LOCK))
-        .map_err(fail("Open save lock"))?;
+    let lock = open_save_lock(data_dir)?;
     let lock_info = regular_file(&lock, "Read save lock")?;
     // Keep the original handle alive so its inode cannot be reused during
     // this transaction, even if the destination is replaced while waiting.
@@ -368,7 +392,99 @@ fn persist_text_impl(
     stage.verify()?;
     #[cfg(test)]
     observe(SavePoint::Validated)?;
-    stage.persist(leaf)
+    stage.persist(leaf, false)
+}
+
+fn persist_new_text(
+    root: &Path,
+    anchor: &RootAnchor,
+    data_dir: &Path,
+    relative: &str,
+    text: &str,
+    #[cfg(test)] before_commit: impl FnOnce(),
+) -> CommandResult<String> {
+    if text.len() as u64 > MAX_FILE_BYTES || text.as_bytes().contains(&0) {
+        return Err("Save a UTF-8 text file smaller than 2 MB.".into());
+    }
+    let parts = components(relative)?;
+    if parts
+        .iter()
+        .any(|part| HIDDEN.iter().any(|name| part.eq_ignore_ascii_case(name)))
+    {
+        return Err("This path is excluded from the workspace tree.".into());
+    }
+    let (leaf, parents) = parts.split_last().unwrap();
+    anchor.verify(root)?;
+    let parent = anchor
+        .open_directory(parents)
+        .map_err(fail("Open destination directory"))?;
+    let parent_info = parent
+        .metadata()
+        .map_err(fail("Read destination directory"))?;
+    reject_profile_save_parent(data_dir, &parent_info)?;
+    let root_dir = anchor
+        .open_directory(&[])
+        .map_err(fail("Open workspace directory"))?;
+    let root_path = descriptor_path(&root_dir).map_err(fail("Resolve workspace path"))?;
+    let relative_path = |absolute: &Path| {
+        absolute
+            .strip_prefix(&root_path)
+            .ok()
+            .and_then(Path::to_str)
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+    };
+    let parent_path = descriptor_path(&parent).map_err(fail("Resolve destination directory"))?;
+    let fallback_path = relative_path(&parent_path.join(leaf))
+        .ok_or("The destination is outside the admitted workspace.")?;
+    let lock = open_save_lock(data_dir)?;
+    regular_file(&lock, "Read save lock")?;
+    lock.lock().map_err(fail("Acquire save lock"))?;
+    verify_save_directory(root, anchor, parents, &parent)?;
+    let path = root.join(relative);
+    let mut stage = SaveStage::new(&parent, path.parent().unwrap())?;
+    stage
+        .temporary
+        .write_all(text.as_bytes())
+        .map_err(fail("Write file"))?;
+    #[cfg(test)]
+    before_commit();
+    verify_save_directory(root, anchor, parents, &parent)?;
+    stage.verify()?;
+    stage.persist(leaf, true)?;
+    Ok(descriptor_path(stage.temporary.as_file())
+        .ok()
+        .and_then(|path| relative_path(&path))
+        .unwrap_or(fallback_path))
+}
+
+fn reject_profile_save_parent(data_dir: &Path, parent: &Metadata) -> CommandResult<()> {
+    // On the first save, creating the profile can also create missing
+    // ancestors. Reserve their nearest existing parent conservatively rather
+    // than trying to predict all the names the volume treats as aliases.
+    for candidate in data_dir.ancestors() {
+        match fs::metadata(candidate) {
+            Ok(directory) => {
+                if file_identity(&directory) == file_identity(parent) {
+                    return Err("The app profile directory is reserved.".into());
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(fail("Read app profile directory")(error)),
+        }
+    }
+    Err("Unable to resolve the app profile directory.".into())
+}
+
+fn descriptor_path(file: &File) -> io::Result<PathBuf> {
+    let mut buffer = [0u8; libc::PATH_MAX as usize];
+    // Darwin writes a NUL-terminated path into the PATH_MAX buffer.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let path = CStr::from_bytes_until_nul(&buffer).map_err(io::Error::other)?;
+    Ok(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
 }
 
 fn new_file(root: &Path, anchor: &RootAnchor, relative: &str) -> CommandResult<()> {
@@ -690,6 +806,35 @@ pub async fn save_file(
             Some((&anchor, reviewed_version.as_deref())),
             #[cfg(test)]
             &mut |_| Ok(()),
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn save_new_file(
+    app: AppHandle,
+    state: State<'_, Core>,
+    id: u64,
+    path: String,
+    text: String,
+) -> CommandResult<String> {
+    let (root, anchor) = observation_root(&state, id)?;
+    let data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("Resolve save lock directory: {error}"))?;
+    #[cfg(feature = "e2e")]
+    state.1.wait(&path).await?;
+    blocking(move || {
+        persist_new_text(
+            &root,
+            &anchor,
+            &data_dir,
+            &path,
+            &text,
+            #[cfg(test)]
+            || {},
         )
     })
     .await

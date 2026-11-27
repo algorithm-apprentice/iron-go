@@ -23,6 +23,7 @@ When launched from Finder, Iron Go also searches common tool locations, includin
 - File tree, editor tabs, unsaved-change indicators, undo, save conflict protection, quick file navigation, and full-text search across saved files.
 - **Save All** saves dirty tabs in order. When closing an unsaved tab, switching projects, or quitting, Iron Go offers to save or discard the edits; a failed save keeps the project open.
 - Native file watching updates the project tree and reloads open files without unsaved edits. Changed, missing, or unreadable files are indicated without overwriting unsaved buffers. **Compare with Disk** shows both versions and can reload or save only against the reviewed disk file. **Refresh Project** also rechecks open files.
+- **Save to a New Path** rescues a retained native buffer after deletion or another disk problem. It creates a new file without overwriting an existing destination.
 - Go syntax highlighting in Monaco. `gofmt` formats the current buffer without saving it.
 - Dark and light themes, saved through **Settings → Color Theme** (`⌘,`).
 - `gopls` completion, hover documentation, workspace definition navigation, and diagnostics in the Problems panel. Run a named test through its **Run Test** CodeLens or **Go: Run Test at Cursor** in the command palette.

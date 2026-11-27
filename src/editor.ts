@@ -1,4 +1,5 @@
 import * as monaco from "monaco-editor/editor/editor.api.js";
+import { caseFold } from "unicode-case-folding";
 import "monaco-editor/languages/definitions/go/register.js";
 import "monaco-editor/languages/definitions/markdown/register.js";
 import "monaco-editor/editor/contrib/bracketMatching/browser/bracketMatching.js";
@@ -72,6 +73,12 @@ export function replaceBuffer(model: monaco.editor.ITextModel, text: string) {
 
 type Target = monaco.IRange | monaco.IPosition;
 
+// Be conservative about missing paths, which have no inode to compare. Case
+// folding and canonical normalization catch aliases even on macOS volumes
+// that would currently allow two distinct names.
+const destinationKey = (path: string) => caseFold(path.normalize("NFD"))
+  .replace(/\p{Default_Ignorable_Code_Point}/gu, "").normalize("NFD");
+
 export class Documents {
   readonly editor: monaco.editor.IStandaloneCodeEditor;
   readonly tabs = new Map<string, DocumentTab>();
@@ -82,6 +89,7 @@ export class Documents {
   private opening = new Map<string, Promise<string>>();
   private applyingDisk?: DocumentTab;
   private reviewingDisk?: DocumentTab;
+  private newDestination?: { key: string };
 
   get editRevision() { return this.edits; }
 
@@ -164,6 +172,7 @@ export class Documents {
   reset(folder: Project) {
     this.location++;
     this.opening.clear();
+    this.newDestination = undefined;
     this.editor.setModel(null);
     this.active = undefined;
     for (const tab of this.tabs.values()) this.remove(tab);
@@ -182,7 +191,7 @@ export class Documents {
   async open(path: string, options: { focus?: boolean; activate?: boolean; target?: Target; current?: () => boolean } = {}) {
     const folder = this.folder;
     const { focus = false, activate = true, target, current = () => true } = options;
-    if (!folder || !current()) return;
+    if (!folder || !current() || this.destinationReserved(path)) return;
     // A speculative Debug lookup must never invalidate a user's pending
     // navigation, even when the two callers share the same disk read.
     const location = activate && !options.current ? ++this.location : this.location;
@@ -196,27 +205,10 @@ export class Documents {
       }
       try {
         const disk = await pending;
-        if (folder !== this.folder || !current()) return;
+        if (folder !== this.folder || !current() || this.destinationReserved(path)) return;
         tab = this.tabs.get(path);
         if (!tab) {
-          const root = folder.native?.path;
-          const uri = root ? monaco.Uri.file(`${root.replace(/\/$/, "")}/${path}`) : monaco.Uri.from({ scheme: "irongo-preview", path: `/${path}` });
-          const language = path.endsWith(".go") ? "go" : path.endsWith(".md") ? "markdown" : "plaintext";
-          const model = monaco.editor.createModel(disk, language, uri);
-          model.updateOptions({ insertSpaces: language !== "go", tabSize: 4, indentSize: 4, trimAutoWhitespace: true });
-          const created: DocumentTab = {
-             path, model, disk, clean: bufferText(model), dirty: false, saving: false, reloadRevision: 0, viewState: null,
-             subscription: model.onDidChangeContent(() => {
-              this.edits++;
-              if (this.applyingDisk === created) return;
-              const dirty = bufferText(model) !== created.clean;
-              if (dirty !== created.dirty) {
-                created.dirty = dirty;
-                this.events.changed();
-              }
-              this.events.edited(created);
-            }),
-          };
+          const created = this.makeTab(folder, path, disk, disk);
           this.tabs.set(path, created);
           this.events.opened(created);
           this.events.changed();
@@ -227,6 +219,73 @@ export class Documents {
     if (!tab || folder !== this.folder || !current()) return;
     if (activate && location === this.location) this.activate(tab, focus, target);
     return tab;
+  }
+
+  private destinationReserved(path: string) {
+    return this.newDestination !== undefined && this.newDestination.key === destinationKey(path);
+  }
+
+  private makeTab(folder: Project, path: string, text: string, disk: string, saved?: string): DocumentTab {
+    const root = folder.native?.path;
+    const uri = root ? monaco.Uri.file(`${root.replace(/\/$/, "")}/${path}`) : monaco.Uri.from({ scheme: "irongo-preview", path: `/${path}` });
+    const language = path.endsWith(".go") ? "go" : path.endsWith(".md") ? "markdown" : "plaintext";
+    const model = monaco.editor.createModel(text, language, uri);
+    model.updateOptions({ insertSpaces: language !== "go", tabSize: 4, indentSize: 4, trimAutoWhitespace: true });
+    const current = bufferText(model);
+    const clean = saved ?? current;
+    const tab: DocumentTab = {
+      path, model, disk, clean, dirty: current !== clean, saving: false, reloadRevision: 0, viewState: null,
+      subscription: model.onDidChangeContent(() => {
+        this.edits++;
+        if (this.applyingDisk === tab) return;
+        const dirty = bufferText(model) !== tab.clean;
+        if (dirty !== tab.dirty) {
+          tab.dirty = dirty;
+          this.events.changed();
+        }
+        this.events.edited(tab);
+      }),
+    };
+    return tab;
+  }
+
+  async saveToNew(tab: DocumentTab, path: string) {
+    const folder = this.folder;
+    if (!folder?.createFromBuffer || !this.isLive(folder, tab) || this.newDestination || tab.saving || tab.reloading !== undefined) return;
+    const key = destinationKey(path);
+    if ([...this.tabs.keys(), ...this.opening.keys()].some(existing => destinationKey(existing) === key)) {
+      throw new Error("This path matches an open or opening tab. Choose a different path.");
+    }
+    const destination = this.newDestination = { key };
+    const submitted = bufferText(tab.model);
+    tab.reloadRevision++;
+    tab.saving = true;
+    this.events.changed();
+    try {
+      const actualPath = await folder.createFromBuffer(path, submitted);
+      if (!this.isLive(folder, tab)) return;
+      const rebound = this.makeTab(folder, actualPath, bufferText(tab.model), submitted, submitted);
+      const wasActive = this.active === tab;
+      rebound.viewState = wasActive ? this.editor.saveViewState() : tab.viewState;
+      const order = [...this.tabs.values()];
+      this.tabs.clear();
+      for (const existing of order) {
+        const current = existing === tab ? rebound : existing;
+        this.tabs.set(current.path, current);
+      }
+      if (wasActive) {
+        this.active = undefined;
+        this.activate(rebound, false);
+      }
+      this.remove(tab);
+      this.events.opened(rebound);
+      this.events.changed();
+      return rebound;
+    } finally {
+      if (this.newDestination === destination) this.newDestination = undefined;
+      tab.saving = false;
+      if (this.isLive(folder, tab)) this.events.changed();
+    }
   }
 
   private activate(tab: DocumentTab, focus: boolean, target?: Target) {

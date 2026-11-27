@@ -136,6 +136,52 @@ test("an external observation cannot apply across a newer edit or save baseline"
   });
 });
 
+test("saving to a new path fences aliases and old observations and keeps later edits", async () => {
+  await documentScenario("save-to-new-path", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs, documentState } = window;
+      const observation = Promise.withResolvers();
+      const pendingOpen = Promise.withResolvers();
+      const write = Promise.withResolvers();
+      const writes = [];
+      docs.reset({
+        read: path => path === "pending.txt" ? pendingOpen.promise : Promise.resolve("original"),
+        inspect: () => observation.promise,
+        createFromBuffer: (path, text) => { writes.push([path, text]); return write.promise; },
+        save: async (path, expected, text) => { writes.push([path, expected, text]); },
+      });
+      const source = await docs.open("source.txt");
+      await docs.open("Résumé.txt", { activate: false });
+      await docs.open("straße.txt", { activate: false });
+      const pending = docs.open("pending.txt", { activate: false });
+      const refused = [];
+      for (const path of ["re\u0301sume\u0301.TXT", "STRAẞE.txt", "STRASSE.txt", "PENDING.txt", "SOURCE.txt"]) {
+        try { await docs.saveToNew(source, path); } catch { refused.push(path); }
+      }
+      pendingOpen.resolve("an open tab");
+      await pending;
+      const obsolete = docs.reconcile(source);
+      source.model.setValue("submitted");
+      const saving = docs.saveToNew(source, "rescue.txt");
+      const aliasWasBlocked = await docs.open("RESCUE.txt") === undefined;
+      source.model.setValue("newer edit");
+      write.resolve("rescue.txt");
+      const rebound = await saving;
+      observation.resolve({ kind: "missing" });
+      await obsolete;
+      const state = documentState(rebound);
+      await docs.save(rebound);
+      return { aliasWasBlocked, refused: refused.length, sourceStillOpen: docs.tabs.has("source.txt"), active: docs.active.path,
+        diskChange: rebound.diskChange ?? null, state, writes };
+    });
+    assert.deepEqual(outcome, {
+      aliasWasBlocked: true, refused: 5, sourceStillOpen: false, active: "rescue.txt", diskChange: null,
+      state: { text: "newer edit", disk: "submitted", dirty: true },
+      writes: [["rescue.txt", "submitted"], ["rescue.txt", "submitted", "newer edit"]],
+    });
+  });
+});
+
 test("clean external reload is undoable against the new baseline and adopts a new encoding convention", async () => {
   await documentScenario("external-reload-baseline", async page => {
     const outcome = await page.evaluate(async () => {

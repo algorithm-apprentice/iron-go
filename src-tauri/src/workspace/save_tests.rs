@@ -237,6 +237,64 @@ fn staging_identity_does_not_depend_on_read_permissions() {
 }
 
 #[test]
+fn new_path_never_replaces_a_destination_created_after_staging() {
+    let fixture = Fixture::new();
+    let project = Workspace::open(&fixture.root).unwrap();
+    let destination = fixture.root.join("recovered.txt");
+    let result = persist_new_text(
+        &project.root,
+        &project.anchor,
+        &fixture.profile,
+        "recovered.txt",
+        "editor",
+        || {
+            fs::write(&destination, "other writer").unwrap();
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(fs::read_to_string(destination).unwrap(), "other writer");
+    assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 2);
+}
+
+#[test]
+fn new_path_cannot_create_the_stable_profile_lock_as_a_side_effect() {
+    let fixture = Fixture::new();
+    fs::create_dir(&fixture.profile).unwrap();
+    let workspace = Workspace::open(fixture.dir.path()).unwrap();
+    let result = persist_new_text(
+        &workspace.root,
+        &workspace.anchor,
+        &fixture.profile,
+        "profile/SAVE.LOCK",
+        "does not belong in the profile",
+        || {},
+    );
+    assert!(result
+        .unwrap_err()
+        .contains("profile directory is reserved"));
+    assert_eq!(fs::read_dir(fixture.profile).unwrap().count(), 0);
+}
+
+#[test]
+fn new_path_cannot_provision_the_requested_destination_as_an_app_directory() {
+    let fixture = Fixture::new();
+    let workspace = Workspace::open(fixture.dir.path()).unwrap();
+    let result = persist_new_text(
+        &workspace.root,
+        &workspace.anchor,
+        &fixture.profile,
+        "PROFILE",
+        "file contents",
+        || {},
+    );
+    assert!(result
+        .unwrap_err()
+        .contains("profile directory is reserved"));
+    assert!(!fixture.profile.exists());
+    assert!(!workspace.root.join("PROFILE").exists());
+}
+
+#[test]
 fn lock_and_replace_errors_leave_original_bytes() {
     let fixture = Fixture::new();
     // A non-directory in place of the profile makes lock creation fail.

@@ -55,6 +55,7 @@ export interface Project {
   inspect?(path: string): Promise<DiskObservation>;
   save(path: string, expected: string, text: string, reviewedVersion?: string, quitTicket?: number): Promise<void>;
   createFile(path: string): Promise<void>;
+  createFromBuffer?(path: string, text: string): Promise<string>;
   search(query: string, caseSensitive: boolean): Promise<SearchResult>;
 }
 
@@ -67,6 +68,7 @@ export function nativeProject(native: NativeFolder): Project {
     inspect: (path) => invoke<DiskObservation>("inspect_file", { id, path }),
     save: (path, expected, text, reviewedVersion, quitTicket) => invoke<void>("save_file", { id, path, expected, text, reviewedVersion, quitTicket }),
     createFile: (path) => invoke<void>("create_file", { id, path }),
+    createFromBuffer: (path, text) => invoke<string>("save_new_file", { id, path, text }),
     search: (query, caseSensitive) => invoke<SearchResult>("search_files", { id, query, caseSensitive }),
   };
 }

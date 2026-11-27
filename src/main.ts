@@ -265,6 +265,7 @@ function renderDocuments() {
   disk.textContent = active?.diskChange ? diskMessage[active.diskChange] : "";
   disk.hidden = !disk.textContent;
   byId("compare-disk").hidden = !project.native || active?.diskChange !== "changed";
+  byId("save-new-path").hidden = !project.native || (active?.diskChange !== "missing" && active?.diskChange !== "unavailable");
   updateCursor();
   syncControls();
 }
@@ -457,6 +458,30 @@ async function compareWithDisk() {
     release();
     if (document.activeElement === document.body && docs.active === tab) docs.editor.focus();
   }
+}
+
+function saveToNewPath() {
+  const tab = docs.active;
+  const target = project;
+  if (!tab || !target.createFromBuffer) return;
+  const release = reserveFileActivity();
+  if (!release) return;
+  byId("form-dialog").addEventListener("close", release, { once: true });
+  forms.show({
+    title: "Save to a New Path", description: `Save the buffer for ${tab.path} to a new file without changing the existing path.`,
+    submit: "Save New File", fields: [{ name: "path", label: "Workspace-relative destination", placeholder: "recovered.txt" }],
+    async run({ path }) {
+      if (project !== target) return false;
+      validateRelative(path);
+      const rebound = await docs.saveToNew(tab, path);
+      if (!rebound) return false;
+      revealParents(rebound.path);
+      rootExpanded = true;
+      await refresh();
+      if (view === "search") scheduleSearch();
+      status(`Saved ${rebound.path}`);
+    },
+  });
 }
 
 async function reloadActive() {
@@ -957,6 +982,7 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Save All", icon: "save", run: saveAll },
     { label: "Reload File from Disk", icon: "refresh", run: reloadActive },
     ...(project.native && docs.active ? [{ label: "Compare with Disk", icon: "files" as const, run: compareWithDisk }] : []),
+    ...(project.native && docs.active ? [{ label: "Save to a New Path…", icon: "save" as const, run: saveToNewPath }] : []),
     { label: "Format Go File", detail: "⇧⌥F", icon: "format", run: formatActive },
     { label: "Go: Run Selected Target", detail: "⌘↵", icon: "play", run: () => { void runTask("run"); } },
     { label: "Go: Choose Run Target", icon: "package", run: () => runTargets.picker.focus() },
@@ -1085,6 +1111,7 @@ byId("new-file").addEventListener("click", newFile);
 byId("format").addEventListener("click", formatActive);
 byId("save").addEventListener("click", saveActive);
 byId("compare-disk").addEventListener("click", compareWithDisk);
+byId("save-new-path").addEventListener("click", saveToNewPath);
 const runOrStop = () => execution.task ? stopTask() : runTask(runTargets.primaryAction());
 byId("run").addEventListener("click", runOrStop);
 byId("panel-stop").addEventListener("click", stopTask);

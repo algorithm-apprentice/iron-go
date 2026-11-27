@@ -190,6 +190,7 @@ fn main() {
             workspace_disk::start_workspace_watch,
             workspace_disk::wait_workspace_watch,
             workspace::save_file,
+            workspace::save_new_file,
             workspace::create_file,
             workspace::search_files,
             tools::go_tools,

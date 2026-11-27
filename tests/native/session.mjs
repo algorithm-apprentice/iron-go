@@ -1164,6 +1164,69 @@ async function fileSuite() {
     assert.ok(sizes[0].margin <= 66 && sizes[1].margin <= 74, JSON.stringify(sizes));
     await traceGutterClick(1000);
   });
+  await record("native Save to a New Path rescues an unavailable buffer without overwriting", async () => {
+    const sourceFile = path.join(fixture, "recover-source.txt");
+    const openAlias = path.join(fixture, "already-open.txt");
+    const existing = path.join(fixture, "exists.txt");
+    const canonical = "recovery-pkg/recovered.txt";
+    const recovered = path.join(fixture, canonical);
+    await mkdir(path.join(fixture, "recovery-pkg"));
+    const request = await stat(path.join(fixture, "RECOVERY-PKG")).then(() => "RECOVERY-PKG/recovered.txt", error => {
+      if (error.code !== "ENOENT") throw error;
+      return canonical;
+    });
+    await Promise.all([[sourceFile, "original\n"], [openAlias, "alias\n"], [existing, "do not overwrite\n"]]
+      .map(([file, content]) => writeFile(file, content)));
+    for (const relative of ["already-open.txt", "recover-source.txt"]) {
+      await eventually(`${relative} appears in the tree`, () => js("return !!document.querySelector('#explorer [data-path=\"' + arguments[0] + '\"]');", relative));
+      await click(`#explorer [data-path="${relative}"]`);
+      await eventually(`${relative} is active`, current, state => state?.path === relative);
+    }
+    const submitted = "retained unsaved text\n";
+    const newer = submitted + "newer editor changes\n";
+    await replace(submitted);
+    await rename(sourceFile, path.join(fixture, "source-backup.txt"));
+    await rename(openAlias, path.join(fixture, "alias-backup.txt"));
+    await eventually("the missing file offers a rescue action", () => js("return !document.querySelector('#save-new-path').hidden;"));
+    await click("#save-new-path");
+    await click('[data-dialog-close="form-dialog"]');
+    await eventually("Cancel leaves the previous tab and controls", () => js("return !document.querySelector('#save').disabled;"));
+    assert.equal((await current()).text, submitted);
+
+    await click("#save-new-path");
+    await set("#form-path", "ALREADY-OPEN.txt");
+    await click("#form-submit");
+    await eventually("missing open aliases remain protected", () => text("#form-error"), value => /matches an open/i.test(value));
+    await set("#form-path", "exists.txt");
+    await click("#form-submit");
+    await eventually("existing path collision is reported", () => text("#form-error"), value => /file exists/i.test(value));
+    assert.equal(await readFile(existing, "utf8"), "do not overwrite\n");
+    assert.equal((await current()).text, submitted);
+
+    await js("window.__newPathHold = false; void window.__ironTest.holdSave(true, arguments[0]).then(() => window.__newPathHold = true); return true;", request);
+    await eventually("new path hold is enabled", () => js("return window.__newPathHold;"));
+    try {
+      await set("#form-path", request);
+      await click("#form-submit");
+      await eventually("new path write is admitted", () => js(`
+        if (!window.__newPathAtBarrier) void window.__ironTest.holdSave().then(waiting => window.__newPathAtBarrier = waiting);
+        return !!window.__newPathAtBarrier;
+      `));
+      await replace(newer);
+    } finally { await js("void window.__ironTest.holdSave(false); return true;"); }
+    await eventually("the tab rebinds to disk spelling and preserves later edits", current, state => state?.path === canonical && state.text === newer && state.dirty);
+    assert.equal(await readFile(recovered, "utf8"), submitted);
+    await assert.rejects(stat(sourceFile), { code: "ENOENT" });
+    await eventually("the new path appears in the restored workbench", () => js("return !document.querySelector('#save').disabled && !!document.querySelector('#explorer [data-path=\"recovery-pkg/recovered.txt\"]');"));
+    await click("#quick-open");
+    await set("#palette-text", "recovered.txt");
+    await click("#palette-options button");
+    await eventually("Quick Open activates the rebound editor", current, state => state?.path === canonical && state.text === newer);
+    assert.equal(await js("return [...document.querySelectorAll('#tabs .tab-main')].filter(tab => tab.dataset.path.endsWith('/recovered.txt')).length;"), 1);
+    await click("#save");
+    await eventually("ordinary Save advances the new file", () => readFile(recovered, "utf8"), value => value === newer);
+    await eventually("the rebound tab is clean", current, state => !state.dirty);
+  });
   await record("native watcher detects a moved ancestor and rejects writes into a replacement root", async () => {
     const parent = path.dirname(fixture);
     const retired = `${parent}-retired`;
