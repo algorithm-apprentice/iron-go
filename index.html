@@ -14,9 +14,9 @@
           <span data-icon="search"></span><span id="quick-label">Search files</span><kbd>⌘ P</kbd>
         </button>
         <div class="title-actions">
-          <button id="open-folder" class="icon-button" title="Open Project (⌘O)" aria-label="Open Project" data-icon="folderOpen"></button>
+          <button id="open-folder" class="icon-button" title="Open Project (⌘O)" aria-label="Open Project" data-icon="folderOpen" hidden></button>
           <button id="toggle-sidebar" class="icon-button" title="Toggle Side Bar (⌘B)" aria-label="Toggle Side Bar" aria-pressed="true" data-icon="sidebar"></button>
-          <button id="toggle-panel" class="icon-button" title="Toggle Bottom Panel (⌘J)" aria-label="Toggle Bottom Panel" aria-pressed="true" data-icon="layout"></button>
+          <button id="toggle-panel" class="icon-button" title="Toggle Bottom Panel (⌘J)" aria-label="Toggle Bottom Panel" aria-controls="panel" aria-pressed="true" data-icon="layout"></button>
         </div>
       </header>
 
@@ -34,7 +34,6 @@
               <h1>Project</h1>
               <div class="inline-actions">
                 <button id="new-file" class="icon-button" title="New File" aria-label="New File" data-icon="filePlus"></button>
-                <button id="refresh-files" class="icon-button" title="Refresh Project" aria-label="Refresh Project" data-icon="refresh"></button>
                 <button id="workspace-actions" class="icon-button" title="Project Actions" aria-label="Project Actions" data-icon="more"></button>
               </div>
             </header>
@@ -128,10 +127,8 @@
                 <button class="panel-tab active" id="output-tab" role="tab" aria-controls="output-pane" aria-selected="true" data-panel="output">Output</button>
               </div>
               <div class="panel-actions inline-actions">
-                <span class="output-source"><span data-icon="terminal"></span> Go Output</span>
                 <button id="panel-stop" class="icon-button" title="Stop Task" aria-label="Stop Task" data-icon="stop" hidden></button>
                 <button id="clear-output" class="icon-button" title="Clear Output" aria-label="Clear Output" data-icon="trash"></button>
-                <button id="hide-panel" class="icon-button" title="Hide Panel (⌘J)" aria-label="Hide Panel" data-icon="close"></button>
               </div>
             </div>
             <div id="output-pane" class="output-pane" role="tabpanel" aria-labelledby="output-tab" tabindex="0">
@@ -153,7 +150,7 @@
         <span id="indent" class="status-detail">Tab Size: 4</span>
         <span class="status-detail encoding">UTF-8</span>
         <span id="language" class="status-detail">Go</span>
-        <button id="tool-status" class="status-button tool-status" aria-label="Go tools and settings" title="Go tools and settings"><span class="status-dot"></span><span id="tool-version">Preview</span></button>
+        <span id="tool-status" class="tool-status" role="status" aria-label="Go toolchain"><span class="status-dot" aria-hidden="true"></span><span id="tool-version">Preview</span></span>
       </footer>
     </div>
 

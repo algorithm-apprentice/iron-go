@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { expectedGoSyntax, goSyntaxSample, renderedGoSyntax } from "../go-syntax-sample.mjs";
 import { runtimeClean } from "./plan.mjs";
 
 if (!process.send) throw new Error("Run native acceptance through workbench.mjs.");
@@ -48,6 +49,24 @@ const output = () => text("#output-log");
 async function chooseCommand(command) {
   await click("#quick-open");
   await set("#palette-text", `>${command}`);
+  await click("#palette-options button");
+}
+
+async function openProjectControl(expected) {
+  const visible = await js(`return ['#welcome-open', '#open-folder'].filter(selector => {
+    const box = document.querySelector(selector).getBoundingClientRect();
+    return box.width > 0 && box.height > 0;
+  });`);
+  assert.equal(visible.length, 1, "exactly one Open Project control is visible");
+  if (expected) assert.equal(visible[0], expected);
+  await click(visible[0]);
+}
+
+async function refreshThroughProjectActions() {
+  await click('[data-view="explorer"]');
+  await click("#workspace-actions");
+  await set("#palette-text", "refresh project");
+  await eventually("project menu exposes Refresh Project", () => text("#palette-options"), value => value.includes("Refresh Project"));
   await click("#palette-options button");
 }
 
@@ -238,7 +257,7 @@ async function externalProjectSmoke() {
   assert.ok(module, "The project smoke expects a root go.mod");
   await record(`opens the committed ${module} snapshot as a real Go project`, async () => {
     await eventually("workbench ready", () => js("return !!window.__ironTest && document.querySelector('#project-welcome')?.hidden === false;"));
-    await click("#open-folder");
+    await openProjectControl("#welcome-open");
     await eventually("external module editor", current, state => state?.root === fixture && state.path?.endsWith(".go"), 30_000);
     assert.equal(await text("#module-name"), module);
   });
@@ -329,7 +348,7 @@ async function nativeQuitSmoke() {
   await record("native Quit asks before discarding a dirty Go buffer", async () => {
     const source = path.join(fixture, "cmd/orbit/main.go");
     await writeFile(source, 'package main\nimport ("fmt"; "os"; "time")\nfunc main(){fmt.Printf("quit-child-ready %d\\n",os.Getpid());time.Sleep(time.Minute)}\n');
-    await click("#open-folder");
+    await openProjectControl("#welcome-open");
     const initial = await eventually("disposable project open", current, state => state?.path === "cmd/orbit/main.go");
     await eventually("Go target ready", () => js("return document.querySelector('#run-target').value === './cmd/orbit' && !document.querySelector('#run').disabled;"));
     await click("#run");
@@ -430,11 +449,8 @@ async function nativeQuitSmoke() {
   });
 }
 
-async function checkTheme() {
-  await record("native theme switches both the editor and workbench", async () => {
-    await eventually("workbench boot", () => js("return !!window.__ironTest && document.body.classList.contains('desktop');"));
-    await click("#settings");
-    const selectTheme = value => js(`
+function selectNativeTheme(value) {
+  return js(`
       const select = document.querySelector('#theme-setting');
       if (!select) return 'Color Theme selector missing';
       let error = null;
@@ -446,17 +462,29 @@ async function checkTheme() {
         return error;
       } finally { window.removeEventListener('error', onError); }
     `, value);
-    const colors = () => js("return ['.monaco-editor-background', '.sidebar', '.bottom-panel'].map(selector => getComputedStyle(document.querySelector(selector)).backgroundColor);");
-    assert.equal(await selectTheme("light"), null);
-    await eventually("native VS Code Light colors", colors, value => value?.join("/") === "rgb(255, 255, 255)/rgb(250, 250, 253)/rgb(250, 250, 253)");
-    assert.equal(await selectTheme("dark"), null);
-    await eventually("native VS Code Dark colors", colors, value => value?.join("/") === "rgb(18, 19, 20)/rgb(25, 26, 27)/rgb(25, 26, 27)");
+}
+
+async function setNativeTheme(theme) {
+  await click("#settings");
+  assert.equal(await selectNativeTheme(theme), null);
+  await click('[data-dialog-close="settings-dialog"]');
+}
+
+async function checkTheme() {
+  await record("native theme switches both the editor and workbench", async () => {
+    await eventually("workbench boot", () => js("return !!window.__ironTest && document.body.classList.contains('desktop');"));
+    const colors = () => js("return ['.monaco-editor-background', '.sidebar', '.bottom-panel', '#run'].map(selector => getComputedStyle(document.querySelector(selector)).backgroundColor);");
+    await click("#settings");
+    assert.equal(await selectNativeTheme("light"), null);
+    await eventually("native Light Modern colors", colors, value => value?.join("/") === "rgb(255, 255, 255)/rgb(248, 248, 248)/rgb(248, 248, 248)/rgb(0, 95, 184)");
+    assert.equal(await selectNativeTheme("dark"), null);
+    await eventually("native Dark Modern colors", colors, value => value?.join("/") === "rgb(31, 31, 31)/rgb(24, 24, 24)/rgb(24, 24, 24)/rgb(0, 120, 212)");
     await click('[data-dialog-close="settings-dialog"]');
   });
 }
 
 async function openOrbit() {
-  await click("#open-folder");
+  await openProjectControl("#welcome-open");
   return eventually("native folder and Monaco file", current, state => state?.path === "cmd/orbit/main.go" && state?.root === fixture);
 }
 
@@ -517,8 +545,26 @@ async function lifecycleSuite() {
     await eventually("Go toolchain reported", () => text("#tool-version"), value => /go?\s*\d+\.\d+/i.test(value));
     await eventually("sole executable selected without typing", () => js("return document.querySelector('#run-target')?.value;"), value => value === "./cmd/orbit", 5000);
   });
-  await addWaitTarget();
-  await click("#refresh-files");
+  await record("Project Actions refreshes the tree and Go targets without a second button", async () => {
+    assert.equal(await js("return !!document.querySelector('#refresh-files');"), false);
+    await addWaitTarget();
+    await refreshThroughProjectActions();
+    await eventually("new executable discovered after menu refresh", () => js("return [...document.querySelector('#run-target').options].some(option => option.value === './cmd/wait');"));
+    await eventually("new package appears in expanded Go tree", () => js("return !!document.querySelector('#explorer [data-path=\"cmd/wait\"]');"));
+    await click('#explorer [data-path="cmd/wait"]');
+    await eventually("new source appears in the expanded package", () => js("return !!document.querySelector('#explorer [data-path=\"cmd/wait/entry.go\"]');"));
+  });
+  await record("Go toolchain status stays visible without a second Settings control", async () => {
+    const status = await js(`const el = document.querySelector('#tool-status');
+      return { tag: el.tagName, tabIndex: el.tabIndex, version: el.textContent, visible: el.getBoundingClientRect().width > 0 };`);
+    assert.deepEqual({ ...status, version: undefined }, { tag: "SPAN", tabIndex: -1, version: undefined, visible: true });
+    assert.match(status.version, /Go \d+\.\d+/);
+    await click("#settings");
+    await click("#probe-tools");
+    await eventually("probe completes in Settings", () => js("return !document.querySelector('#probe-tools').disabled;"));
+    assert.equal(await text("#tool-version"), status.version);
+    await click('[data-dialog-close="settings-dialog"]');
+  });
   await lifecycleTransitions();
 }
 
@@ -580,7 +626,43 @@ async function fileSuite() {
     assert.equal(await js("return document.querySelector('#search-case').getBoundingClientRect().height;"), 24);
     await click('[data-view="explorer"]');
   });
+  await record("native bottom panel has one persistent toggle and keeps focus reachable", async () => {
+    const state = () => js(`return {
+      shown: !document.querySelector('#panel').hidden,
+      pressed: document.querySelector('#toggle-panel').getAttribute('aria-pressed'),
+      focus: document.activeElement?.id,
+      problems: document.querySelector('#problems-tab').getAttribute('aria-selected'),
+      duplicate: !!document.querySelector('#hide-panel, .output-source')
+    };`);
+    const shortcut = () => js("document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'j', metaKey: true, bubbles: true, cancelable: true })); return true;");
+    assert.equal((await state()).duplicate, false);
+    await click("#toggle-panel");
+    await eventually("title toggle hides bottom panel", state, result => !result.shown && result.pressed === "false");
+    await shortcut();
+    await eventually("keyboard shortcut shows bottom panel", state, result => result.shown && result.pressed === "true");
+    await click("#problems-tab");
+    await js("document.querySelector('#problems-tab').focus(); return true;");
+    await shortcut();
+    await eventually("focus moves from hidden tab to visible toggle", state, result => !result.shown && result.focus === "toggle-panel");
+    await click("#status-problems");
+    await eventually("status Problems opens the correct tab", state, result => result.shown && result.problems === "true");
+    await click("#output-tab");
+  });
   await checkTheme();
+  await record("native Go syntax roles change in place without dropping the buffer", async () => {
+    await replace(goSyntaxSample);
+    for (const theme of ["dark", "light"]) {
+      await setNativeTheme(theme);
+      await eventually(`${theme} rendered Go token colors`, () => js(`return (${renderedGoSyntax.toString()})();`),
+        colors => Object.entries(expectedGoSyntax[theme]).every(([role, color]) => colors?.[role] === color));
+      const state = await current();
+      assert.equal(state.text, goSyntaxSample);
+      assert.equal(state.dirty, true);
+      assert.equal(await readFile(source, "utf8"), original);
+    }
+    await setNativeTheme("dark");
+    await replace(original);
+  });
 
   await record("formats only the buffer, then saves actual disk bytes", async () => {
     const ugly = original.replace("const version =", "const     version=     ") + "\n// Native acceptance\n";
@@ -625,7 +707,7 @@ async function fileSuite() {
       const source = ["package main", ...Array.from({ length: lines - 1 }, (_, index) => `// line ${index + 2}`)].join("\n");
       await writeFile(path.join(fixture, `gutter${lines}.go`), source);
     }
-    await click("#refresh-files");
+    await refreshThroughProjectActions();
     await eventually("gutter fixtures in the tree", () => js("return !!document.querySelector('#explorer [data-path=\"gutter1001.go\"]');"));
     const sizes = [];
     for (const lines of [999, 1001]) {
@@ -671,7 +753,7 @@ async function goSuite() {
 
   await record("chooses between two actual Go targets and stops the inferior", async () => {
     await addWaitTarget();
-    await click("#open-folder");
+    await openProjectControl("#open-folder");
     await eventually("both discovered targets", () => js("return Array.from(document.querySelector('#run-target').options).map(option => option.value);"), values => values?.includes("./cmd/orbit") && values?.includes("./cmd/wait"));
     await eventually("workspace ready", () => js("return !document.querySelector('#run').disabled;"));
     assert.equal(await js("return document.querySelector('#run-target').value;"), "");
@@ -681,6 +763,12 @@ async function goSuite() {
     await click("#run");
     const ready = await eventually("long-running Go program", output, value => /agent-ready \d+/.test(value), 30_000);
     const pid = Number(ready.match(/agent-ready (\d+)/)[1]);
+    const actionGap = await js(`
+      const stop = document.querySelector('#panel-stop').getBoundingClientRect();
+      const clear = document.querySelector('#clear-output').getBoundingClientRect();
+      return stop.width && clear.width ? clear.left - stop.right : null;
+    `);
+    assert.equal(actionGap, 1, "visible Stop Task and Clear Output keep a one-pixel gap");
     await click("#panel-stop");
     await eventually("task cancellation", output, value => /task stopped/i.test(value));
     await eventually("Go inferior exited", () => {
@@ -706,8 +794,17 @@ async function goSuite() {
       const lines = partial.split("\n");
       const index = lines.findIndex(line => line.includes("status.NewRep"));
       await replace(partial);
-      await js("return window.__ironTest.suggest(arguments[0], arguments[1]);", index + 1, lines[index].indexOf("NewRep") + "NewRep".length + 1);
-      await eventually("NewReport suggestion", () => js("return Array.from(document.querySelectorAll('.suggest-widget.visible .monaco-list-row')).map(row => row.textContent);"), items => items?.some(item => item.includes("NewReport")), 20_000);
+      for (const [theme, background] of [["dark", "rgb(4, 57, 94)"], ["light", "rgb(0, 95, 184)"]]) {
+        if (theme === "light") await setNativeTheme(theme);
+        await js("return window.__ironTest.suggest(arguments[0], arguments[1]);", index + 1, lines[index].indexOf("NewRep") + "NewRep".length + 1);
+        await eventually(`selected Go completion uses ${theme} Modern colors`, () => js(`
+          const row = document.querySelector('.suggest-widget.visible .monaco-list-row.focused');
+          if (!row) return null;
+          const style = getComputedStyle(row);
+          return { text: row.textContent, background: style.backgroundColor, foreground: style.color };
+        `), row => row?.text.includes("NewReport") && row.background === background && row.foreground === "rgb(255, 255, 255)", 20_000);
+      }
+      await setNativeTheme("dark");
       await replace(clean);
     });
     await record("gopls hover and definition work through Monaco", async () => {
@@ -829,7 +926,7 @@ async function debugSuite() {
         await gone("Debug Stop reaps Delve", stopped);
 
         const switched = await paused();
-        await click("#open-folder");
+        await openProjectControl("#open-folder");
         await eventually("switch confirms active debug session", () => js("return document.querySelector('#project-transition-dialog').open;"));
         assert.match(await text("#project-transition-description"), /debug session will be stopped/i);
         await click("#project-transition-continue");
@@ -865,7 +962,7 @@ async function lifecycleTransitions() {
     const active = await current();
     assert.equal(active.dirty, true);
     const confirm = () => eventually("real project transition confirmation", () => js("return document.querySelector('#project-transition-dialog')?.open === true;"));
-    await click("#open-folder");
+    await openProjectControl("#open-folder");
     await confirm();
     assert.match(await text("#project-transition-description"), /unsaved edits.*Go task/i);
     await click("#project-transition-cancel");
@@ -891,7 +988,7 @@ async function lifecycleTransitions() {
   });
   await record("a project without an executable offers Test as its primary action", async () => {
     await rename(path.join(fixture, "cmd"), path.join(fixture, ".hidden-cmd"));
-    await click("#open-folder");
+    await openProjectControl("#welcome-open");
     await eventually("library Test toolbar action", () => text("#run"), value => value.trim() === "Test", 5000);
     await click("#run");
     await eventually("library tests run from the toolbar", output, value => /PASS: TestSummary[\s\S]*exit code 0/.test(value), 60_000);

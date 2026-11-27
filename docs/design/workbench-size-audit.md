@@ -104,6 +104,10 @@ answers a different question; do not erase useful status to remove an action.
 | Toolbar Go Run/Stop versus Go panel actions | Toolbar is one-target immediate action; Build, package scope and Test in the panel retain distinct behavior. Consolidate only equivalent actions, not the scope picker or Build. |
 | Active filename versus breadcrumbs | Different information: which buffer is active versus where it lives. Retain enough path context to disambiguate same-named files. |
 
-These are candidates for a separate interaction pass, not removals shipped
-by the geometry change. Prove each action still works by pointer and keyboard
-when its relevant panel is open or closed before deleting an entry.
+The geometry change did not remove these controls. The
+[bottom panel interaction pass](output-panel-controls.md) removes the redundant
+badge and Hide button. The [project and Settings pass](workbench-entry-points.md)
+consolidates Open Project, Settings, and Refresh Project. Run/Stop scopes and
+path context remain distinct; no removal is proposed for them without new
+evidence. Prove each action still works by pointer and keyboard in its
+relevant states before deleting an entry.

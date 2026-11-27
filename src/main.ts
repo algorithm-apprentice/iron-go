@@ -241,10 +241,10 @@ function syncControls() {
   btn("format").disabled = !active?.path.endsWith(".go") || formatting || fileActionsBlocked();
   btn("save").disabled = !active || active.saving || fileActionsBlocked();
   btn("open-folder").disabled = busy || execution.preparing || filesBusy();
+  btn("open-folder").hidden = !!project.welcome;
   btn("welcome-open").disabled = busy;
   btn("welcome-new").disabled = busy;
   btn("new-file").disabled = fileActionsBlocked() || !!project.welcome;
-  btn("refresh-files").disabled = busy || !!project.welcome;
   const run = btn("run");
   run.disabled = busy || (execution.occupied ? !execution.canStopTask : filesBusy()) || !!project.welcome;
   run.dataset.running = String(!!task);
@@ -660,7 +660,7 @@ async function testAtCursor(kind: "run" | "debug") {
 }
 
 function updateTools() {
-  const toolStatus = btn("tool-status");
+  const toolStatus = byId("tool-status");
   const version = tools?.goVersion?.replace(/^go/, "Go ");
   const state = !desktop ? "Preview" : !tools ? "Checking Go…" : version ?? "Go not found";
   const lspLabel = gopls === "ready" ? "gopls ready" : gopls === "starting" ? "gopls starting…" : gopls === "failed" ? "gopls stopped" : tools?.gopls ? "gopls available" : "gopls not installed";
@@ -709,6 +709,12 @@ function maybeStartLsp() {
 
 function showSettings() { byId<HTMLDialogElement>("settings-dialog").showModal(); }
 
+function refreshProject() {
+  if (projectWorkflow.busy || project.welcome) return;
+  void refresh();
+  void runTargets.refresh();
+}
+
 function showPalette(command = false, workspaceOnly = false) {
   const actions: { label: string; detail?: string; icon: Icon; run(): void; workspace?: boolean }[] = [
     { label: "Open Project…", detail: "⌘O", icon: "folderOpen", run: openFolder, workspace: true },
@@ -717,7 +723,7 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Next Editor", detail: "⇧⌘]", icon: "files", run: () => cycleEditor(1) },
     { label: "Previous Editor", detail: "⇧⌘[", icon: "files", run: () => cycleEditor(-1) },
     { label: "New File…", icon: "filePlus", run: newFile, workspace: true },
-    { label: "Refresh Project", icon: "refresh", run: () => { void refresh(); }, workspace: true },
+    { label: "Refresh Project", icon: "refresh", run: refreshProject, workspace: true },
     { label: "Collapse Folders", icon: "folder", run: () => { opened.clear(); renderExplorer(); }, workspace: true },
     { label: "Search Saved Files", detail: "⇧⌘F", icon: "search", run: () => chooseView("search") },
     { label: "Save File", detail: "⌘S", icon: "save", run: saveActive },
@@ -811,7 +817,6 @@ byId("welcome-open").addEventListener("click", openFolder);
 byId("welcome-new").addEventListener("click", newModule);
 byId("toggle-sidebar").addEventListener("click", toggleSidebar);
 byId("new-file").addEventListener("click", newFile);
-byId("refresh-files").addEventListener("click", () => { void refresh(); void runTargets.refresh(); });
 byId("format").addEventListener("click", formatActive);
 byId("save").addEventListener("click", saveActive);
 const runOrStop = () => execution.task ? stopTask() : runTask(runTargets.primaryAction());
@@ -819,7 +824,6 @@ byId("run").addEventListener("click", runOrStop);
 byId("panel-stop").addEventListener("click", stopTask);
 byId("stop-task").addEventListener("click", stopTask);
 byId("settings").addEventListener("click", showSettings);
-byId("tool-status").addEventListener("click", showSettings);
 byId("probe-tools").addEventListener("click", probeTools);
 monaco.editor.addCommand({ id: runTestCommand, run: (_accessor, id: number, path: string, name: string) => {
   if (project.native?.id === id && docs.active?.path === path && path.endsWith("_test.go")) {

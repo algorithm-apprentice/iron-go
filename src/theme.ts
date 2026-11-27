@@ -8,15 +8,28 @@ const editorRoles = {
   "editor.background": "--canvas",
   "editor.foreground": "--editor-text",
   "editorGutter.background": "--canvas",
-  "editorLineNumber.foreground": "--quiet",
-  "editorLineNumber.activeForeground": "--text",
-  "editor.lineHighlightBackground": "--editor-line",
+  "editorLineNumber.foreground": "--editor-number",
+  "editorLineNumber.activeForeground": "--editor-active-number",
+  "editor.lineHighlightBorder": "--editor-line-border",
   "editor.selectionBackground": "--editor-selection",
   "minimap.background": "--canvas",
   "editorWidget.background": "--widget",
-  "editorWidget.border": "--control-edge",
-  "editorSuggestWidget.selectedBackground": "--selection",
+  "editorWidget.border": "--editor-widget-border",
+  "editorSuggestWidget.selectedBackground": "--selected-command",
+  "editorSuggestWidget.selectedForeground": "--selected-command-text",
   "focusBorder": "--focus",
+};
+
+const goKeywords = (words: string) => words.split(" ").map(word => `keyword.${word}.go`);
+
+const goSyntaxRoles = {
+  declaration: goKeywords("chan const func interface map package struct type var true false nil"),
+  flow: goKeywords("break case continue default defer else fallthrough for go goto if import range return select switch"),
+  type: goKeywords("bool byte complex64 complex128 float32 float64 int int8 int16 int32 int64 rune string uint uint8 uint16 uint32 uint64 uintptr"),
+  string: ["string.go"],
+  escape: ["string.escape.go"],
+  number: ["number.go", "number.float.go", "number.hex.go", "number.octal.go", "number.binary.go"],
+  comment: ["comment.go", "comment.doc.go"],
 };
 
 function applyTheme(theme: ColorTheme) {
@@ -32,8 +45,14 @@ function applyTheme(theme: ColorTheme) {
   monaco.editor.defineTheme(name, {
     base: theme === "light" ? "vs" : "vs-dark",
     inherit: true,
-    rules: [],
-    colors: Object.fromEntries(Object.entries(editorRoles).map(([role, token]) => [role, color(token)])),
+    rules: Object.entries(goSyntaxRoles).flatMap(([role, tokens]) => {
+      const foreground = color(`--go-syntax-${role}`).slice(1);
+      return tokens.map(token => ({ token, foreground }));
+    }),
+    colors: {
+      ...Object.fromEntries(Object.entries(editorRoles).map(([role, token]) => [role, color(token)])),
+      "editor.lineHighlightBackground": "#00000000",
+    },
   });
   monaco.editor.setTheme(name);
 }

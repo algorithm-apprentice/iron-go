@@ -16,15 +16,20 @@ export class Feedback {
       button.addEventListener("click", () => this.show(button.dataset.panel as Pane));
     }
     byId("clear-output").addEventListener("click", () => this.clear());
-    byId("hide-panel").addEventListener("click", () => this.toggle(false));
     byId("toggle-panel").addEventListener("click", () => this.toggle());
     byId("status-problems").addEventListener("click", () => this.show("problems"));
   }
 
   toggle(visible = byId("panel").hidden) {
-    byId("panel").hidden = !visible;
-    byId("panel-resize").hidden = !visible;
-    byId("toggle-panel").setAttribute("aria-pressed", String(visible));
+    const panel = byId("panel");
+    const divider = byId("panel-resize");
+    const toggle = byId("toggle-panel");
+    const focused = document.activeElement;
+    const restoreFocus = !visible && (panel.contains(focused) || focused === divider);
+    panel.hidden = !visible;
+    divider.hidden = !visible;
+    toggle.setAttribute("aria-pressed", String(visible));
+    if (restoreFocus) toggle.focus();
     this.layoutChanged();
   }
 

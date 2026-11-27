@@ -16,3 +16,5 @@ record detailed behavior, alternatives, implementation order, and acceptance.
 | [0009](0009-save-transactions.md) | Serialize same-profile save replacement and reject stale file results | Accepted |
 | [0010](0010-workbench-workflow-ownership.md) | Separate project transitions and Quit reservations from Go execution | Accepted |
 | [0011](0011-native-tool-transport.md) | Share bounded Go tool transport without merging LSP and DAP | Accepted |
+| [0012](0012-vscode-modern-color-reference.md) | Use VS Code Modern colors for workbench roles | Accepted |
+| [0013](0013-go-syntax-colors.md) | Give Go tokens their own color rules | Accepted |

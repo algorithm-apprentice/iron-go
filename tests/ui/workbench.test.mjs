@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { build, preview } from "vite";
 import { runtimeClean } from "../native/plan.mjs";
+import { expectedGoSyntax, goSyntaxSample, renderedGoSyntax } from "../go-syntax-sample.mjs";
 
 let server, browser, url, assets;
 const fixture = fileURLToPath(new URL("../fixtures/orbit", import.meta.url));
@@ -578,14 +579,50 @@ test("Dark and Light switch the entire workbench and persist without dropping ed
     const backgrounds = () => page.evaluate(() => [".monaco-editor-background", ".sidebar", ".bottom-panel"].map(selector =>
       getComputedStyle(document.querySelector(selector)).backgroundColor,
     ));
-    const dark = ["rgb(18, 19, 20)", "rgb(25, 26, 27)", "rgb(25, 26, 27)"];
-    const light = ["rgb(255, 255, 255)", "rgb(250, 250, 253)", "rgb(250, 250, 253)"];
+    const dark = ["rgb(31, 31, 31)", "rgb(24, 24, 24)", "rgb(24, 24, 24)"];
+    const light = ["rgb(255, 255, 255)", "rgb(248, 248, 248)", "rgb(248, 248, 248)"];
+    const rgb = (selector, property) => page.locator(selector).first().evaluate((el, property) => getComputedStyle(el)[property], property);
+    async function checkRoles(lightTheme) {
+      assert.equal(await rgb("#run", "backgroundColor"), lightTheme ? "rgb(0, 95, 184)" : "rgb(0, 120, 212)");
+      await page.locator("#format").focus();
+      await page.keyboard.press("Shift+Tab");
+      assert.deepEqual(await page.locator("#run").evaluate(el => {
+        const style = getComputedStyle(el);
+        return { focused: el === document.activeElement && el.matches(":focus-visible"),
+          outline: style.outlineStyle, width: style.outlineWidth, color: style.outlineColor };
+      }), { focused: true, outline: "solid", width: "1px", color: "rgb(255, 255, 255)" });
+      assert.equal(await rgb("#quick-open", "color"), lightTheme ? "rgb(30, 30, 30)" : "rgb(204, 204, 204)");
+      assert.equal(await rgb("#quick-open", "borderTopColor"), lightTheme ? "rgba(30, 30, 30, 0.2)" : "rgba(204, 204, 204, 0.2)");
+      assert.equal(await rgb(".tab.active", "color"), lightTheme ? "rgb(59, 59, 59)" : "rgb(255, 255, 255)");
+      assert.equal(await rgb(".tab:not(.active)", "color"), lightTheme ? "rgb(97, 97, 97)" : "rgb(157, 157, 157)");
+      assert.equal(await rgb("#editor .line-numbers:not(.active-line-number)", "color"), "rgb(110, 118, 129)");
+      assert.equal(await rgb("#editor .line-numbers.active-line-number", "color"), lightTheme ? "rgb(23, 17, 132)" : "rgb(204, 204, 204)");
+      assert.equal(await rgb("#editor .view-overlays .current-line", "backgroundColor"), "rgba(0, 0, 0, 0)");
+      assert.equal(await rgb("#editor .view-overlays .current-line", "borderTopColor"), lightTheme ? "rgb(238, 238, 238)" : "rgb(40, 40, 40)");
+
+      const selectedFile = page.locator(".tree-row.active");
+      assert.equal(await rgb(".tree-row.active", "backgroundColor"), lightTheme ? "rgb(228, 230, 241)" : "rgb(55, 55, 61)");
+      await selectedFile.focus();
+      assert.equal(await rgb(".tree-row.active", "backgroundColor"), lightTheme ? "rgb(232, 232, 232)" : "rgb(4, 57, 94)");
+      assert.equal(await rgb(".tree-row.active", "color"), lightTheme ? "rgb(0, 0, 0)" : "rgb(255, 255, 255)");
+      await page.locator("#quick-open").click();
+      const selected = ".palette-option[aria-current='true']";
+      await page.locator(selected).waitFor();
+      assert.equal(await rgb("#palette", "backgroundColor"), lightTheme ? "rgb(248, 248, 248)" : "rgb(34, 34, 34)");
+      assert.equal(await rgb(selected, "backgroundColor"), lightTheme ? "rgb(0, 95, 184)" : "rgb(4, 57, 94)");
+      assert.equal(await rgb(selected, "color"), "rgb(255, 255, 255)");
+      await page.keyboard.press("Escape");
+    }
+    await page.locator('#explorer [data-path="go.mod"]').click();
+    await page.getByRole("tab", { name: "go.mod", selected: true }).waitFor();
+    await page.getByRole("tab", { name: "main.go", exact: true }).click();
     await page.getByRole("button", { name: "Settings", exact: true }).click();
     const theme = page.getByRole("combobox", { name: "Color Theme" });
     await theme.waitFor({ timeout: 3000 });
     assert.deepEqual(await theme.locator("option").allTextContents(), ["Dark", "Light"]);
     assert.deepEqual(await backgrounds(), dark);
     await page.getByRole("button", { name: "Close settings" }).click();
+    await checkRoles(false);
     await page.locator("#editor textarea.inputarea").focus();
     await page.keyboard.insertText("// Unsaved theme check");
     await page.locator('.tab.dirty [data-path="cmd/orbit/main.go"]').waitFor();
@@ -593,6 +630,7 @@ test("Dark and Light switch the entire workbench and persist without dropping ed
     await theme.selectOption({ label: "Light" });
     await page.getByRole("button", { name: "Close settings" }).click();
     assert.deepEqual(await backgrounds(), light);
+    await checkRoles(true);
     assert.match(await page.locator("#editor .view-lines").innerText(), /Unsaved\s+theme\s+check/);
     assert.equal(await page.locator('.tab.dirty [data-path="cmd/orbit/main.go"]').count(), 1);
     await page.getByRole("button", { name: "Save File" }).click();
@@ -607,6 +645,46 @@ test("Dark and Light switch the entire workbench and persist without dropping ed
     await page.getByRole("button", { name: "Color Theme: Dark", exact: true }).waitFor({ timeout: 3000 });
     await palette.press("Enter");
     assert.deepEqual(await backgrounds(), dark);
+  });
+});
+
+test("each theme separates rendered Go syntax roles on the real editor canvas", async () => {
+  await scenario("go-syntax-colors", async page => {
+    const editor = page.locator("#editor textarea.inputarea");
+    await editor.focus();
+    await page.keyboard.press("Meta+a");
+    await page.keyboard.insertText(goSyntaxSample);
+    await page.waitForFunction(() => document.querySelector("#editor .view-lines")?.textContent.includes("Readable"));
+    const ratio = (foreground, background) => {
+      const luminance = value => value.match(/\d+/g).slice(0, 3).map(byte => Number(byte) / 255)
+        .map(channel => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4)
+        .reduce((sum, channel, index) => sum + channel * [0.2126, 0.7152, 0.0722][index], 0);
+      const values = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
+      return (values[0] + 0.05) / (values[1] + 0.05);
+    };
+    for (const theme of ["dark", "light"]) {
+      if (theme === "light") {
+        await page.locator("#settings").click();
+        await page.locator("#theme-setting").selectOption("light");
+        await page.locator('[data-dialog-close="settings-dialog"]').click();
+      }
+      await page.waitForFunction(() => [...document.querySelectorAll("#editor .view-lines .view-line span[class*='mtk']")].some(el => el.textContent.trim() === "func"));
+      const colors = await page.evaluate(renderedGoSyntax);
+      assert.deepEqual(colors, expectedGoSyntax[theme]);
+      const canvas = await page.locator(".monaco-editor-background").first().evaluate(el => getComputedStyle(el).backgroundColor);
+      for (const token of Object.values(colors)) assert.ok(ratio(token, canvas) >= 4.5, `${theme}: ${token} on ${canvas}`);
+      assert.equal(await page.locator('.tab.dirty [data-path="cmd/orbit/main.go"]').count(), 1);
+      assert.match(await page.locator("#editor .view-lines").innerText(), /func\s+paint/);
+    }
+    await page.locator('#explorer [data-path="README.md"]').click();
+    await page.getByRole("tab", { name: "README.md", exact: true, selected: true }).waitFor();
+    await editor.focus();
+    await page.keyboard.press("Meta+a");
+    await page.keyboard.insertText(`type normally\n\n\`\`\`go\n${goSyntaxSample}\`\`\`\n`);
+    await page.waitForFunction(() => [...document.querySelectorAll("#editor .view-lines .view-line span[class*='mtk']")].some(el => el.textContent.trim() === "func"));
+    assert.deepEqual(await page.evaluate(renderedGoSyntax), expectedGoSyntax.light);
+    const prose = page.locator("#editor .view-line [class*='mtk']").filter({ hasText: "type normally" }).first();
+    assert.equal(await prose.evaluate(el => getComputedStyle(el).color), "rgb(59, 59, 59)");
   });
 });
 
@@ -636,7 +714,7 @@ test("adjacent workbench controls and visible dividers use a one-pixel gap", asy
       assert.ok(gaps.length, `${group} should have adjacent controls`);
       for (const gap of gaps) assert.ok(Math.abs(gap - 1) < 0.1, `${group} gap: expected 1px, got ${gap}px`);
     };
-    const horizontalGroups = [".title-actions", ".editor-actions", ".panel-tabs", ".panel-actions", "#explorer-view .inline-actions"];
+    const horizontalGroups = [".title-actions", ".editor-actions", ".panel-tabs", "#explorer-view .inline-actions"];
     for (const group of horizontalGroups) await check(group, false, "button, select, input, .run-picker-field");
     await page.locator('#explorer [data-path="go.mod"]').click();
     await page.getByRole("tab", { name: "go.mod", selected: true }).waitFor();
@@ -715,7 +793,7 @@ test("compact chrome returns room to code without shrinking button targets", asy
       await page.getByRole("button", { name: "Project", exact: true }).click();
     }
     const header = await box(".panel-header");
-    for (const selector of ["#output-tab", "#problems-tab", "#clear-output", "#hide-panel"]) {
+    for (const selector of ["#output-tab", "#problems-tab", "#clear-output"]) {
       const bounds = await box(selector);
       assert.ok(bounds.y >= header.y && bounds.y + bounds.height <= header.y + header.height);
     }
@@ -778,4 +856,96 @@ test("resized chrome keeps its chosen dimensions across hiding and reopening", a
     await page.locator("#toggle-panel").click();
     assert.equal(await height("#panel"), panel + 14);
   });
+});
+
+test("one persistent panel toggle preserves output, selection and keyboard focus", async () => {
+  await scenario("single-bottom-panel-toggle", async page => {
+    const panel = page.locator("#panel");
+    const toggle = page.getByRole("button", { name: "Toggle Bottom Panel" });
+    const problems = page.getByRole("tab", { name: /Problems/ });
+    const output = page.getByRole("tab", { name: "Output" });
+    const log = page.locator("#output-log");
+    await panel.waitFor({ state: "visible" });
+    assert.equal(await panel.getByText("Go Output", { exact: true }).count(), 0);
+    assert.equal(await panel.getByRole("button", { name: "Hide Panel" }).count(), 0);
+    assert.equal(await toggle.count(), 1);
+    assert.equal(await toggle.getAttribute("aria-controls"), "panel");
+    const original = await log.textContent();
+    assert.match(original, /Project opened:/);
+
+    await problems.click();
+    await page.keyboard.press("Meta+j");
+    await panel.waitFor({ state: "hidden" });
+    assert.equal(await toggle.getAttribute("aria-pressed"), "false");
+    assert.ok(await toggle.evaluate(el => el === document.activeElement));
+    await page.keyboard.press("Enter");
+    await panel.waitFor({ state: "visible" });
+    assert.equal(await toggle.getAttribute("aria-pressed"), "true");
+    assert.equal(await problems.getAttribute("aria-selected"), "true");
+
+    await page.locator("#panel-resize").focus();
+    await page.keyboard.press("Meta+j");
+    await panel.waitFor({ state: "hidden" });
+    assert.ok(await toggle.evaluate(el => el === document.activeElement));
+    await page.getByRole("button", { name: "Show Problems" }).click();
+    await panel.waitFor({ state: "visible" });
+    assert.equal(await problems.getAttribute("aria-selected"), "true");
+
+    const editorInput = page.locator("#editor textarea.inputarea");
+    await editorInput.focus();
+    await page.keyboard.press("Meta+j");
+    await panel.waitFor({ state: "hidden" });
+    assert.ok(await editorInput.evaluate(el => el === document.activeElement));
+    await page.keyboard.press("Meta+j");
+    await panel.waitFor({ state: "visible" });
+    assert.ok(await editorInput.evaluate(el => el === document.activeElement));
+    await toggle.click();
+    await panel.waitFor({ state: "hidden" });
+    await toggle.click();
+    await panel.waitFor({ state: "visible" });
+    await output.click();
+    assert.equal(await log.textContent(), original);
+    await page.getByRole("button", { name: "Clear Output" }).click();
+    assert.equal(await log.textContent(), "");
+  });
+});
+
+test("project actions have one visible entry per state and tool status is informational", async () => {
+  await scenario("single-project-entry-points", async page => {
+    const opens = page.getByRole("button", { name: "Open Project", exact: true });
+    const welcome = page.locator("#welcome-open");
+    const header = page.locator("#open-folder");
+    assert.equal(await opens.count(), 1);
+    await welcome.waitFor({ state: "visible" });
+    await header.waitFor({ state: "hidden" });
+    await welcome.focus();
+    const choosing = page.waitForEvent("filechooser");
+    await page.keyboard.press("Enter");
+    await (await choosing).setFiles(fixture);
+    await page.getByRole("tab", { name: "main.go", exact: true, selected: true }).waitFor();
+    await header.waitFor({ state: "visible" });
+    await welcome.waitFor({ state: "hidden" });
+    assert.equal(await opens.count(), 1);
+
+    const status = page.locator("#tool-status");
+    assert.equal(await status.innerText(), "Preview");
+    assert.equal(await status.evaluate(el => el.tabIndex), -1);
+    assert.equal(await page.getByRole("button", { name: "Go tools and settings" }).count(), 0);
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.getByRole("dialog", { name: "Workbench Settings" }).waitFor();
+    await page.keyboard.press("Escape");
+
+    assert.equal(await page.getByRole("button", { name: "Refresh Project", exact: true }).count(), 0);
+    const projectActions = page.getByRole("button", { name: "Project Actions" });
+    await projectActions.click();
+    const palette = page.getByRole("textbox", { name: "Quick Open search" });
+    await palette.fill("refresh project");
+    await page.getByRole("button", { name: "Refresh Project", exact: true }).waitFor();
+    await palette.press("Enter");
+    await projectActions.click();
+    await palette.fill("close project");
+    await palette.press("Enter");
+    await welcome.waitFor({ state: "visible" });
+    assert.equal(await opens.count(), 1);
+  }, false);
 });
