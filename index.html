@@ -174,6 +174,18 @@
         <option value="dark">Dark</option>
         <option value="light">Light</option>
       </select></label>
+      <div class="settings-row">
+        <label for="editor-font"><strong>Editor Font</strong></label>
+        <select id="editor-font" class="text-field">
+          <option value="jetbrains">JetBrains Mono</option>
+          <option value="system">System Monospace</option>
+        </select>
+      </div>
+      <div class="settings-row">
+        <label for="editor-font-size"><strong>Editor Font Size</strong></label>
+        <input id="editor-font-size" class="text-field" type="number" min="8" max="40" step="1" aria-describedby="editor-font-size-unit" />
+        <span id="editor-font-size-unit">px</span>
+      </div>
       <label class="settings-row"><div><strong>Minimap</strong><small>Show a compact overview of the file.</small></div><input id="minimap-setting" type="checkbox" /></label>
       <label class="settings-row"><div><strong>Word wrap</strong><small>Wrap long lines to the editor width.</small></div><input id="wrap-setting" type="checkbox" /></label>
       <div class="settings-tools"><h3>Go Toolchain</h3><div id="settings-tools-info" class="view-note"></div><button id="probe-tools" class="button quiet"><span data-icon="refresh"></span>Check tools</button></div>

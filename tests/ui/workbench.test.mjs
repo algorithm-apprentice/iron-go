@@ -824,6 +824,91 @@ test("Run Target's disabled styling dims the field and the chevron in both theme
   });
 });
 
+test("editor typography defaults to bundled JetBrains Mono and remembers changes", async () => {
+  await scenario("editor-typography", async page => {
+    const line = page.locator("#editor .view-line").first();
+    const verify = (family, size, height) => page.waitForFunction(({ family, size, height }) => {
+      const row = document.querySelector("#editor .view-line");
+      if (!row) return false;
+      const { fontFamily, fontSize } = getComputedStyle(row);
+      return fontFamily.replaceAll('"', '').startsWith(`${family},`) && fontSize === `${size}px` &&
+        row.getBoundingClientRect().height === height;
+    }, { family, size, height }, { timeout: 5000 });
+    const font = page.getByLabel("Editor Font", { exact: true });
+    const size = page.getByLabel("Editor Font Size", { exact: true });
+    const open = () => page.locator("#settings").click();
+    const close = () => page.getByRole("button", { name: "Close settings" }).click();
+    const original = await line.textContent();
+    await page.waitForFunction(() => [...document.fonts].some(face =>
+      face.family.replaceAll('"', '') === "JetBrains Mono" && face.status === "loaded"));
+    await verify("JetBrains Mono", 13, 18);
+
+    await open();
+    assert.equal(await font.locator("option:checked").textContent(), "JetBrains Mono");
+    assert.equal(await size.inputValue(), "13");
+    await font.selectOption({ label: "System Monospace" });
+    await size.fill("16");
+    await size.press("Enter");
+    await verify("SF Mono", 16, 22);
+    for (const invalid of ["", "16.5", "41"]) {
+      await size.fill(invalid);
+      await size.blur();
+      assert.equal(await size.inputValue(), "16");
+    }
+    await close();
+    assert.equal(await line.textContent(), original);
+
+    await page.reload();
+    await openFixture(page);
+    await verify("SF Mono", 16, 22);
+    await open();
+    assert.equal(await font.locator("option:checked").textContent(), "System Monospace");
+    assert.equal(await size.inputValue(), "16");
+
+    await size.fill("8");
+    await size.blur();
+    await close();
+    await verify("SF Mono", 8, 18);
+    const expanded = page.locator("#editor .codicon-folding-expanded").first();
+    await expanded.hover();
+    await expanded.click();
+    await page.locator("#editor .codicon-folding-collapsed").first().waitFor();
+
+    await page.evaluate(() => {
+      localStorage.setItem("irongo.editor-font", "unknown");
+      localStorage.setItem("irongo.editor-font-size", "16.5");
+    });
+    await page.reload();
+    await openFixture(page);
+    await verify("JetBrains Mono", 13, 18);
+  });
+});
+
+test("Monaco refreshes fallback measurements after the bundled font arrives", async () => {
+  await documentScenario("editor-font-load", async page => {
+    const release = Promise.withResolvers();
+    await page.route(/JetBrainsMono-Regular.*\.woff2$/, async route => {
+      await release.promise;
+      await route.continue();
+    });
+    try {
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => window.documents);
+      const characterWidth = () => {
+        const { monaco } = window.workflowFixture;
+        return window.documents.editor.getOption(monaco.editor.EditorOption.fontInfo).typicalHalfwidthCharacterWidth;
+      };
+      const fallbackWidth = await page.evaluate(characterWidth);
+      release.resolve();
+      await page.waitForFunction(fallbackWidth => {
+        const { monaco } = window.workflowFixture;
+        const { typicalHalfwidthCharacterWidth } = window.documents.editor.getOption(monaco.editor.EditorOption.fontInfo);
+        return typicalHalfwidthCharacterWidth !== fallbackWidth;
+      }, fallbackWidth, { timeout: 5000 });
+    } finally { release.resolve(); }
+  });
+});
+
 test("resized chrome keeps its chosen dimensions across hiding and reopening", async () => {
   await scenario("compact-chrome-resize", async page => {
     await page.setViewportSize({ width: 760, height: 600 });

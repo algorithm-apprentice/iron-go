@@ -12,12 +12,31 @@ import "monaco-editor/editor/contrib/hover/browser/hoverContribution.js";
 import "monaco-editor/editor/contrib/linesOperations/browser/linesOperations.js";
 import "monaco-editor/editor/contrib/suggest/browser/suggestController.js";
 import "monaco-editor/features/find/register.js";
+import "./editor-font.css";
 import EditorWorker from "monaco-editor/editor/editor.worker.js?worker";
 import type { Project } from "./workspace";
 
 export { monaco };
 
 Object.assign(globalThis, { MonacoEnvironment: { getWorker: () => new EditorWorker() } });
+
+const systemMonospace = '"SF Mono", Menlo, Monaco, Consolas, monospace';
+const jetBrainsMono = '"JetBrains Mono"';
+export const defaultEditorFontSize = 13;
+
+export function editorTypography(font = "jetbrains", fontSize = defaultEditorFontSize) {
+  return {
+    fontFamily: font === "system" ? systemMonospace : `${jetBrainsMono}, ${systemMonospace}`,
+    fontSize,
+    lineHeight: Math.max(18, Math.round(fontSize * 18 / defaultEditorFontSize)),
+  };
+}
+
+// Monaco can cache the fallback widths while the bundled face is still loading.
+void document.fonts.load(`${defaultEditorFontSize}px ${jetBrainsMono}`).then(
+  () => monaco.editor.remeasureFonts(),
+  () => { /* Keep using the system fallback. */ },
+);
 
 export interface DocumentTab {
   path: string;
@@ -64,9 +83,9 @@ export class Documents {
   constructor(private readonly element: HTMLElement, private readonly events: DocumentEvents) {
     this.editor = monaco.editor.create(element, {
       model: null, theme: "vs-dark", automaticLayout: true, editContext: false,
-      accessibilitySupport: "off", ariaLabel: "Code editor content", fontSize: 13,
-      fontFamily: '"SF Mono", Menlo, Monaco, Consolas, monospace', fontLigatures: false,
-      lineHeight: 18, lineNumbersMinChars: 3, lineDecorationsWidth: 8, padding: { top: 10, bottom: 8 },
+      accessibilitySupport: "off", ariaLabel: "Code editor content",
+      ...editorTypography(), fontLigatures: false,
+      lineNumbersMinChars: 3, lineDecorationsWidth: 8, padding: { top: 10, bottom: 8 },
       glyphMargin: true,
       renderLineHighlight: "all", scrollBeyondLastLine: false, roundedSelection: false,
       minimap: { enabled: true, renderCharacters: false, showSlider: "mouseover", maxColumn: 75 },

@@ -1,7 +1,7 @@
 import "./styles.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { byId, element, Forms, message, Palette } from "./dialogs";
-import { bufferText, Documents, monaco, type DocumentTab } from "./editor";
+import { bufferText, defaultEditorFontSize, Documents, editorTypography, monaco, type DocumentTab } from "./editor";
 import { Feedback } from "./feedback";
 import { fileIcon, icon, prepareIcons, type Icon } from "./icons";
 import { GoLanguage, debugTestCommand, runTestCommand, type LanguageState } from "./lsp";
@@ -787,8 +787,44 @@ function bindLayout() {
   }
 }
 
+function bindEditorTypography() {
+  const font = byId<HTMLSelectElement>("editor-font");
+  const size = input("editor-font-size");
+  const fontKey = "irongo.editor-font";
+  const sizeKey = "irongo.editor-font-size";
+  let fontSize = defaultEditorFontSize;
+  try {
+    font.value = localStorage.getItem(fontKey) ?? font.value;
+    size.value = localStorage.getItem(sizeKey) ?? size.value;
+  } catch { /* Use the defaults. */ }
+
+  function apply() {
+    if (!font.value) font.value = "jetbrains";
+    if (size.validity.valid && Number.isInteger(size.valueAsNumber)) fontSize = size.valueAsNumber;
+    size.value = String(fontSize);
+    docs.editor.updateOptions(editorTypography(font.value, fontSize));
+  }
+  function save() {
+    apply();
+    try {
+      localStorage.setItem(fontKey, font.value);
+      localStorage.setItem(sizeKey, size.value);
+    } catch { /* Still apply for this session. */ }
+  }
+  font.addEventListener("change", save);
+  size.addEventListener("change", save);
+  size.addEventListener("keydown", event => {
+    if (event.key === "Enter" && !event.isComposing) {
+      event.preventDefault();
+      size.blur();
+    }
+  });
+  apply();
+}
+
 function bindSettings() {
   bindColorTheme();
+  bindEditorTypography();
   const options = [
     { field: "minimap-setting", enabled: true },
     { field: "wrap-setting", enabled: false },

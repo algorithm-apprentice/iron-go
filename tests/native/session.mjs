@@ -665,6 +665,31 @@ async function fileSuite() {
     await click("#output-tab");
   });
   await checkTheme();
+  await record("native editor loads bundled JetBrains Mono and applies typography settings", async () => {
+    const appearance = () => js(`
+      const row = document.querySelector('#editor .view-line');
+      if (!row) return null;
+      const { fontFamily, fontSize } = getComputedStyle(row);
+      const loaded = [...document.fonts].some(face => face.family.replaceAll('"', '') === 'JetBrains Mono' && face.status === 'loaded');
+      return { fontFamily, fontSize, height: row.getBoundingClientRect().height, loaded };
+    `);
+    await eventually("bundled font at the default size", appearance,
+      value => value?.loaded && /^"?JetBrains Mono/.test(value.fontFamily) && value.fontSize === "13px" && value.height === 18);
+    const set = (id, value) => js(`
+      const field = document.getElementById(arguments[0]);
+      field.value = arguments[1];
+      field.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    `, id, value);
+    await click("#settings");
+    await set("editor-font", "system");
+    await set("editor-font-size", "16");
+    await eventually("larger system monospace editor", appearance,
+      value => /^"?SF Mono/.test(value?.fontFamily) && value.fontSize === "16px" && value.height === 22);
+    await set("editor-font", "jetbrains");
+    await set("editor-font-size", "13");
+    await click('[data-dialog-close="settings-dialog"]');
+  });
   await record("native Go syntax roles change in place without dropping the buffer", async () => {
     await replace(goSyntaxSample);
     for (const theme of ["dark", "light"]) {
