@@ -5,6 +5,9 @@ verification. For current instructions, start at the [documentation index](../RE
 Long-lived decisions are indexed in [ADRs](../adr/README.md). Historical plans
 and initial baselines are in the [archive](../archive/README.md).
 
+The [architecture review follow-up](architecture-follow-up.md) tracks the
+cross-cutting ownership and complexity fixes.
+
 ## Projects, files, and recovery
 
 - [Welcome and project opening](goland-projects.md); [recent projects and editor sessions](recent-projects.md).

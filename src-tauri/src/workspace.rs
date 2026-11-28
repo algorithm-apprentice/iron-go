@@ -44,6 +44,7 @@ pub struct WorkspaceInfo {
     pub(crate) recent_error: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Workspace {
     pub info: WorkspaceInfo,
     pub root: PathBuf,
@@ -253,6 +254,14 @@ pub(crate) fn open_save_lock(data_dir: &Path) -> CommandResult<File> {
         .custom_flags(OPEN_REGULAR)
         .open(data_dir.join(SAVE_LOCK))
         .map_err(fail("Open save lock"))
+}
+
+pub(crate) fn try_save_lock(data_dir: &Path) -> CommandResult<File> {
+    let lock = open_save_lock(data_dir)?;
+    regular_file(&lock, "Read save lock")?;
+    lock.try_lock()
+        .map_err(|error| format!("Save storage is busy; try the operation again: {error}"))?;
+    Ok(lock)
 }
 
 pub(crate) fn verify_save_directory(
@@ -543,7 +552,39 @@ pub fn validate_module(name: &str, module: &str) -> CommandResult<()> {
     Ok(())
 }
 
-pub fn create_module(parent: &Path, name: &str, module: &str) -> CommandResult<Workspace> {
+pub(crate) enum ModuleCreation {
+    Ready(Workspace),
+    CreatedNotOpened {
+        path: PathBuf,
+        error: String,
+    },
+    Incomplete {
+        path: PathBuf,
+        file: &'static str,
+        error: String,
+    },
+}
+
+pub(crate) fn create_module(
+    parent: &Path,
+    name: &str,
+    module: &str,
+) -> CommandResult<ModuleCreation> {
+    create_module_with(parent, name, module, |path, text| {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(text.as_bytes()))
+    })
+}
+
+fn create_module_with(
+    parent: &Path,
+    name: &str,
+    module: &str,
+    mut write: impl FnMut(&Path, &str) -> io::Result<()>,
+) -> CommandResult<ModuleCreation> {
     validate_module(name, module)?;
     let path = parent.join(name);
     fs::create_dir(&path).map_err(fail("Create module folder"))?;
@@ -552,15 +593,19 @@ pub fn create_module(parent: &Path, name: &str, module: &str) -> CommandResult<W
         ("main.go", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"Hello from Iron Go!\")\n}\n".to_owned()),
     ];
     // create_new also protects a file added by another process during setup.
-    for (name, text) in files {
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path.join(name))
-            .and_then(|mut file| file.write_all(text.as_bytes()))
-            .map_err(fail("Write starter module"))?;
+    for (file, text) in files {
+        if let Err(error) = write(&path.join(file), &text) {
+            return Ok(ModuleCreation::Incomplete {
+                path,
+                file,
+                error: error.to_string(),
+            });
+        }
     }
-    Workspace::open(&path)
+    Ok(match Workspace::open(&path) {
+        Ok(workspace) => ModuleCreation::Ready(workspace),
+        Err(error) => ModuleCreation::CreatedNotOpened { path, error },
+    })
 }
 
 #[derive(Serialize)]
@@ -1005,6 +1050,7 @@ pub async fn save_new_file(
 pub struct TestSaveHold {
     gate: tokio::sync::watch::Sender<(bool, Option<String>)>,
     waiting: std::sync::atomic::AtomicBool,
+    profile_lock: std::sync::Mutex<Option<File>>,
 }
 
 #[cfg(feature = "e2e")]
@@ -1013,6 +1059,7 @@ impl Default for TestSaveHold {
         Self {
             gate: tokio::sync::watch::channel((false, None)).0,
             waiting: false.into(),
+            profile_lock: Default::default(),
         }
     }
 }
@@ -1051,10 +1098,82 @@ pub fn test_hold_save(state: State<'_, Core>, hold: Option<bool>, path: Option<S
     state.1.waiting.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+#[cfg(feature = "e2e")]
 #[tauri::command]
-pub async fn create_file(state: State<'_, Core>, id: u64, path: String) -> CommandResult<()> {
-    let (root, anchor) = observation_root(&state, id)?;
-    blocking(move || new_file(&root, &anchor, &path)).await
+pub fn test_hold_save_lock(
+    app: AppHandle,
+    state: State<'_, Core>,
+    hold: Option<bool>,
+) -> CommandResult<bool> {
+    if let Some(hold) = hold {
+        let mut locked = state.1.profile_lock.lock().unwrap();
+        if hold && locked.is_none() {
+            let directory = app
+                .path()
+                .app_local_data_dir()
+                .map_err(|error| error.to_string())?;
+            *locked = Some(try_save_lock(&directory)?);
+        } else if !hold {
+            locked.take();
+            return Ok(false); // Release the OS lock without consulting session state.
+        }
+    }
+    Ok(state.0.lock().unwrap().workspace_busy())
+}
+
+#[tauri::command]
+pub async fn create_file(
+    app: AppHandle,
+    state: State<'_, Core>,
+    id: u64,
+    path: String,
+) -> CommandResult<()> {
+    let data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| error.to_string())?;
+    let (root, anchor, lease) = {
+        let mut session = state.0.lock().unwrap();
+        let root = session.root(id)?.to_path_buf();
+        let anchor = session.workspace.as_ref().unwrap().anchor.clone();
+        let lease = crate::workspace_admission::Lease::begin(
+            &app,
+            &mut session,
+            crate::workspace_admission::Kind::CreateFile,
+        )?;
+        (root, anchor, lease)
+    };
+    blocking(move || {
+        let lease = lease;
+        let parts = components(&path)?;
+        let (_, parents) = parts.split_last().unwrap();
+        // Check the nearest existing parent before provisioning the profile lock.
+        for depth in (0..=parents.len()).rev() {
+            match anchor.open_directory(&parents[..depth]) {
+                Ok(parent) => {
+                    reject_profile_save_parent(
+                        &data_dir,
+                        &parent.metadata().map_err(fail("Inspect file parent"))?,
+                    )?;
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                Err(error) => return Err(fail("Open file parent")(error)),
+            }
+        }
+        let lock = open_save_lock(&data_dir)?;
+        regular_file(&lock, "Read save lock")?;
+        lock.lock().map_err(fail("Acquire save lock"))?;
+        {
+            let core = app.state::<Core>();
+            let session = core.0.lock().unwrap();
+            lease.check(&session)?;
+            session.root(id)?;
+        }
+        lease.admit_effect()?;
+        new_file(&root, &anchor, &path)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1074,6 +1193,45 @@ mod save_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_handoff_reports_save_contention_without_waiting_for_the_writer() {
+        let profile = tempfile::tempdir().unwrap();
+        let writer = try_save_lock(profile.path()).unwrap();
+        assert!(try_save_lock(profile.path())
+            .unwrap_err()
+            .contains("Save storage is busy"));
+        drop(writer);
+        assert!(try_save_lock(profile.path()).is_ok());
+    }
+
+    #[test]
+    fn a_failed_second_starter_write_reports_the_path_and_keeps_the_first_file() {
+        let parent = tempfile::tempdir().unwrap();
+        let result = create_module_with(
+            parent.path(),
+            "sample",
+            "example.com/sample",
+            |path, text| {
+                if path.ends_with("main.go") {
+                    return Err(io::Error::other("starter write failed"));
+                }
+                fs::write(path, text)
+            },
+        )
+        .unwrap();
+        let ModuleCreation::Incomplete { path, file, error } = result else {
+            panic!("expected a reported partial project");
+        };
+        assert_eq!(path, parent.path().join("sample"));
+        assert_eq!(file, "main.go");
+        assert_eq!(error, "starter write failed");
+        assert!(fs::read_to_string(path.join("go.mod"))
+            .unwrap()
+            .starts_with("module example.com/sample\n"));
+        assert!(!path.join("main.go").exists());
+        assert!(create_module(parent.path(), "sample", "example.com/sample").is_err());
+    }
 
     #[test]
     fn rename_revision_rejects_a_file_created_after_enumeration() {
@@ -1102,7 +1260,11 @@ mod tests {
     #[test]
     fn creates_and_saves_without_overwriting_external_edits() {
         let dir = tempfile::tempdir().unwrap();
-        let project = create_module(dir.path(), "hello-go", "example.com/hello-go").unwrap();
+        let ModuleCreation::Ready(project) =
+            create_module(dir.path(), "hello-go", "example.com/hello-go").unwrap()
+        else {
+            panic!("the starter module did not open");
+        };
         assert!(create_module(dir.path(), "hello-go", "example.com/other").is_err());
         assert_eq!(
             collect(&project.root).unwrap().module.as_deref(),

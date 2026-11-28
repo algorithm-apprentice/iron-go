@@ -188,6 +188,33 @@ pub fn test_quit_deadline(app: AppHandle, hold: Option<bool>) -> Option<(u64, bo
     pending.map(|(ticket, deadline)| (ticket, Instant::now() >= deadline))
 }
 
+#[cfg(feature = "e2e")]
+#[tauri::command]
+pub fn test_expire_quit(app: AppHandle, ticket: u64) -> bool {
+    let gate = app.state::<ExitGate>();
+    let expired = {
+        let core = app.state::<crate::Core>();
+        let session = core.0.lock().unwrap();
+        if !session.quit_tearing_down(ticket) {
+            return false;
+        }
+        let mut gate = gate.0.lock().unwrap();
+        let now = Instant::now();
+        let Some((id, deadline)) = gate.pending.as_mut() else {
+            return false;
+        };
+        if *id != ticket {
+            return false;
+        }
+        *deadline = now;
+        gate.expire(ticket, now)
+    };
+    if expired {
+        let _ = app.emit_to("main", EXIT_EXPIRED, ticket);
+    }
+    expired
+}
+
 fn decision_timeout() -> Duration {
     #[cfg(feature = "e2e")]
     if let Some(ms) = std::env::var("IRON_GO_E2E_EXIT_TIMEOUT_MS")
@@ -307,9 +334,21 @@ pub async fn resolve_app_exit(
     approve: bool,
     retirement: Option<crate::drafts::Retirement>,
 ) -> CommandResult<bool> {
+    // The operation owns the cutover and draft stage even if IPC stops waiting.
+    tauri::async_runtime::spawn(resolve_exit(app, ticket, approve, retirement))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+async fn resolve_exit(
+    app: AppHandle,
+    ticket: u64,
+    approve: bool,
+    retirement: Option<crate::drafts::Retirement>,
+) -> CommandResult<bool> {
     let retire = retirement.is_some();
     let mut staged = false;
-    let mut terminal_fence = None;
+    let mut cutover = None;
     #[cfg(feature = "e2e")]
     let mut refuse = false;
     if approve
@@ -320,8 +359,28 @@ pub async fn resolve_app_exit(
             .unwrap()
             .live(ticket, Instant::now())
     {
+        match crate::terminal::begin_cutover(&app, Some(ticket)) {
+            Ok(lease) => cutover = Some(std::sync::Arc::new(lease)),
+            Err(error) => {
+                let core = app.state::<crate::Core>();
+                let session = core.0.lock().unwrap();
+                // Refuse an unadmitted request immediately, but do not consume
+                // a ticket that a competing approval already owns.
+                if !session.owns_quit(ticket) {
+                    take(&app, ticket);
+                }
+                return Err(error);
+            }
+        }
         if let Some(plan) = retirement {
-            if let Err(error) = crate::drafts::prepare_quit(app.clone(), ticket, plan).await {
+            if let Err(error) = crate::drafts::prepare_quit(
+                app.clone(),
+                ticket,
+                plan,
+                cutover.as_ref().unwrap().clone(),
+            )
+            .await
+            {
                 app.state::<ExitGate>().0.lock().unwrap().take(ticket);
                 return Err(error);
             }
@@ -339,36 +398,49 @@ pub async fn resolve_app_exit(
                 refuse = probe.wait().await;
             }
         }
-        match crate::terminal::fence_cutover(&app, Some(ticket)).await {
-            Ok(fence) => terminal_fence = Some(fence),
-            Err(error) => {
-                app.state::<ExitGate>().0.lock().unwrap().take(ticket);
-                if staged {
-                    let _ = crate::drafts::cancel_quit(app, ticket).await;
+        let retire_processes = async {
+            crate::terminal::retire_for_cutover(&app, cutover.as_ref().unwrap(), Some(ticket))
+                .await?;
+            let stopping = {
+                let core = app.state::<crate::Core>();
+                let mut session = core.0.lock().unwrap();
+                cutover.as_ref().unwrap().check(&session)?;
+                if !live_ticket(&app, ticket) {
+                    return Err("The Quit decision expired before the debugger could close.".into());
                 }
-                return Err(error);
-            }
-        }
-        if let Err(error) =
-            crate::debug_program::stop_program(app.state::<crate::Core>().inner(), None).await
-        {
+                session.request_program_stop(None)
+            };
+            crate::debug_program::wait_program_stop(stopping).await
+        };
+        if let Err(error) = retire_processes.await {
             app.state::<ExitGate>().0.lock().unwrap().take(ticket);
-            let _ = crate::drafts::cancel_quit(app, ticket).await;
+            if staged {
+                let _ = crate::drafts::cancel_quit(app, ticket).await;
+            }
             return Err(error);
         }
     }
     let (send, receive) = oneshot::channel();
     let decision_app = app.clone();
+    let decision_lease = cutover.clone();
     queue_on_main(move || {
-        let _terminal_fence = terminal_fence;
         let app = decision_app;
-        let accepted = app
-            .state::<ExitGate>()
-            .inner()
-            .0
-            .lock()
-            .map_err(|error| error.to_string())
-            .and_then(|mut gate| gate.resolve(ticket, approve, Instant::now()));
+        let accepted = (|| {
+            let core = app.state::<crate::Core>();
+            let session = core.0.lock().unwrap();
+            if let Some(lease) = &decision_lease {
+                lease.check(&session)?;
+            } else if session.owns_quit(ticket) {
+                // A competing response cannot withdraw the admitted operation's ticket.
+                return Ok(false);
+            }
+            app.state::<ExitGate>()
+                .inner()
+                .0
+                .lock()
+                .map_err(|error| error.to_string())
+                .and_then(|mut gate| gate.resolve(ticket, approve, Instant::now()))
+        })();
         if !matches!(accepted, Ok(true)) {
             let _ = send.send(accepted);
         } else if !approve {
@@ -397,10 +469,14 @@ pub async fn resolve_app_exit(
             let _ = send.send(Ok(false));
         }
     });
-    let result = receive.await.map_err(|error| error.to_string())?;
+    let result = receive
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
     if staged {
         crate::drafts::cancel_quit(app, ticket).await?;
     }
+    drop(cutover);
     result
 }
 

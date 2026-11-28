@@ -1,11 +1,8 @@
 use std::{
     collections::BTreeMap,
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::{self, Read},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{OpenOptionsExt, PermissionsExt},
-    },
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, LazyLock},
@@ -17,7 +14,8 @@ use tauri::{ipc::Channel, AppHandle, Manager, State};
 use tokio::{io::AsyncReadExt, process::Command, sync::oneshot};
 
 use crate::{
-    process_owner::{OwnedChild, ProcessGroup},
+    go_launch::{prepare_build, verify_handoff},
+    process_owner::{bind_child_directory, OwnedChild, ProcessGroup},
     tools::command,
     workspace::{excluded_name, go_source_signature, package_dir, run_directory},
     workspace_disk::RootAnchor,
@@ -78,7 +76,27 @@ pub enum TaskEvent {
 pub struct RunningTask {
     pub(crate) id: u64,
     pub(crate) stop: Option<oneshot::Sender<()>>,
-    pub(crate) group: Arc<ProcessGroup>,
+    pub(crate) group: Option<Arc<ProcessGroup>>,
+}
+
+struct PreparingRerun {
+    app: AppHandle,
+    id: u64,
+    stop: Option<oneshot::Receiver<()>>,
+}
+
+impl Drop for PreparingRerun {
+    fn drop(&mut self) {
+        let core = self.app.state::<Core>();
+        let mut session = core.0.lock().unwrap();
+        if session
+            .task
+            .as_ref()
+            .is_some_and(|task| task.id == self.id && task.group.is_none())
+        {
+            session.task.take();
+        }
+    }
 }
 
 #[cfg(feature = "e2e")]
@@ -130,7 +148,9 @@ impl RunningTask {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        self.group.kill();
+        if let Some(group) = &self.group {
+            group.kill();
+        }
     }
 }
 
@@ -243,36 +263,47 @@ pub async fn start_task(
         }
         launch.validate()?;
     }
-    let mut session = state.0.lock().unwrap();
-    let root = session.root(id)?;
-    if session.task.is_some()
-        || session.debug.is_some()
-        || session.program_debug.is_some()
-        || session.terminal_go()
-        || session.terminal_cutover
-    {
-        return Err("A Go task or debug session is already running.".into());
-    }
-    for package in &packages {
-        package_dir(root, package)?;
-    }
-    if let Some(launch) = &launch {
-        run_directory(session.workspace.as_ref().unwrap(), &launch.directory)?;
-    }
-    let temporary = launch
-        .as_ref()
-        .map(|_| tempfile::Builder::new().prefix("iron-go-run-").tempdir())
-        .transpose()
-        .map_err(|error| format!("Prepare executable directory: {error}"))?;
-    let mut command = command("go")?;
+    let mut preparing = None;
     let rerun = if let Some(import_path) = rerun_import_path {
-        let workspace = session.workspace.as_ref().unwrap();
-        let anchor = workspace.anchor.clone();
-        let signature = go_source_signature(root, &anchor)?;
+        let (root, anchor, token) = {
+            let mut session = state.0.lock().unwrap();
+            let root = session.root(id)?.to_path_buf();
+            if session.go_busy() || session.workspace_busy() {
+                return Err("A Go task or workspace operation is already in progress.".into());
+            }
+            let anchor = session.workspace.as_ref().unwrap().anchor.clone();
+            let task = session.next_id();
+            let (send, receive) = oneshot::channel();
+            session.task = Some(RunningTask {
+                id: task,
+                stop: Some(send),
+                group: None,
+            });
+            (
+                root,
+                anchor,
+                PreparingRerun {
+                    app: app.clone(),
+                    id: task,
+                    stop: Some(receive),
+                },
+            )
+        };
+        let source_root = root.clone();
+        let source_anchor = anchor.clone();
+        let signature =
+            crate::blocking(move || go_source_signature(&source_root, &source_anchor)).await;
+        {
+            let session = state.0.lock().unwrap();
+            if !can_admit_followup(&session, id, token.id) {
+                return Err("Go rerun was canceled before it started.".into());
+            }
+        }
+        preparing = Some(token);
         Some(TestRerun {
-            root: root.to_path_buf(),
+            root,
             anchor,
-            signature,
+            signature: signature?,
             import_path,
             selector: packages[0].clone(),
             filter: filter.clone().unwrap(),
@@ -280,15 +311,57 @@ pub async fn start_task(
     } else {
         None
     };
-    if rerun.is_some() {
-        command.args(["env", "-json", "GOWORK", "GOFLAGS"]);
-    } else if let Some(directory) = &temporary {
-        command
-            .args(["build", "-o"])
-            .arg(directory.path().join("program"));
+    let data_dir = if rerunning {
+        Some(
+            app.path()
+                .app_local_data_dir()
+                .map_err(|error| error.to_string())?,
+        )
     } else {
-        command.arg(kind.verb());
+        None
+    };
+    let mut session = state.0.lock().unwrap();
+    let root = session.root(id)?;
+    let admitted = if let Some(preparing) = &preparing {
+        can_admit_followup(&session, id, preparing.id)
+    } else {
+        !session.go_busy() && !session.workspace_busy()
+    };
+    if !admitted {
+        return Err("A Go task or debug session is already running.".into());
     }
+    let (temporary, mut command) = if let Some(launch) = &launch {
+        let (prepared, command) = prepare_build(
+            session.workspace.as_ref().unwrap(),
+            &packages[0],
+            launch,
+            || {
+                tempfile::Builder::new()
+                    .prefix("iron-go-run-")
+                    .tempdir()
+                    .map_err(|error| format!("Prepare executable directory: {error}"))
+            },
+            "program",
+            &[],
+        )?;
+        (Some(prepared), command)
+    } else {
+        for package in &packages {
+            package_dir(root, package)?;
+        }
+        let mut command = command("go")?;
+        if rerun.is_some() {
+            bind_child_directory(
+                &mut command,
+                run_directory(session.workspace.as_ref().unwrap(), ".")?,
+            );
+            command.args(["env", "-json", "GOWORK", "GOFLAGS"]);
+        } else {
+            command.current_dir(root);
+            command.arg(kind.verb());
+        }
+        (None, command)
+    };
     let mut flags = String::new();
     if matches!(kind, TaskKind::Test) {
         if !rerunning {
@@ -305,25 +378,30 @@ pub async fn start_task(
         }
         flags.push_str(&format!(" -run '{filter}'"));
     }
-    if !rerunning {
+    if !rerunning && temporary.is_none() {
         command.args(&packages);
     }
-    let child = spawn_child(command.current_dir(root))
-        .map_err(|error| format!("Start Go task: {error}"))?;
-    let (send, mut receive) = oneshot::channel();
+    let child = spawn_child(&mut command).map_err(|error| format!("Start Go task: {error}"))?;
+    let (task_id, mut receive) = if let Some(preparing) = &mut preparing {
+        session.task.as_mut().unwrap().group = Some(child.group.clone());
+        (preparing.id, preparing.stop.take().unwrap())
+    } else {
+        let (send, receive) = oneshot::channel();
+        let task_id = session.next_id();
+        session.task = Some(RunningTask {
+            id: task_id,
+            stop: Some(send),
+            group: Some(child.group.clone()),
+        });
+        (task_id, receive)
+    };
     #[cfg(feature = "e2e")]
     let handoff = session.acceptance.run_handoff.clone();
-    let task_id = session.next_id();
-    if let Some(directory) = &temporary {
+    if let Some(prepared) = &temporary {
         session
             .run_directories
-            .insert(task_id, directory.path().to_path_buf());
+            .insert(task_id, prepared.directory.path().to_path_buf());
     }
-    session.task = Some(RunningTask {
-        id: task_id,
-        stop: Some(send),
-        group: child.group.clone(),
-    });
     tauri::async_runtime::spawn(async move {
         let label = if launch.is_some() {
             format!("Build configured Go package {}", packages[0])
@@ -352,29 +430,40 @@ pub async fn start_task(
                     #[cfg(not(feature = "e2e"))]
                     let proceed = true;
                     if proceed {
-                        admit_followup(&app, id, task_id, |workspace| {
-                            rerun.spawn(workspace, &environment)
-                        })
+                        admit_rerun(&app, id, task_id, rerun, environment, data_dir.unwrap()).await
                     } else {
                         Ok(None)
                     }
                 }
                 Ok(None) => Ok(None),
-                Err(error) => Err(error),
+                Err(error) => {
+                    let core = app.state::<Core>();
+                    if can_admit_followup(&core.0.lock().unwrap(), id, task_id) {
+                        Err(error)
+                    } else {
+                        Ok(None)
+                    }
+                }
             };
             finish_phase(process, &mut receive, &mut budget, emit, WaitPolicy::Leader).await
         } else {
             supervise(child, &mut receive, &mut budget, emit).await
         };
-        if matches!(finished, TaskEvent::Finished { success: true, .. }) {
-            if let (Some(launch), Some(directory)) = (launch, temporary.as_ref()) {
-                let path = directory.path().join("program");
+        let cleaned = if let (Some(launch), Some(prepared)) = (launch, temporary) {
+            if matches!(finished, TaskEvent::Finished { success: true, .. }) {
                 #[cfg(feature = "e2e")]
-                let proceed = handoff.wait(directory.path(), &mut receive).await;
+                let proceed = handoff.wait(prepared.directory.path(), &mut receive).await;
                 #[cfg(not(feature = "e2e"))]
                 let proceed = true;
                 let program = if proceed {
-                    admit_executable(&app, id, task_id, &path, launch)
+                    admit_executable(
+                        &app,
+                        id,
+                        task_id,
+                        &prepared.binary,
+                        prepared.working,
+                        launch,
+                    )
                 } else {
                     Ok(None)
                 };
@@ -386,8 +475,10 @@ pub async fn start_task(
                 finished =
                     finish_phase(program, &mut receive, &mut budget, emit, WaitPolicy::Group).await;
             }
-        }
-        let cleaned = temporary.is_none_or(|directory| directory.close().is_ok());
+            prepared.directory.close().is_ok()
+        } else {
+            true
+        };
         let core = app.state::<Core>();
         let mut session = core.0.lock().unwrap();
         if cleaned {
@@ -425,24 +516,14 @@ fn admit_executable(
     workspace_id: u64,
     task_id: u64,
     path: &Path,
+    working: File,
     launch: RunLaunch,
 ) -> CommandResult<Option<OwnedChild>> {
     admit_followup(app, workspace_id, task_id, |workspace| {
-        verify_executable(path)?;
-        let directory = run_directory(workspace, &launch.directory)?;
+        verify_handoff(workspace, &launch.directory, &working, path)?;
         let mut command = Command::new(path);
+        bind_child_directory(&mut command, working);
         command.args(launch.args).envs(launch.environment);
-        // The only child-side operation before exec is the async-signal-safe
-        // fchdir. The captured File keeps the validated directory open until then.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::fchdir(directory.as_raw_fd()) == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            });
-        }
         spawn_child(&mut command).map_err(|error| format!("Start configured Go program: {error}"))
     })
 }
@@ -455,17 +536,48 @@ fn admit_followup(
 ) -> CommandResult<Option<OwnedChild>> {
     let core = app.state::<Core>();
     let mut session = core.0.lock().unwrap();
-    if session.root(workspace_id).is_err()
-        || !session
-            .task
-            .as_ref()
-            .is_some_and(|task| task.id == task_id && task.stop.is_some())
-    {
+    if !can_admit_followup(&session, workspace_id, task_id) {
         return Ok(None);
     }
     let child = spawn(session.workspace.as_ref().unwrap())?;
-    session.task.as_mut().unwrap().group = child.group.clone();
+    session.task.as_mut().unwrap().group = Some(child.group.clone());
     Ok(Some(child))
+}
+
+fn can_admit_followup(session: &crate::Session, workspace_id: u64, task_id: u64) -> bool {
+    !session.cutover_tearing_down()
+        && session.root(workspace_id).is_ok()
+        && session
+            .task
+            .as_ref()
+            .is_some_and(|task| task.id == task_id && task.stop.is_some())
+}
+
+async fn admit_rerun(
+    app: &AppHandle,
+    workspace_id: u64,
+    task_id: u64,
+    rerun: TestRerun,
+    environment: GoEnvironment,
+    data_dir: PathBuf,
+) -> CommandResult<Option<OwnedChild>> {
+    let app = app.clone();
+    crate::blocking(move || {
+        let result = (|| {
+            let _save = crate::workspace::try_save_lock(&data_dir)?;
+            rerun.unchanged()?;
+            admit_followup(&app, workspace_id, task_id, |workspace| {
+                rerun.spawn(workspace, &environment)
+            })
+        })();
+        let core = app.state::<Core>();
+        if result.is_err() && !can_admit_followup(&core.0.lock().unwrap(), workspace_id, task_id) {
+            Ok(None)
+        } else {
+            result
+        }
+    })
+    .await
 }
 
 async fn finish_phase(
@@ -493,6 +605,7 @@ async fn finish_phase(
     }
 }
 
+#[derive(Clone)]
 struct TestRerun {
     root: PathBuf,
     anchor: RootAnchor,
@@ -537,9 +650,9 @@ impl TestRerun {
         workspace: &Workspace,
         environment: &GoEnvironment,
     ) -> CommandResult<OwnedChild> {
-        self.unchanged()?;
         package_dir(&workspace.root, &self.selector)?;
         let mut command = command("go")?;
+        bind_child_directory(&mut command, run_directory(workspace, ".")?);
         command
             .args([
                 "test",
@@ -550,7 +663,6 @@ impl TestRerun {
                 &self.filter,
                 &self.selector,
             ])
-            .current_dir(&self.root)
             .env("GOWORK", &environment.work_file)
             .env("GOFLAGS", &environment.flags);
         spawn_child(&mut command).map_err(|error| format!("Start Go rerun: {error}"))
@@ -620,15 +732,15 @@ async fn verify_test_rerun(
             .into_string()
             .map_err(|_| "Cannot use a non-UTF-8 workfile for Go rerun.")?
     };
-    let Some(list) = admit_followup(app, workspace_id, task_id, |_| {
+    let Some(list) = admit_followup(app, workspace_id, task_id, |workspace| {
         let mut go = command("go")?;
+        bind_child_directory(&mut go, run_directory(workspace, ".")?);
         go.args([
             "list",
             "-find",
             "-json=ImportPath,Dir,Module",
             &rerun.selector,
         ])
-        .current_dir(&rerun.root)
         .env("GOWORK", &environment.work_file)
         .env("GOFLAGS", &environment.flags);
         spawn_child(&mut go).map_err(|error| format!("Verify Go package: {error}"))
@@ -642,7 +754,16 @@ async fn verify_test_rerun(
     let package = serde_json::from_slice(&bytes)
         .map_err(|_| "Go did not resolve exactly one package for rerun.")?;
     verify_package(rerun, package)?;
-    rerun.unchanged()?;
+    let check = rerun.clone();
+    let result = crate::blocking(move || check.unchanged()).await;
+    if !can_admit_followup(
+        &app.state::<Core>().0.lock().unwrap(),
+        workspace_id,
+        task_id,
+    ) {
+        return Ok(None);
+    }
+    result?;
     Ok(Some(environment))
 }
 
@@ -915,6 +1036,28 @@ pub fn stop_task(state: State<'_, Core>, id: u64) -> CommandResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stopped_preparing_rerun_cannot_admit_its_first_process() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut workspace = Workspace::open(fixture.path()).unwrap();
+        workspace.info.id = 1;
+        let (stop, mut cancelled) = oneshot::channel();
+        let mut session = crate::Session {
+            workspace: Some(workspace),
+            task: Some(RunningTask {
+                id: 2,
+                stop: Some(stop),
+                group: None,
+            }),
+            ..Default::default()
+        };
+        assert!(can_admit_followup(&session, 1, 2));
+        assert!(!can_admit_followup(&session, 1, 3));
+        session.task.as_mut().unwrap().cancel();
+        assert!(cancelled.try_recv().is_ok());
+        assert!(!can_admit_followup(&session, 1, 2));
+    }
 
     #[test]
     fn rerun_uses_a_literal_selector_and_quotes_go_regexp_components() {

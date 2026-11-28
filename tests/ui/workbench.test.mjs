@@ -696,6 +696,102 @@ test("a delayed Debug breakpoint reply cannot update the new project's marks", a
   });
 });
 
+test("Debug only applies the latest breakpoint reply per file", async () => {
+  await documentScenario("debug-breakpoint-request-order", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { DebugSession } = window.workflowFixture;
+      const admitted = Promise.withResolvers();
+      const finished = Promise.withResolvers();
+      const requests = [];
+      const verified = [];
+      let emit;
+      const session = new DebugSession({ id: 1, path: "/fixture" }, {
+        verify(path, lines) { verified.push({ path, lines }); },
+      }, { isCurrent: () => true, admitted: admitted.resolve, finished: finished.resolve }, {
+        debug: async (_id, _pkg, events) => { emit = events; return { server: 1, output: "/fixture/debug" }; },
+        sendDebug: async (_server, request) => { if (request.command === "setBreakpoints") requests.push(request.seq); },
+        stopDebug: async () => {},
+      });
+      const startup = session.start("main_test.go", "TestA");
+      await admitted.promise;
+      const reply = (index, lines) => emit({ type: "message", message: {
+        type: "response", request_seq: requests[index], success: true, body: { breakpoints: lines.map(verified => ({ verified })) },
+      } });
+      const reject = (index, message) => emit({ type: "message", message: {
+        type: "response", request_seq: requests[index], success: false, message,
+      } });
+
+      const older = session.setBreakpoints("main_test.go", [5]);
+      const other = session.setBreakpoints("other.go", [2]);
+      const superseded = session.setBreakpoints("main_test.go", [5, 9]).catch(error => error.message);
+      const cleared = session.setBreakpoints("main_test.go", []);
+      reply(3, []);
+      await cleared;
+      reply(1, [true]);
+      await other;
+      reply(0, [true]);
+      await older;
+      reject(2, "outdated breakpoint error");
+      const obsoleteError = await superseded;
+      const current = session.setBreakpoints("main_test.go", [3]).catch(error => error.message);
+      reject(4, "current breakpoint error");
+      const currentError = await current;
+      session.retire();
+      await Promise.all([startup, finished.promise]);
+      return { verified, obsoleteError, currentError };
+    });
+    assert.deepEqual(outcome, { verified: [{ path: "main_test.go", lines: [] }, { path: "other.go", lines: [2] }],
+      obsoleteError: undefined, currentError: "current breakpoint error" });
+  });
+});
+
+test("an unconfirmed terminal cleanup keeps its owner and allows Close and Go Stop retries", async () => {
+  await documentScenario("retry-unconfirmed-terminal-cleanup", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { TerminalPane, ExecutionLane, host } = window.workflowFixture;
+      const panel = window.mountFeedback();
+      const messages = [];
+      const stops = [];
+      const terminal = new TerminalPane(visible => { if (visible) panel.show("terminal"); else panel.hide("terminal"); },
+        error => messages.push(String(error)), () => {});
+      const folder = { id: 1, path: "/fixture" };
+      let deliver;
+      let currentId = 0;
+      host.startTerminal = async (_id, _launch, _size, events) => { deliver = events; return ++currentId; };
+      host.stopTerminal = async id => {
+        stops.push(id);
+        deliver({ type: "cleanup", id, reason: "Retiring terminal processes…" });
+        if (stops.filter(value => value === id).length === 1) {
+          deliver({ type: "cleanup", id, reason: "Unconfirmed cleanup" });
+          throw new Error("Unconfirmed cleanup");
+        }
+        deliver({ type: "closed", id, reason: "Terminal stopped" });
+      };
+      const observe = promise => promise.catch(error => error.message);
+
+      await terminal.start(folder, { kind: "shell" });
+      const closeError = await observe(terminal.stop(true));
+      const shellKept = terminal.active;
+      await terminal.stop(true);
+      const shellClosed = !terminal.active;
+
+      const lane = new ExecutionLane(() => {});
+      await lane.start(folder, "run", { revision: () => 0, save: async () => {}, dirty: () => false },
+        token => terminal.start(folder, { kind: "go", package: ".", launch: { directory: ".", args: [], environment: {} } }, {
+          started: () => lane.taskEvent(token, "started"), build() {}, closed: () => lane.taskEvent(token, "finished"),
+        }));
+      const stopError = await observe(lane.stopTask(() => terminal.stop()));
+      const goKept = terminal.isGo(folder) && lane.canStopTask;
+      await lane.stopTask(() => terminal.stop());
+      const goClosed = !terminal.active && !lane.occupied;
+      terminal.reset();
+      return { shellKept, shellClosed, closeError, goKept, goClosed, stopError, stops, messages };
+    });
+    assert.deepEqual(outcome, { shellKept: true, shellClosed: true, closeError: "Unconfirmed cleanup",
+      goKept: true, goClosed: true, stopError: "Unconfirmed cleanup", stops: [1, 1, 2, 2], messages: [] });
+  });
+});
+
 test("a delayed resume failure does not retire a newer Delve stop", async () => {
   await documentScenario("debug-resume-order", async page => {
     const outcome = await page.evaluate(async () => {

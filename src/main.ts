@@ -8,9 +8,11 @@ import { showGoSource } from "./go-source-view";
 import { DebugInspectionView } from "./debug-inspection-view";
 import type { DebugInspectionState } from "./debug-inspection";
 import { DraftRecorder } from "./draft-recorder";
+import { EditorSessionRecorder } from "./editor-session-recorder";
 import { TerminalPane } from "./terminal-pane";
 import { applyExactTextEdits, bufferText, defaultEditorFontSize, Documents, editorTypography, exactModelRange, monaco, type DocumentTab, type SaveOptions } from "./editor";
 import { Feedback } from "./feedback";
+import { FileActivity, fileCommands as decideFileCommands } from "./file-commands";
 import { fileIcon, icon, prepareIcons, type Icon } from "./icons";
 import { GoLanguage, debugTestCommand, runTestCommand, type GoLocation, type GoSymbol, type LanguageState } from "./lsp";
 import { Breakpoints, DebugSession } from "./debugger";
@@ -27,7 +29,7 @@ import { ProjectSnapshots } from "./project-workflow";
 import { saveDirtyTabs } from "./save-batch";
 import { createCursorTestWorkflow } from "./cursor-test-workflow";
 import { handleEditorCycle } from "./editor-shortcuts";
-import { desktop, host, importedProject, nativeProject, welcomeProject, type DraftItem, type NativeFolder, type Project, type ReadableDisk, type RunLaunch, type TaskKind, type ToolStatus, type WorkspaceMutation } from "./workspace";
+import { desktop, host, importedProject, nativeProject, welcomeProject, type DraftItem, type NativeFolder, type Project, type ReadableDisk, type RunLaunch, type SavedEditorSession, type TaskKind, type ToolStatus, type WorkspaceMutation } from "./workspace";
 
 type View = "explorer" | "search" | "tasks";
 
@@ -71,21 +73,11 @@ const breakpoints = new Breakpoints();
 const drafts = new DraftRecorder(byId("draft-state"));
 const debugInspection = new DebugInspectionView(byId("debug-stack"), byId("debug-variables"));
 let executionLine: { model: monaco.editor.ITextModel; ids: string[] } | undefined;
-let formatting = false;
-let fileMutations = 0;
-let fileDecisionPending = false;
+const fileActivity = new FileActivity(syncControls);
 let testQuitRequests = 0;
 let quitDialogTicket: number | undefined;
 let lastExpiredQuitTicket = 0;
 const sessionExpiry = new Map<number, () => void>();
-let restoringSession = false;
-let failedSessionRestore: Project | undefined;
-let sessionInstall = 0;
-let sessionTimer: number | undefined;
-let sessionWrite: Promise<void> | undefined;
-let sessionDirty = false;
-let sessionRevision = 0;
-let holdSessionDebounce = false;
 let tools: ToolStatus | undefined;
 let lsp: GoLanguage | undefined;
 let gopls: LanguageState = "idle";
@@ -111,10 +103,17 @@ const diskMessage = {
   unavailable: "File unavailable on disk",
 };
 
+const editorSession = new EditorSessionRecorder<NativeFolder, SavedEditorSession>({
+  capture: () => docs.captureSession(),
+  write: (folder: NativeFolder, revision, view, ticket) => host.writeEditorSession(folder.id, revision, view, ticket),
+  liveTicket: ticket => ticket > lastExpiredQuitTicket,
+  error: showError,
+});
+
 const docs = new Documents(byId("editor"), {
-  changed: renderDocuments,
+  changed() { invalidateNavigation(); editorSession.changed(); renderDocuments(); },
   opened: tab => {
-    if (!restoringSession && failedSessionRestore === project) failedSessionRestore = undefined;
+    editorSession.openedDocument();
     breakpoints.open(tab); lsp?.opened(tab); invalidateNavigation(); void refreshDisk?.();
   },
   edited: tab => {
@@ -130,6 +129,7 @@ const docs = new Documents(byId("editor"), {
 });
 const execution = new ExecutionLane<NativeFolder, DebugSession>(syncControls);
 const { lookup: cursorTestLookup, projectWorkflow } = createCursorTestWorkflow(docs.editor, reserved => {
+  editorSession.pauseAutomatic(reserved);
   if (reserved) {
     invalidateJumps();
     navigation?.cancel();
@@ -143,8 +143,16 @@ function cycleEditor(direction: 1 | -1) {
   return !projectWorkflow.busy && docs.cycle(direction);
 }
 
-const filesBusy = () => docs.saving || formatting || fileMutations !== 0;
-const fileActionsBlocked = () => projectWorkflow.busy || execution.preparing || fileDecisionPending;
+const filesBusy = () => docs.saving || fileActivity.busy;
+const fileActionsBlocked = () => projectWorkflow.busy || execution.preparing || fileActivity.decision;
+const canCreateFile = () => !project.welcome && !fileActionsBlocked() && !filesBusy();
+function fileCommands() {
+  const tab = docs.active;
+  return decideFileCommands({
+    active: tab && { go: tab.path.endsWith(".go"), saving: tab.saving, reloading: tab.reloading !== undefined },
+    busy: filesBusy(), blocked: fileActionsBlocked(), modal: !!document.querySelector("dialog[open]"), desktop,
+  });
+}
 const saveBarrier = {
   revision: () => docs.editRevision,
   dirty: () => docs.dirty,
@@ -155,13 +163,10 @@ const saveBarrier = {
 
 function reserveFileActivity() {
   if (fileActionsBlocked() || filesBusy() || document.querySelector("dialog[open]")) return;
-  fileDecisionPending = true;
-  fileMutations++;
-  syncControls();
+  const release = fileActivity.reserve("decision");
+  if (!release) return;
   return () => {
-    fileMutations--;
-    fileDecisionPending = false;
-    syncControls();
+    release();
     void refreshDisk?.();
   };
 }
@@ -325,8 +330,6 @@ async function replayLocation(direction: -1 | 1) {
 }
 
 function renderDocuments() {
-  invalidateNavigation();
-  queueEditorSession();
   const tabs = byId("tabs");
   const active = docs.active;
   const scroll = tabs.scrollLeft;
@@ -615,13 +618,15 @@ function syncControls() {
   const task = execution.task;
   const debug = execution.debug;
   const busy = projectWorkflow.busy;
-  btn("format").disabled = !active?.path.endsWith(".go") || formatting || fileActionsBlocked();
-  btn("save").disabled = !active || active.saving || fileActionsBlocked();
+  const commands = fileCommands();
+  // Preview keeps the affordance so the action can explain why gofmt is unavailable there.
+  btn("format").disabled = !commands.format.enabled && !commands.format.reason;
+  btn("save").disabled = !commands.save.enabled;
   btn("open-folder").disabled = busy || execution.preparing || filesBusy();
   btn("open-folder").hidden = !!project.welcome;
   btn("welcome-open").disabled = busy;
   btn("welcome-new").disabled = busy;
-  btn("new-file").disabled = fileActionsBlocked() || !!project.welcome;
+  btn("new-file").disabled = !canCreateFile();
   const run = btn("run");
   run.disabled = busy || (execution.occupied ? !execution.canStopTask : filesBusy()) || !!project.welcome;
   run.dataset.running = String(!!task);
@@ -736,7 +741,7 @@ function saveFormatter(tab: DocumentTab, enabled: boolean) {
 }
 
 async function saveActive(useFormatting = true) {
-  if (fileActionsBlocked() || !docs.active) return;
+  if (!fileCommands().save.enabled || !docs.active) return;
   const tab = docs.active;
   const target = project;
   try {
@@ -912,7 +917,7 @@ async function recoverDrafts(manage = false) {
 
 async function reloadActive() {
   const tab = docs.active;
-  if (!tab || tab.saving || fileActionsBlocked()) return;
+  if (!tab || !fileCommands().reload.enabled) return;
   const target = project;
   const release = reserveFileActivity();
   if (!release) return;
@@ -936,15 +941,15 @@ async function reloadDocument(tab: DocumentTab, reviewed?: ReadableDisk) {
 
 async function formatActive() {
   const tab = docs.active;
-  if (!tab?.path.endsWith(".go") || formatting || fileActionsBlocked()) return;
-  if (!desktop) { toast("Go formatting uses gofmt in the macOS desktop app."); return; }
+  const action = fileCommands().format;
+  if (!tab || !action.enabled) { if (action.reason) toast(action.reason); return; }
   const target = project;
-  formatting = true;
-  syncControls();
+  const release = fileActivity.reserve("format");
+  if (!release) return;
   try {
     if (await docs.format(tab, host.format) && project === target && docs.active === tab) status(`Formatted ${basename(tab.path)} with gofmt`);
   } catch (error) { if (project === target && docs.active === tab) showError(error); }
-  finally { formatting = false; syncControls(); }
+  finally { release(); }
 }
 
 async function organizeImports() {
@@ -1107,43 +1112,10 @@ function watchProject(target: Project) {
   });
 }
 
-function queueEditorSession() {
-  if (!project.native || restoringSession || failedSessionRestore === project) return;
-  sessionDirty = true;
-  clearTimeout(sessionTimer);
-  if (import.meta.env.VITE_IRON_E2E === "1" && holdSessionDebounce) return;
-  if (!sessionWrite) sessionTimer = window.setTimeout(() => { void flushEditorSession(); }, 280);
-}
-
-async function flushEditorSession(quitTicket?: number) {
-  clearTimeout(sessionTimer);
-  sessionDirty = false;
-  const folder = project.native;
-  if (!folder || restoringSession || failedSessionRestore === project) return;
-  const snapshot = docs.captureSession();
-  const revision = ++sessionRevision;
-  await sessionWrite;
-  if (project.native !== folder || revision !== sessionRevision || (quitTicket !== undefined && quitTicket <= lastExpiredQuitTicket)) return;
-  const write = host.writeEditorSession(folder.id, revision, snapshot, quitTicket).catch(error => {
-    if (project.native === folder && (quitTicket === undefined || quitTicket > lastExpiredQuitTicket)) showError(error);
-  });
-  sessionWrite = write;
-  try { await write; }
-  finally {
-    if (sessionWrite === write) sessionWrite = undefined;
-    if (sessionDirty) queueEditorSession();
-  }
-}
-
 async function install(target: Project) {
-  const generation = ++sessionInstall;
-  clearTimeout(sessionTimer);
-  sessionDirty = false;
-  restoringSession = true;
+  const ready = editorSession.beginProject(target.native);
   try { await installProject(target); }
-  finally {
-    if (sessionInstall === generation) { restoringSession = false; queueEditorSession(); }
-  }
+  finally { ready(); }
 }
 
 async function installProject(target: Project) {
@@ -1159,7 +1131,6 @@ async function installProject(target: Project) {
   lsp = undefined;
   project = target;
   explorerSelection = undefined;
-  failedSessionRestore = undefined;
   drafts.reset();
   previousLsp?.dispose();
   runTargets.reset(target);
@@ -1190,7 +1161,7 @@ async function installProject(target: Project) {
   if (target !== project) return;
   if (target.native) void runTargets.refresh();
   const saved = target.native?.editorSession;
-  if (!indexed) failedSessionRestore = target;
+  if (!indexed) editorSession.failRestore();
   const restored = saved && indexed ? await docs.restoreSession(saved,
     new Set(snapshot.entries.filter(entry => !entry.directory).map(entry => entry.path)), () => project === target) : undefined;
   if (target !== project) return;
@@ -1236,7 +1207,7 @@ async function confirmTransition() {
 
 function changeProject(choose: () => Promise<Project | undefined>) {
   return projectWorkflow.transition({ ready: transitionReady, confirm: confirmTransition,
-    choose: async () => { await flushEditorSession(); return choose(); }, install });
+    choose: async () => { await editorSession.flush(); return choose(); }, install });
 }
 
 function openFolder() {
@@ -1317,32 +1288,39 @@ function newModule() {
       { name: "module", label: "Go module path", value: "example.com/hello-go", maxLength: 240 },
     ],
     async run({ name, module }) {
-      return changeProject(async () => {
-        const folder = await host.create(name, module, drafts.plan(project.native));
-        return folder ? nativeProject(folder) : undefined;
+      let written = false;
+      const installed = await changeProject(async () => {
+        const outcome = await host.create(name, module, drafts.plan(project.native));
+        if (outcome.kind === "opened") return nativeProject(outcome.workspace);
+        if (outcome.kind === "cancelled") return;
+        written = true;
+        toast(outcome.kind === "incomplete"
+          ? `Project creation stopped at ${outcome.file}. Inspect the files left in ${outcome.path}: ${outcome.error}`
+          : `Project created in ${outcome.path} but not opened. Use Open Project to open it. ${outcome.error}`, true);
       });
+      return installed || written;
     },
   });
 }
 
 function newFile() {
-  if (fileActionsBlocked() || project.welcome) return;
+  if (!canCreateFile()) return;
   const target = project;
   forms.show({
     title: "New File", description: `Create a file inside ${project.name}. Include a folder prefix to create missing folders.`,
     fields: [{ name: "path", label: "Relative file path", placeholder: "pkg/example.go" }],
     async run({ path }) {
-      if (fileActionsBlocked()) return false;
+      if (!canCreateFile()) return false;
       if (target !== project) throw new Error("This workspace has changed.");
       validateRelative(path);
-      fileMutations++;
-      syncControls();
+      const release = fileActivity.reserve("create");
+      if (!release) return false;
       try {
         await target.createFile(path);
         await refresh();
         await openFile(path);
         status(`Created ${path}`);
-      } finally { fileMutations--; syncControls(); }
+      } finally { release(); }
     },
   });
 }
@@ -1839,7 +1817,7 @@ function refreshProject() {
 
 type WorkbenchCommand = { enabled: boolean; unavailable?: string; run(): unknown };
 
-function menuCommands(): Record<string, WorkbenchCommand> {
+function menuCommands() {
   const workspace = !project.welcome;
   const projectReady = !projectWorkflow.busy && transitionReady();
   const fileReady = !fileActionsBlocked() && !!docs.active && !docs.active.saving && docs.active.reloading === undefined;
@@ -1848,17 +1826,18 @@ function menuCommands(): Record<string, WorkbenchCommand> {
   const canLaunch = !!project.native && !!tools?.goVersion && projectReady && !execution.occupied;
   const canRun = canLaunch && !!runTargets.picker.value;
   const atTest = semantic && !!docs.active?.path.endsWith("_test.go");
+  const file = fileCommands();
   const item = (enabled: boolean, run: () => unknown, unavailable?: string): WorkbenchCommand => ({ enabled, run, unavailable });
   return {
     settings: item(true, () => showSettings()),
     "new-project": item(projectReady, newModule), "open-project": item(projectReady, openFolder),
     recent: item(projectReady && desktop, showRecentProjects), "close-project": item(projectReady && workspace, closeProject),
-    "new-file": item(workspace && !fileActionsBlocked(), newFile),
-    save: item(fileReady && !!docs.active?.dirty, saveActive), "save-all": item(docs.dirty && !fileActionsBlocked() && !filesBusy(), saveAll),
-    reload: item(fileReady, reloadActive),
+    "new-file": item(canCreateFile(), newFile),
+    save: item(file.save.enabled && !!docs.active?.dirty, saveActive), "save-all": item(docs.dirty && !fileActionsBlocked() && !filesBusy(), saveAll),
+    reload: item(file.reload.enabled, reloadActive),
     find: item(!!docs.active && !document.activeElement?.closest("input, textarea:not(.inputarea), [contenteditable='true']:not(.native-edit-context), #terminal-pane"),
       () => { docs.editor.focus(); return docs.editor.getAction("actions.find")?.run(); }),
-    format: item(goFile && desktop && !formatting, formatActive), organize: item(semantic && !filesBusy(), organizeImports),
+    format: item(file.format.enabled, formatActive, file.format.reason), organize: item(semantic && !filesBusy(), organizeImports),
     rename: item(semantic && !filesBusy(), renameGoSymbol),
     explorer: item(workspace, () => chooseView("explorer")), search: item(workspace, () => chooseView("search")),
     sidebar: item(true, toggleSidebar), panel: item(true, () => feedback.toggle()), commands: item(true, () => showPalette(true)),
@@ -1878,6 +1857,8 @@ function menuCommands(): Record<string, WorkbenchCommand> {
   };
 }
 
+type WorkbenchCommandId = keyof ReturnType<typeof menuCommands>;
+
 function allowedMenuCommand(id: string) {
   if (composing || projectWorkflow.busy) return false;
   const dialog = document.querySelector("dialog[open]");
@@ -1888,12 +1869,13 @@ function executeMenuCommand(id: string, explainUnavailable = false) {
   if (!allowedMenuCommand(id)) return;
   const commands = menuCommands();
   if (!Object.hasOwn(commands, id)) return;
-  if (!commands[id].enabled) {
-    const reason = commands[id].unavailable;
+  const command = commands[id as WorkbenchCommandId];
+  if (!command.enabled) {
+    const reason = command.unavailable;
     if (explainUnavailable && reason) toast(reason);
     return;
   }
-  try { void Promise.resolve(commands[id].run()).catch(showError); }
+  try { void Promise.resolve(command.run()).catch(showError); }
   catch (error) { showError(error); }
 }
 
@@ -1924,7 +1906,7 @@ async function bindWorkbenchMenu() {
 }
 
 function showPalette(command = false, workspaceOnly = false) {
-  const nativeAction = (id: string, preview: () => unknown) => desktop ? () => executeMenuCommand(id) : preview;
+  const nativeAction = (id: WorkbenchCommandId, preview: () => unknown) => desktop ? () => executeMenuCommand(id) : preview;
   const actions: { label: string; detail?: string; icon: Icon; run(): void; workspace?: boolean }[] = [
     { label: "Open Project…", detail: "⌘O", icon: "folderOpen", run: nativeAction("open-project", openFolder), workspace: true },
     ...(desktop ? [{ label: "Open Recent…", icon: "folder" as const, run: () => executeMenuCommand("recent"), workspace: true }] : []),
@@ -2203,8 +2185,8 @@ document.addEventListener("keydown", event => {
   if (apply) { event.preventDefault(); event.stopPropagation(); void apply(); }
 }, true);
 
-docs.editor.onDidChangeCursorPosition(() => { updateCursor(); invalidateNavigation(); queueEditorSession(); });
-docs.editor.onDidScrollChange(event => { if (event.scrollTopChanged) queueEditorSession(); });
+docs.editor.onDidChangeCursorPosition(() => { updateCursor(); invalidateNavigation(); editorSession.changed(); });
+docs.editor.onDidScrollChange(event => { if (event.scrollTopChanged) editorSession.changed(); });
 byId("welcome-recent").hidden = !desktop;
 byId("welcome-recent").addEventListener("click", () => { void showRecentProjects(); });
 byId("terminal-close").addEventListener("click", () => { void closeTerminal().catch(showError); });
@@ -2213,7 +2195,8 @@ bindLayout();
 bindSettings();
 new MutationObserver(changes => {
   if (replaying !== undefined && changes.some(change => change.target instanceof HTMLDialogElement && change.oldValue === null)) invalidateJumps();
-  queueMenuState();
+  if (changes.some(change => change.target instanceof HTMLDialogElement)) syncControls();
+  else queueMenuState();
 }).observe(document.body, { attributes: true, attributeOldValue: true, attributeFilter: ["open"], subtree: true });
 if (desktop) void bindWorkbenchMenu().catch(showError);
 const monacoDefinition = CommandsRegistry.getCommand("editor.action.revealDefinition");
@@ -2283,7 +2266,7 @@ if (desktop) {
         thawDrafts = drafts.freeze();
         const expired = new Promise<void>(resolve => { sessionExpiry.set(event.payload, resolve); });
         try {
-          await Promise.race([flushEditorSession(event.payload), expired]);
+          await Promise.race([editorSession.flush(event.payload), expired]);
           if (event.payload <= lastExpiredQuitTicket) return false;
           return await Promise.race([host.resolveExit(event.payload, true, drafts.plan(project.native)), expired.then(() => false)]);
         } finally { sessionExpiry.delete(event.payload); }
@@ -2303,11 +2286,7 @@ if (import.meta.env.VITE_IRON_E2E === "1") {
     quitRequests: () => testQuitRequests,
     quitExpiry: () => lastExpiredQuitTicket,
     workspaceId: () => project.native?.id,
-    holdEditorSession: hold => {
-      holdSessionDebounce = hold;
-      clearTimeout(sessionTimer);
-      if (!hold) queueEditorSession();
-    },
+    holdEditorSession: hold => editorSession.holdDebounce(hold),
     terminal,
   }));
 }

@@ -3,6 +3,7 @@ mod acceptance;
 mod debug;
 mod debug_program;
 mod drafts;
+mod go_launch;
 mod go_source;
 mod lsp;
 mod packages;
@@ -15,6 +16,7 @@ mod tool_transport;
 mod tools;
 mod workbench_menu;
 mod workspace;
+mod workspace_admission;
 mod workspace_disk;
 mod workspace_files;
 
@@ -44,7 +46,7 @@ struct Session {
     debug: Option<tool_transport::RunningServer>,
     program_debug: Option<debug_program::ProgramDebug>,
     terminal: Option<terminal::Owner>,
-    terminal_cutover: bool,
+    workspace_operation: Option<workspace_admission::Operation>,
     #[cfg(feature = "e2e")]
     acceptance: acceptance::Admission,
 }
@@ -63,6 +65,13 @@ impl Session {
             .filter(|workspace| workspace.info.id == id)
             .map(|workspace| workspace.root.as_path())
             .ok_or_else(|| "The workspace is no longer open.".to_owned())
+    }
+
+    fn go_busy(&self) -> bool {
+        self.task.is_some()
+            || self.debug.is_some()
+            || self.program_debug.is_some()
+            || self.terminal_go()
     }
 
     fn stop_processes(&mut self) {
@@ -206,7 +215,7 @@ async fn new_module(
     name: String,
     module: String,
     retirement: Option<drafts::Retirement>,
-) -> CommandResult<Option<workspace::WorkspaceInfo>> {
+) -> CommandResult<NewModuleOutcome> {
     workspace::validate_module(&name, &module)?;
     #[cfg(feature = "e2e")]
     let fixture_parent = std::env::var_os("IRON_GO_E2E_WORKSPACE").and_then(|path| {
@@ -216,17 +225,58 @@ async fn new_module(
     });
     #[cfg(not(feature = "e2e"))]
     let fixture_parent = None;
+    #[cfg(feature = "e2e")]
+    if fixture_parent.is_some()
+        && std::mem::take(
+            &mut app
+                .state::<Core>()
+                .0
+                .lock()
+                .unwrap()
+                .acceptance
+                .cancel_next_picker,
+        )
+    {
+        return Ok(NewModuleOutcome::Cancelled);
+    }
     let selection = match fixture_parent {
         Some(path) => Some(path),
         None => pick_folder("Choose a Location for the New Go Project").await?,
     };
     let Some(parent) = selection else {
-        return Ok(None);
+        return Ok(NewModuleOutcome::Cancelled);
     };
-    let intended = parent.join(&name);
-    let workspace = blocking(move || workspace::create_module(&parent, &name, &module)).await?;
-    let fence = terminal::fence_cutover(&app, None).await?;
-    blocking(move || {
+    let fence = std::sync::Arc::new(terminal::begin_cutover(&app, None)?);
+    #[cfg(feature = "e2e")]
+    app.state::<Core>().1.wait("@new-project-preflight").await?;
+    let creation = blocking({
+        let app = app.clone();
+        let fence = fence.clone();
+        move || {
+            fence.check(&app.state::<Core>().0.lock().unwrap())?;
+            fence.admit_effect()?;
+            workspace::create_module(&parent, &name, &module)
+        }
+    })
+    .await?;
+    let workspace = match creation {
+        workspace::ModuleCreation::Ready(workspace) => workspace,
+        workspace::ModuleCreation::CreatedNotOpened { path, error } => {
+            return Ok(NewModuleOutcome::created_not_opened(&path, error));
+        }
+        workspace::ModuleCreation::Incomplete { path, file, error } => {
+            return Ok(NewModuleOutcome::Incomplete {
+                path: path.display().to_string(),
+                file,
+                error,
+            });
+        }
+    };
+    let path = workspace.root.clone();
+    if let Err(error) = terminal::retire_for_cutover(&app, &fence, None).await {
+        return Ok(NewModuleOutcome::created_not_opened(&path, error));
+    }
+    let installed = blocking(move || {
         let _fence = fence;
         install_workspace(
             app.state::<Core>().inner(),
@@ -234,15 +284,39 @@ async fn new_module(
             retirement.map(|plan| (&app, plan)),
             Some(&app),
         )
-        .map(Some)
-        .map_err(|error| {
-            format!(
-                "Project created in {}. The open project was retained: {error}",
-                intended.display()
-            )
-        })
     })
-    .await
+    .await;
+    Ok(match installed {
+        Ok(workspace) => NewModuleOutcome::Opened { workspace },
+        Err(error) => NewModuleOutcome::created_not_opened(&path, error),
+    })
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NewModuleOutcome {
+    Cancelled,
+    Opened {
+        workspace: workspace::WorkspaceInfo,
+    },
+    CreatedNotOpened {
+        path: String,
+        error: String,
+    },
+    Incomplete {
+        path: String,
+        file: &'static str,
+        error: String,
+    },
+}
+
+impl NewModuleOutcome {
+    fn created_not_opened(path: &std::path::Path, error: String) -> Self {
+        Self::CreatedNotOpened {
+            path: path.display().to_string(),
+            error,
+        }
+    }
 }
 
 #[tauri::command]
@@ -364,7 +438,11 @@ fn main() {
             #[cfg(feature = "e2e")]
             quit::test_quit_deadline,
             #[cfg(feature = "e2e")]
+            quit::test_expire_quit,
+            #[cfg(feature = "e2e")]
             workspace::test_hold_save,
+            #[cfg(feature = "e2e")]
+            workspace::test_hold_save_lock,
             #[cfg(feature = "e2e")]
             acceptance::test_cancel_next_picker,
             #[cfg(feature = "e2e")]

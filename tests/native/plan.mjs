@@ -95,7 +95,42 @@ function goReportFailure(report, { reopen, requireGopls }) {
   }
 }
 
-export function summarizeGroup(group, { worker, report, failure, cleanup, nativeTerminal, diagnostics = [], reopen, requireGopls }) {
+const recoveryPhases = {
+  initial: { ids: ["draft-crash"], action: "crash with completed draft", proof: "observed_crash" },
+  reopen: { ids: ["draft-reopened", "draft-writer-isolated", "draft-quit-refused", "draft-discard-quit"],
+    action: "discard recovery and Quit", proof: "native_quit" },
+  after: { ids: ["draft-retired"], action: undefined, proof: "supervised" },
+};
+const criticalCases = {
+  quit: ["dirty-quit"],
+  "quit-save": ["save-quit"],
+  terminal: ["pty-io", "pty-credit", "pty-survivor", "pty-cutover"],
+};
+const recoveryCaseIds = new Set(Object.values(recoveryPhases).flatMap(phase => phase.ids));
+
+function criticalFailure(group, report, reopen, processEvidence) {
+  const phase = group === "recovery" ? recoveryPhases[reopen === "after-quit" ? "after" : reopen ? "reopen" : "initial"] : undefined;
+  const expected = phase?.ids ?? (Object.hasOwn(criticalCases, group) ? criticalCases[group] : undefined);
+  if (!expected) return;
+  const byId = new Map();
+  for (const entry of report.cases) {
+    if (entry.id === undefined) continue;
+    if (byId.has(entry.id)) return `Duplicate native case ID: ${entry.id}`;
+    if (phase && recoveryCaseIds.has(entry.id) && !expected.includes(entry.id)) {
+      return `Native case belongs to another Recovery phase: ${entry.id}`;
+    }
+    byId.set(entry.id, entry.result);
+  }
+  for (const id of expected) {
+    if (!byId.has(id)) return `Missing native case: ${id}`;
+    if (byId.get(id) !== "pass") return `Native case did not pass: ${id}`;
+  }
+  if (phase && (report.terminal?.action !== phase.action || processEvidence !== phase.proof)) {
+    return `Recovery phase is missing matching primary process evidence: ${phase.proof}`;
+  }
+}
+
+export function summarizeGroup(group, { worker, report, failure, cleanup, nativeTerminal, processEvidence, diagnostics = [], reopen, requireGopls }) {
   const valid = validReport(group, report);
   const primary = failure || (valid && report.failure) || (valid && report.cases.find(entry => entry.result === "fail")?.error)
     || (worker?.code !== 0 || worker.signal ? `Worker exited: ${JSON.stringify(worker ?? null)}` : undefined)
@@ -106,7 +141,8 @@ export function summarizeGroup(group, { worker, report, failure, cleanup, native
       ? "Missing verified native Quit; watchdog EOF is not the Quit oracle." : undefined);
   const secondary = [...diagnostics, ...(valid ? report.diagnostics ?? [] : [])];
   if (cleanup && primary) secondary.push(cleanup);
-  const verdict = primary || cleanup || (group === "go" && goReportFailure(report, { reopen, requireGopls }));
+  const verdict = primary || cleanup || (group === "go" ? goReportFailure(report, { reopen, requireGopls })
+    : criticalFailure(group, report, reopen, processEvidence));
   return { group, result: verdict ? "fail" : "pass", ...(verdict ? { failure: verdict } : {}),
     ...(secondary.length ? { diagnostics: secondary } : {}), ...(worker ? { worker } : {}),
     ...(valid ? { cases: report.cases, terminal: report.terminal } : { cases: [] }) };

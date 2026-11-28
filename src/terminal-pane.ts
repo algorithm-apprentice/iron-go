@@ -8,6 +8,7 @@ interface TerminalSession {
   launch: TerminalLaunch;
   active: boolean;
   closing: boolean;
+  retiring: boolean;
   discard: boolean;
   terminal?: Terminal;
   fit?: ResizeObserver;
@@ -35,7 +36,7 @@ export class TerminalPane {
   async start(folder: NativeFolder, launch: TerminalLaunch, events?: { started(): void; build(event: TaskEvent): void; closed(reason: string): void }) {
     if (this.active) throw new Error("Close the active terminal before starting another.");
     this.reset();
-    const session: TerminalSession = { folder, launch, active: true, closing: false, discard: false, input: Promise.resolve(), pendingInput: 0 };
+    const session: TerminalSession = { folder, launch, active: true, closing: false, retiring: false, discard: false, input: Promise.resolve(), pendingInput: 0 };
     this.session = session;
     this.tab.hidden = false;
     this.reveal(true);
@@ -53,7 +54,7 @@ export class TerminalPane {
       session.fit = new ResizeObserver(() => { if (this.mount.clientWidth > 0 && this.mount.clientHeight > 0) fit.fit(); });
       session.fit.observe(this.mount);
       terminal.onData(data => this.input(session, data));
-      terminal.onResize(size => { if (current() && session.id !== undefined && session.active) this.resize(session.id, size); });
+      terminal.onResize(size => { if (current() && session.id !== undefined && session.active && !session.retiring) this.resize(session.id, size); });
       if (session.closing) { events?.closed("Terminal stopped"); this.reset(); return; }
       const deliver = (event: TerminalEvent) => {
         if (!current()) return;
@@ -71,6 +72,9 @@ export class TerminalPane {
           });
         } else if (event.type === "build") {
           events?.build(event.event);
+        } else if (event.type === "cleanup") {
+          session.retiring = true;
+          this.status.textContent = event.reason;
         } else {
           session.active = false;
           session.closing = false;
@@ -122,6 +126,7 @@ export class TerminalPane {
   }
 
   private input(session: TerminalSession, data: string) {
+    if (!session.active || session.closing || session.retiring) return;
     const size = this.encoder.encode(data).length;
     // Rust reserves the other 32 KiB, including its partially written chunk.
     if (size + session.pendingInput > 32 * 1024) { this.report("The terminal input queue is full."); return; }
@@ -130,7 +135,7 @@ export class TerminalPane {
       const id = session.id ?? await session.admission;
       if (id === undefined) return;
       for (let start = 0; start < data.length;) {
-        if (this.session !== session || !session.active || session.closing) return;
+        if (this.session !== session || !session.active || session.closing || session.retiring) return;
         let end = Math.min(start + 2048, data.length);
         if (end < data.length && /[\ud800-\udbff]/.test(data[end - 1])) end--;
         await host.terminalInput(id, data.slice(start, end));

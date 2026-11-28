@@ -289,17 +289,17 @@ pub async fn mutate_workspace_files(
         .map_err(|error| error.to_string())?;
     blocking(move || {
         let state = app.state::<Core>();
-        let session = state.0.lock().unwrap();
-        session.root(id)?;
-        if session.task.is_some()
-            || session.debug.is_some()
-            || session.program_debug.is_some()
-            || session.terminal_go()
-            || session.terminal_cutover
-        {
-            return Err("Stop the current Go task before changing workspace paths.".into());
-        }
-        let workspace = session.workspace.as_ref().unwrap();
+        let (lease, workspace) = {
+            let mut session = state.0.lock().unwrap();
+            session.root(id)?;
+            let workspace = session.workspace.as_ref().unwrap().clone();
+            let lease = crate::workspace_admission::Lease::begin(
+                &app,
+                &mut session,
+                crate::workspace_admission::Kind::Mutation,
+            )?;
+            (lease, workspace)
+        };
         let lock = open_save_lock(&data)?;
         let info = lock.metadata().map_err(failure("Inspect Save lock"))?;
         if !info.is_file() || info.nlink() != 1 {
@@ -311,11 +311,13 @@ pub async fn mutate_workspace_files(
                 .map_err(failure("Resolve app profile"))?,
         )?;
         workspace.anchor.verify(&workspace.root)?;
+        lease.check(&state.0.lock().unwrap())?;
         match operation {
             Operation::NewFolder { path } => {
                 let loc = Location::new(&workspace.root, &workspace.anchor, &path)?;
                 loc.protect(&profile, None)?;
                 loc.verify()?;
+                lease.admit_effect()?;
                 make_directory(&loc.parent, loc.leaf(), 0o777).map_err(failure("Create folder"))?;
                 Ok(Mutation {
                     outcome: Outcome::Folder { path },
@@ -334,13 +336,14 @@ pub async fn mutate_workspace_files(
                 }
                 move_item(
                     &app,
-                    workspace,
+                    &workspace,
                     &profile,
                     &source,
                     &destination,
                     &version,
                     revision,
                     baselines,
+                    &lease,
                 )
             }
             Operation::Trash {
@@ -354,13 +357,20 @@ pub async fn mutate_workspace_files(
                 let from = Location::new(&workspace.root, &workspace.anchor, &source)?;
                 let file = from.open()?;
                 from.protect(&profile, Some(&file))?;
-                let (outcome, warning) =
-                    drafts::rebind_paths(&app, workspace, &source, None, revision, || {
+                let (outcome, warning) = drafts::rebind_paths(
+                    &app,
+                    &workspace,
+                    &source,
+                    None,
+                    revision,
+                    || lease.admit_effect(),
+                    || {
                         verify_source(&from, &file, &version)?;
                         let outcome = trash_item(&from, &file, platform_trash)?;
                         let trashed = matches!(outcome, Outcome::Trashed { .. });
                         Ok((outcome, trashed))
-                    })?;
+                    },
+                )?;
                 Ok(Mutation { outcome, warning })
             }
         }
@@ -377,6 +387,7 @@ fn move_item(
     version: &str,
     revision: u64,
     baselines: Vec<Baseline>,
+    lease: &crate::workspace_admission::Lease,
 ) -> CommandResult<Mutation> {
     let from = Location::new(&workspace.root, &workspace.anchor, source)?;
     let to = Location::new(&workspace.root, &workspace.anchor, destination)?;
@@ -389,6 +400,7 @@ fn move_item(
         source,
         Some(destination),
         revision,
+        || lease.admit_effect(),
         || {
             let verified = baselines
                 .iter()

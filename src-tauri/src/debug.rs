@@ -47,12 +47,7 @@ pub async fn start_debug(
     }
     let mut session = state.0.lock().unwrap();
     let root = session.root(id)?.to_path_buf();
-    if session.task.is_some()
-        || session.debug.is_some()
-        || session.program_debug.is_some()
-        || session.terminal_go()
-        || session.terminal_cutover
-    {
+    if session.go_busy() || session.workspace_busy() {
         return Err("A Go task or debug session is already running.".into());
     }
     package_dir(&root, &package)?;

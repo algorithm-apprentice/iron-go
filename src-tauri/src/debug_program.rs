@@ -1,7 +1,6 @@
 use std::{
     fs::File,
     io,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -17,14 +16,10 @@ use tokio::{
 
 use crate::{
     debug::{connect_adapter, delve_command, private_socket_directory, spawn_adapter},
+    go_launch::{prepare_build, verify_handoff, PreparedBinary},
     process_owner::{bind_child_directory, OwnedChild},
-    tasks::{
-        literal_package_selector, spawn_child, supervise, verify_executable, RunLaunch,
-        RunningTask, TaskEvent, MAX_OUTPUT,
-    },
+    tasks::{spawn_child, supervise, RunLaunch, RunningTask, TaskEvent, MAX_OUTPUT},
     tool_transport::{prepare_server, ToolKind},
-    tools::command,
-    workspace::{package_dir, run_directory},
     CommandResult, Core, Session,
 };
 
@@ -63,35 +58,32 @@ pub async fn start_program_debug(
     launch: RunLaunch,
     events: Channel<ProgramDebugEvent>,
 ) -> CommandResult<u64> {
-    if package.len() > 512 || !literal_package_selector(&package) {
-        return Err("Choose one local executable Go package for debugging.".into());
-    }
-    launch.validate()?;
     let mut session = state.0.lock().unwrap();
-    let root = session.root(id)?;
-    if session.task.is_some()
-        || session.debug.is_some()
-        || session.program_debug.is_some()
-        || session.terminal_go()
-        || session.terminal_cutover
-    {
+    session.root(id)?;
+    if session.go_busy() || session.workspace_busy() {
         return Err("A Go task or debug session is already running.".into());
     }
-    package_dir(root, &package)?;
     let workspace = session.workspace.as_ref().unwrap();
-    let working = run_directory(workspace, &launch.directory)?;
-    let directory = private_socket_directory()?;
-    let binary = directory.path().join("inferior");
+    let (
+        PreparedBinary {
+            directory,
+            binary,
+            working,
+        },
+        mut go,
+    ) = prepare_build(
+        workspace,
+        &package,
+        &launch,
+        private_socket_directory,
+        "inferior",
+        &["-gcflags=all=-N -l"],
+    )?;
     let output = binary
         .to_str()
         .ok_or("The debug output path is not valid UTF-8.")?
         .to_owned();
     let delve = delve_command()?;
-    let mut go = command("go")?;
-    bind_child_directory(&mut go, run_directory(workspace, ".")?);
-    go.args(["build", "-gcflags=all=-N -l", "-o"])
-        .arg(&binary)
-        .arg(&package);
     let child = spawn_child(&mut go).map_err(|error| format!("Start debug build: {error}"))?;
     let (send, mut stop) = oneshot::channel();
     let server = session.next_id();
@@ -103,7 +95,7 @@ pub async fn start_program_debug(
     session.task = Some(RunningTask {
         id: server,
         stop: Some(send),
-        group: child.group.clone(),
+        group: Some(child.group.clone()),
     });
     session.program_debug = Some(ProgramDebug {
         id: server,
@@ -194,6 +186,7 @@ fn admit_adapter(
 ) -> CommandResult<Option<AdapterWorker<impl std::future::Future<Output = String> + Send>>> {
     let mut session = core.0.lock().unwrap();
     if session.root(workspace_id).is_err()
+        || session.cutover_tearing_down()
         || !session
             .task
             .as_ref()
@@ -201,16 +194,12 @@ fn admit_adapter(
     {
         return Ok(None);
     }
-    verify_executable(binary)?;
-    let current = run_directory(session.workspace.as_ref().unwrap(), directory)?;
-    let identity = |file: File| {
-        file.metadata()
-            .map(|metadata| (metadata.dev(), metadata.ino()))
-            .map_err(|error| error.to_string())
-    };
-    if identity(working.try_clone().map_err(|error| error.to_string())?)? != identity(current)? {
-        return Err("The configured working directory was replaced during the debug build.".into());
-    }
+    verify_handoff(
+        session.workspace.as_ref().unwrap(),
+        directory,
+        &working,
+        binary,
+    )?;
     bind_child_directory(&mut delve, working);
     let (child, listener) = spawn_adapter(
         &mut delve,
@@ -433,6 +422,12 @@ impl Session {
 
 pub(crate) async fn stop_program(core: &Core, server: Option<u64>) -> CommandResult<()> {
     let stopping = core.0.lock().unwrap().request_program_stop(server);
+    wait_program_stop(stopping).await
+}
+
+pub(crate) async fn wait_program_stop(
+    stopping: Option<watch::Receiver<bool>>,
+) -> CommandResult<()> {
     if let Some(mut stopped) = stopping {
         tokio::time::timeout(Duration::from_secs(5), stopped.wait_for(|done| *done)).await
             .map_err(|_| "Executable debugger cleanup is still pending. Try Stop or Quit again once the processes exit.".to_owned())?

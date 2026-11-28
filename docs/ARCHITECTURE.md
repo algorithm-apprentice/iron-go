@@ -30,10 +30,10 @@ under [`src`](../src/).
 
 | Area | Rust host | TypeScript workbench |
 | --- | --- | --- |
-| App and project lifecycle | `main.rs`, `quit.rs`, `workbench_menu.rs`: session, Quit tickets, AppKit menus, command registration. | `main.ts`, `project-workflow.ts`, `quit-flow.ts`: workbench assembly, commands, reservations. |
-| Workspace and editor | `workspace.rs`, `workspace_disk.rs`, `workspace_files.rs`: guarded paths, saves, file identity, watchers and moves. | `workspace.ts`, `project-model.ts`, `editor.ts`, `navigation-history.ts`: project bridge, tree/search, Monaco models, Back/Forward. |
-| Continuity | `recent.rs`, `drafts.rs`: recent roots, editor sessions, crash snapshots, leases and retirement. | `draft-recorder.ts` and workbench/session wiring in `main.ts` and `editor.ts`. |
-| Build, run and test | `tools.rs`, `packages.rs`, `tasks.rs`: tool discovery, gofmt, run targets, Go process ownership and bounded output. | `execution.ts`, `run-targets.ts`, `run-configurations.ts`, `go-test-stream.ts`, `feedback.ts`: launch admission, scopes, configurations and results. |
+| App and project lifecycle | `main.rs`, `workspace_admission.rs`, `quit.rs`, `workbench_menu.rs`: session, native operation leases, Quit tickets, AppKit menus and command registration. | `main.ts`, `project-workflow.ts`, `quit-flow.ts`: workbench assembly, commands, reservations. |
+| Workspace and editor | `workspace.rs`, `workspace_disk.rs`, `workspace_files.rs`: guarded paths, saves, file identity, watchers and moves. | `workspace.ts`, `project-model.ts`, `editor.ts`, `navigation-history.ts`, `file-commands.ts`: project bridge, tree/search, Monaco models, Back/Forward and file admission. |
+| Continuity | `recent.rs`, `drafts.rs`: recent roots, editor sessions, crash snapshots, leases and retirement. | `draft-recorder.ts`, `editor-session-recorder.ts`: recovery and recent-state recording. |
+| Build, run and test | `tools.rs`, `packages.rs`, `tasks.rs`, `go_launch.rs`: tool discovery, gofmt, run targets, process ownership and configured executable handoff. | `execution.ts`, `run-targets.ts`, `run-configurations.ts`, `go-test-stream.ts`, `feedback.ts`: launch admission, scopes, configurations and results. |
 | Language services | `lsp.rs`, `go_source.rs`, `tool_transport.rs`: gopls stdio transport and read-only dependency source. | `lsp.ts`, `go-semantic-tokens.ts`, `go-source-view.ts`, `go-rename.ts`, `go-import-edits.ts`: Monaco providers and Go edit/navigation workflows. |
 | Debug and terminal | `debug.rs`, `debug_program.rs`, `terminal.rs`: Delve DAP, executable handoff, PTY lifecycle and credits. | `debugger.ts`, `debug-inspection.ts`, `terminal-pane.ts`: breakpoints, paused state and xterm.js interaction. |
 

@@ -106,3 +106,38 @@ test("duplicate records cannot substitute for a missing Go case and cleanup stay
   assert.match(summarizeGroup("go", options).failure, /duplicate native Go case/i);
   assert.equal(summarizeGroup("go", { ...options, cleanup: "not cleaned" }).failure, "not cleaned");
 });
+
+test("Recovery requires primary process evidence from the matching phase", () => {
+  const worker = { code: 0 };
+  const entry = id => ({ id, name: id, result: "pass" });
+  const terminal = action => ({ action, rendererObserved: "last live checkpoint" });
+  const report = { version: 1, group: "recovery", cases: [entry("draft-crash")], terminal: terminal("crash with completed draft") };
+  assert.match(summarizeGroup("recovery", { worker, report }).failure, /Recovery.*process evidence/i);
+  assert.match(summarizeGroup("recovery", { worker, report, processEvidence: "native_quit" }).failure, /Recovery.*process evidence/i);
+  assert.equal(summarizeGroup("recovery", { worker, report, processEvidence: "observed_crash" }).result, "pass");
+  assert.match(summarizeGroup("recovery", { worker, report: { ...report, cases: [...report.cases, entry("draft-retired")] },
+    processEvidence: "observed_crash" }).failure, /belongs to another Recovery phase.*draft-retired/);
+  const reopen = { ...report, terminal: terminal("discard recovery and Quit"), cases:
+    ["draft-reopened", "draft-writer-isolated", "draft-quit-refused", "draft-discard-quit"].map(entry) };
+  assert.match(summarizeGroup("recovery", { worker, report: reopen, reopen: true, processEvidence: "observed_crash" }).failure,
+    /Recovery.*process evidence/i);
+  assert.equal(summarizeGroup("recovery", { worker, report: reopen, reopen: true, processEvidence: "native_quit" }).result, "pass");
+  const after = { ...report, terminal: undefined, cases: [entry("draft-retired")] };
+  assert.match(summarizeGroup("recovery", { worker, report: after, reopen: "after-quit", processEvidence: "native_quit" }).failure,
+    /Recovery.*process evidence/i);
+  assert.equal(summarizeGroup("recovery", { worker, report: after, reopen: "after-quit", processEvidence: "supervised" }).result, "pass");
+});
+
+test("terminal completeness rejects missing, skipped, and duplicate cases", () => {
+  const worker = { code: 0 };
+  const cases = ["pty-io", "pty-credit", "pty-survivor", "pty-cutover"].map(id => ({ id, name: id, result: "pass" }));
+  const report = { version: 1, group: "terminal", terminal: { action: "Quit with PTY", rendererObserved: "checkpoint" }, cases };
+  const summarize = (entries, extra = {}) => summarizeGroup("terminal", {
+    worker, report: { ...report, cases: entries }, nativeTerminal: true, ...extra,
+  });
+  assert.equal(summarize(cases).result, "pass");
+  assert.match(summarize(cases.slice(0, -1)).failure, /Missing native case.*pty-cutover/);
+  assert.match(summarize([...cases.slice(0, -1), { ...cases.at(-1), result: "skip" }]).failure, /did not pass.*pty-cutover/);
+  assert.match(summarize([...cases, cases[0]]).failure, /Duplicate native case.*pty-io/);
+  assert.equal(summarize([], { failure: "worker failed" }).failure, "worker failed");
+});

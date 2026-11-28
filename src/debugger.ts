@@ -117,6 +117,7 @@ export class DebugSession {
   private admission?: Promise<{ server: number; output?: string }>;
   private seq = 0;
   private readonly pending = new Map<number, Pending>();
+  private readonly breakpointRequests = new Map<string, object>();
   private initialized = false;
   private configDone = false;
   private closed = false;
@@ -221,10 +222,20 @@ export class DebugSession {
   }
 
   async setBreakpoints(path: string, lines = this.marks.at(path)) {
-    const result = await this.request<{ breakpoints: { verified: boolean }[] }>("setBreakpoints", {
-      source: { path: this.absolute(path) }, breakpoints: lines.map(line => ({ line })),
-    });
-    if (!this.closed && this.events.isCurrent()) this.marks.verify(path, lines.filter((_, index) => result.breakpoints[index]?.verified));
+    const request = {};
+    this.breakpointRequests.set(path, request);
+    const latest = () => this.breakpointRequests.get(path) === request;
+    const current = () => latest() && !this.closed && !this.stopping && this.events.isCurrent();
+    try {
+      const result = await this.request<{ breakpoints: { verified: boolean }[] }>("setBreakpoints", {
+        source: { path: this.absolute(path) }, breakpoints: lines.map(line => ({ line })),
+      });
+      if (current()) this.marks.verify(path, lines.filter((_, index) => result.breakpoints[index]?.verified));
+    } catch (error) {
+      if (current()) throw error;
+    } finally {
+      if (latest()) this.breakpointRequests.delete(path);
+    }
   }
 
   private async receive(event: DebugMessage) {

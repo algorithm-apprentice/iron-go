@@ -28,6 +28,9 @@ export function installAcceptance(docs: Documents, workbench: {
   let sourceReadHeld = false;
   let releaseDebugScopes: (() => void) | undefined;
   let debugScopesHeld = false;
+  const format = host.format;
+  let releaseFormat: (() => void) | undefined;
+  let formatHeld = false;
   const releaseNavigation = () => {
     delete window.__ironNavigationProbe;
     const deferred = deferredNavigation;
@@ -43,6 +46,18 @@ export function installAcceptance(docs: Documents, workbench: {
       markers: docs.active ? monaco.editor.getModelMarkers({ resource: docs.active.model.uri }) : [], gopls: workbench.gopls(),
       editor: { width: docs.editor.getLayoutInfo().width, height: docs.editor.getLayoutInfo().height, scrollTop: docs.editor.getScrollTop(), contentHeight: docs.editor.getContentHeight(), runtimeErrors: window.__ironTestRuntimeErrors?.() } }),
     toolProbe: host.tools,
+    holdFormat(hold?: boolean) {
+      if (hold && !releaseFormat) {
+        const gate = new Promise<void>(resolve => { releaseFormat = resolve; });
+        host.format = async text => { formatHeld = true; await gate; return format(text); };
+      } else if (hold === false && releaseFormat) {
+        host.format = format;
+        releaseFormat();
+        releaseFormat = undefined;
+        formatHeld = false;
+      }
+      return formatHeld;
+    },
     replace: (value: string) => { if (docs.active) replaceBuffer(docs.active.model, value); },
     goSourceView: () => {
       const editor = monaco.editor.getEditors().find(editor => editor.getContainerDomNode().id === "go-source-editor");
@@ -141,6 +156,9 @@ export function installAcceptance(docs: Documents, workbench: {
       docs.editor.focus();
       docs.refreshView();
     },
+    scrollToLine: (lineNumber: number) => {
+      docs.editor.setScrollTop(docs.editor.getTopForLineNumber(lineNumber), monaco.editor.ScrollType.Immediate);
+    },
     suggest: (lineNumber: number, column: number) => {
       docs.editor.setPosition({ lineNumber, column });
       docs.editor.focus();
@@ -188,8 +206,14 @@ export function installAcceptance(docs: Documents, workbench: {
     quitRequests: workbench.quitRequests,
     quitExpiry: workbench.quitExpiry,
     quitDeadline: (hold?: boolean) => invoke<[number, boolean] | null>("test_quit_deadline", { hold }),
+    expireQuit: (ticket: number) => invoke<boolean>("test_expire_quit", { ticket }),
     cancelNextPicker: () => invoke<void>("test_cancel_next_picker"),
     holdSave: (hold?: boolean, path?: string) => invoke<boolean>("test_hold_save", { hold, path }),
+    holdSaveLock: (hold?: boolean) => invoke<boolean>("test_hold_save_lock", { hold }),
+    makeFixtureFolder: (path: string) => host.mutateWorkspace(workbench.workspaceId()!, { kind: "new_folder", path }),
+    makeFixtureFile: (path: string) => invoke<void>("create_file", { id: workbench.workspaceId(), path }),
+    closeFixtureProject: () => host.close(workbench.workspaceId()!),
+    inspectFixtureFile: (path: string) => host.inspectFileOperation(workbench.workspaceId()!, path),
     runHandoff: (hold?: boolean) => invoke<string | null>("test_run_handoff", { hold }),
     attemptConfiguredRun: (packageName: string, launch: RunLaunch) =>
       host.task(workbench.workspaceId()!, "run", [packageName], undefined, () => {}, launch),

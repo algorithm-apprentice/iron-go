@@ -15,6 +15,7 @@
   import { DraftRecorder } from "../../../src/draft-recorder.ts";
   import { host } from "../../../src/workspace.ts";
   import { Feedback } from "../../../src/feedback.ts";
+  import { TerminalPane } from "../../../src/terminal-pane.ts";
   import { AbstractMessageReader, AbstractMessageWriter, CancellationTokenSource, createMessageConnection } from "vscode-jsonrpc/lib/browser/main.js";
   import workbenchMarkup from "../../../index.html?raw";
 
@@ -42,5 +43,5 @@
     });
   };
   window.workflowFixture = { DebugSession, ExecutionLane, createCursorTestWorkflow, monaco, GoLanguage, exactModelRange, applyExactTextEdits,
-    AbstractMessageReader, AbstractMessageWriter, CancellationTokenSource, createMessageConnection, DebugInspection, DebugInspectionView, DraftRecorder, host };
+    AbstractMessageReader, AbstractMessageWriter, CancellationTokenSource, createMessageConnection, DebugInspection, DebugInspectionView, DraftRecorder, TerminalPane, host };
 </script>

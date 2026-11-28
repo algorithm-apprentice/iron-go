@@ -117,6 +117,7 @@ impl Admission {
 
 fn seal(session: &mut Session) {
     session.acceptance.sealed = true;
+    session.seal_workspace_effect();
     session.stop_processes();
 }
 
@@ -142,12 +143,14 @@ pub fn watch(app: &AppHandle) {
                 session.acceptance.short_tools != 0
                     || session.program_debug.is_some()
                     || session.terminal.is_some()
+                    || session.workspace_busy()
             })
             .unwrap();
         let drained = eof.is_ok()
             && session.acceptance.short_tools == 0
             && session.program_debug.is_none()
             && session.terminal.is_none()
+            && !session.workspace_busy()
             && !session.acceptance.unproved_exit;
         session.clean_run_directories();
         drop(session);

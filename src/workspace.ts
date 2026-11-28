@@ -13,6 +13,8 @@ export type TaskEvent =
   | { type: "finished"; success: boolean; code: number | null; cancelled: boolean };
 export interface ToolStatus { goVersion: string | null; gofmt: boolean; gopls: boolean; delve: boolean }
 export interface NativeFolder { id: number; name: string; path: string; editorSession?: SavedEditorSession; recentError?: string }
+export type NewModuleOutcome = { kind: "cancelled" } | { kind: "opened"; workspace: NativeFolder }
+  | { kind: "created_not_opened"; path: string; error: string } | { kind: "incomplete"; path: string; file: string; error: string };
 export interface RunTarget { package: string; importPath: string }
 export interface GoPackages { targets: RunTarget[]; allScopes: string[]; packagePaths: Record<string, string> }
 export type ServerEvent = { type: "message"; message: unknown } | { type: "closed"; reason: string };
@@ -39,7 +41,7 @@ export type WorkspaceMutationResult = {
 export type TerminalSize = { cols: number; rows: number };
 export type TerminalLaunch = { kind: "shell" } | { kind: "go"; package: string; launch: RunLaunch };
 export type TerminalEvent = { type: "ready"; id: number } | { type: "output"; id: number; sequence: number; bytes: number[] }
-  | { type: "build"; id: number; event: TaskEvent } | { type: "closed"; id: number; reason: string };
+  | { type: "build"; id: number; event: TaskEvent } | { type: "cleanup" | "closed"; id: number; reason: string };
 export type DiskObservation = ReadableDisk | { kind: "missing" } | { kind: "unavailable" } | { kind: "retry" };
 
 function channel<T>(handler: (event: T) => void) {
@@ -50,7 +52,7 @@ function channel<T>(handler: (event: T) => void) {
 
 export const host = {
   open: (retirement?: DraftRetirement) => invoke<NativeFolder | null>("open_workspace", { retirement }),
-  create: (name: string, module: string, retirement?: DraftRetirement) => invoke<NativeFolder | null>("new_module", { name, module, retirement }),
+  create: (name: string, module: string, retirement?: DraftRetirement) => invoke<NewModuleOutcome>("new_module", { name, module, retirement }),
   close: (id: number, retirement?: DraftRetirement) => invoke<void>("close_workspace", { id, retirement }),
   resolveExit: (ticket: number, approve: boolean, retirement?: DraftRetirement) => invoke<boolean>("resolve_app_exit", { ticket, approve, retirement }),
   presentExit: (ticket: number) => invoke<boolean>("present_app_exit", { ticket }),

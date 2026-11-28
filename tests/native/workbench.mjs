@@ -149,7 +149,9 @@ async function appCleanup(app, groupReport, directory, group, beforeCrash) {
   shutdown.remaining = await remainingChildren(observed);
   if (shutdown.remaining.length) failures.push("Observed test-owned descendants remain after app shutdown.");
   await writeFile(path.join(directory, "cleanup.json"), JSON.stringify(shutdown, null, 2));
-  return { failure: failures.join(" ") || undefined, nativeTerminal: shutdown.nativeTerminal };
+  const processEvidence = failures.length ? undefined : shutdown.nativeTerminal ?
+    (expectedCrash ? "observed_crash" : "native_quit") : shutdown.acknowledged ? "supervised" : undefined;
+  return { failure: failures.join(" ") || undefined, nativeTerminal: shutdown.nativeTerminal, processEvidence };
 }
 
 async function goEnvironment() {
@@ -206,7 +208,7 @@ async function runGroup(executable, env, group, quitHelper, reopen = false, acce
   const trashRoot = volume ? path.join(volume, ".Trashes", String(process.getuid())) : undefined;
   const fixture = path.join(volume ?? fixtureRoot, "workspace", values.project ? path.basename(path.resolve(values.project)) : "orbit");
   const home = path.join(fixtureRoot, "home");
-  let app, peer, peerDirectory, worker, workerExit, groupReport, failure, cleanup, nativeTerminal, mounted = false;
+  let app, peer, peerDirectory, worker, workerExit, groupReport, failure, cleanup, nativeTerminal, processEvidence, mounted = false;
   const beforeCrash = new Map();
   const diagnostics = [];
   try {
@@ -298,6 +300,7 @@ async function runGroup(executable, env, group, quitHelper, reopen = false, acce
       try {
         const result = await appCleanup(app, groupReport, directory, group, beforeCrash.get(app.child.pid));
         nativeTerminal = result.nativeTerminal;
+        processEvidence = result.processEvidence;
         cleanup = [cleanup, result.failure].filter(Boolean).join(" ") || undefined;
       }
       catch (error) {
@@ -322,7 +325,7 @@ async function runGroup(executable, env, group, quitHelper, reopen = false, acce
       catch (error) { cleanup = `Could not remove disposable group: ${error}`; preserve.add(fixtureRoot); }
     }
   }
-  return summarizeGroup(group, { worker: workerExit, report: groupReport, failure, cleanup, nativeTerminal, diagnostics,
+  return summarizeGroup(group, { worker: workerExit, report: groupReport, failure, cleanup, nativeTerminal, processEvidence, diagnostics,
     reopen, requireGopls: values["require-gopls"] });
 }
 

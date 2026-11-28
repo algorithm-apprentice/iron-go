@@ -657,7 +657,7 @@ pub(crate) fn subtree(path: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-// The caller holds native workspace state and the stable Save lock. Preserve
+// The caller owns a workspace reservation and the stable Save lock. Preserve
 // the previous index unless the native filesystem mutation actually commits.
 pub(crate) fn rebind_paths<T>(
     app: &AppHandle,
@@ -665,6 +665,7 @@ pub(crate) fn rebind_paths<T>(
     source: &str,
     destination: Option<&str>,
     revision: u64,
+    admit: impl FnOnce() -> CommandResult<()>,
     mutate: impl FnOnce() -> CommandResult<(T, bool)>,
 ) -> CommandResult<(T, Option<String>)> {
     let project = ProjectKey::admitted(&workspace.root, &workspace.anchor)?;
@@ -679,7 +680,7 @@ pub(crate) fn rebind_paths<T>(
     } else {
         None
     };
-    let mut stage = None;
+    let mut next_index = None;
     if let Some(writer) = writer {
         let mut index = read_index(&writer.dir).map_err(text_error)?;
         if let Some(to) = destination {
@@ -710,9 +711,14 @@ pub(crate) fn rebind_paths<T>(
                     .entries
                     .retain(|entry| entry.project != project || !subtree(&entry.path, source));
             }
-            stage = Some(stage_index(&writer.dir, &index).map_err(text_error)?);
+            next_index = Some(index);
         }
     }
+    admit()?;
+    let stage = match (writer, next_index) {
+        (Some(writer), Some(index)) => Some(stage_index(&writer.dir, &index).map_err(text_error)?),
+        _ => None,
+    };
     let result = mutate();
     let warning = if let (Some(writer), Some(stage)) = (writer, stage) {
         if result.as_ref().is_ok_and(|(_, publish)| *publish) {
@@ -972,17 +978,17 @@ pub(crate) async fn prepare_quit(
     app: AppHandle,
     ticket: u64,
     plan: Retirement,
+    lease: std::sync::Arc<crate::workspace_admission::Lease>,
 ) -> CommandResult<()> {
     blocking(move || {
         let state = app.state::<DraftRuntime>();
         let core = app.state::<Core>();
+        let (root, anchor) = observation_root(&core, plan.id)?;
+        let project = ProjectKey::admitted(&root, &anchor)?;
         let deadline = Instant::now() + Duration::from_secs(1);
         let live = || crate::quit::live_ticket(&app, ticket);
         let expired = "The Quit decision expired before recovery drafts could be retired.";
         let attempt = || -> CommandResult<bool> {
-            let Ok(session) = core.0.try_lock() else { return Ok(false); };
-            let root = session.root(plan.id)?;
-            let project = ProjectKey::admitted(root, &session.workspace.as_ref().unwrap().anchor)?;
             let Ok(mut runtime) = state.0.try_lock() else { return Ok(false); };
             if runtime.quit.is_some() { return Err("Another draft retirement is staged.".into()); }
             let mut stage = None;
@@ -995,12 +1001,14 @@ pub(crate) async fn prepare_quit(
                 let mut index = read_index(&writer.dir).map_err(text_error)?;
                 let count = index.entries.len();
                 index.entries.retain(|entry| entry.project != project || entry.revision > plan.revision);
+                if !live() { return Err(expired.into()); }
+                lease.admit_effect()?;
                 if count != index.entries.len() { stage = Some(stage_index(&writer.dir, &index).map_err(text_error)?); }
                 if !live() {
                     if let Some(stage) = &stage { let _ = unlink(&writer.dir, stage, 0); }
                     return Err(expired.into());
                 }
-            }
+            } else { lease.admit_effect()?; }
             runtime.quit = Some(QuitStage { ticket, stage, approved: false });
             Ok(true)
         };

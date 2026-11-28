@@ -2,10 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{self, Read, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::fs::MetadataExt,
-    },
+    os::fd::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -21,13 +18,10 @@ use tokio::{
 
 use crate::{
     debug_program::ProcessStamp,
+    go_launch::{prepare_build, verify_handoff, PreparedBinary},
     process_owner::{bind_child_directory, exited_without_reaping, OwnedChild},
-    tasks::{
-        literal_package_selector, spawn_child, supervise, verify_executable, RunLaunch,
-        RunningTask, TaskEvent, MAX_OUTPUT,
-    },
-    tools::command,
-    workspace::{package_dir, run_directory},
+    tasks::{spawn_child, supervise, RunLaunch, RunningTask, TaskEvent, MAX_OUTPUT},
+    workspace::run_directory,
     CommandResult, Core, Session,
 };
 
@@ -86,17 +80,29 @@ pub enum Event {
         id: u64,
         event: TaskEvent,
     },
+    Cleanup {
+        id: u64,
+        reason: String,
+    },
     Closed {
         id: u64,
         reason: String,
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Cleanup {
+    Live,
+    Retiring,
+    Unconfirmed { reason: String, retryable: bool },
+    Retired,
+}
+
 pub(crate) struct Owner {
     id: u64,
     pub(crate) go: bool,
-    stop: watch::Sender<bool>,
-    done: watch::Sender<bool>,
+    stop: watch::Sender<u64>,
+    done: watch::Sender<Cleanup>,
     input: mpsc::Sender<Vec<u8>>,
     ack: mpsc::Sender<u64>,
     size: watch::Sender<Size>,
@@ -105,7 +111,7 @@ pub(crate) struct Owner {
 }
 
 struct Streams {
-    stop: watch::Receiver<bool>,
+    stop: watch::Receiver<u64>,
     input: mpsc::Receiver<Vec<u8>>,
     ack: mpsc::Receiver<u64>,
     size: watch::Receiver<Size>,
@@ -138,7 +144,7 @@ pub fn test_terminal_observation(state: State<'_, Core>) -> Option<TestSample> {
 
 impl Owner {
     fn new(id: u64, go: bool, size: Size) -> (Self, Streams) {
-        let (stop, stop_rx) = watch::channel(false);
+        let (stop, stop_rx) = watch::channel(0);
         // Three queued chunks and the chunk being written share 32 KiB.
         let (input, input_rx) = mpsc::channel(3);
         let (ack, ack_rx) = mpsc::channel(FRAME_LIMIT);
@@ -150,7 +156,7 @@ impl Owner {
                 id,
                 go,
                 stop,
-                done: watch::channel(false).0,
+                done: watch::channel(Cleanup::Live).0,
                 input,
                 ack,
                 size,
@@ -183,12 +189,22 @@ impl Session {
     pub(crate) fn request_terminal_stop(
         &mut self,
         id: Option<u64>,
-    ) -> Option<watch::Receiver<bool>> {
+    ) -> Option<watch::Receiver<Cleanup>> {
         let owner = self
             .terminal
             .as_ref()
             .filter(|owner| id.is_none_or(|id| id == owner.id))?;
-        owner.stop.send_replace(true);
+        let request = match *owner.done.borrow() {
+            Cleanup::Live
+            | Cleanup::Unconfirmed {
+                retryable: true, ..
+            } => true,
+            _ => false,
+        };
+        if request {
+            owner.done.send_replace(Cleanup::Retiring);
+            owner.stop.send_modify(|attempt| *attempt += 1);
+        }
         if let Some(task) = self.task.as_mut().filter(|task| task.id == owner.id) {
             task.cancel();
         }
@@ -196,38 +212,66 @@ impl Session {
     }
 }
 
-pub(crate) struct Cutover {
-    app: AppHandle,
-}
-impl Drop for Cutover {
-    fn drop(&mut self) {
-        self.app.state::<Core>().0.lock().unwrap().terminal_cutover = false;
+pub(crate) fn begin_cutover(
+    app: &AppHandle,
+    ticket: Option<u64>,
+) -> CommandResult<crate::workspace_admission::Lease> {
+    let core = app.state::<Core>();
+    let mut session = core.0.lock().unwrap();
+    if ticket.is_some_and(|ticket| !crate::quit::live_ticket(app, ticket)) {
+        return Err("The Quit decision expired before the terminal could close.".into());
     }
+    crate::workspace_admission::Lease::begin(
+        app,
+        &mut session,
+        ticket.map_or(
+            crate::workspace_admission::Kind::Cutover,
+            crate::workspace_admission::Kind::Quit,
+        ),
+    )
 }
 
-pub(crate) async fn fence_cutover(app: &AppHandle, ticket: Option<u64>) -> CommandResult<Cutover> {
-    let fence = {
-        let state = app.state::<Core>();
-        let mut session = state.0.lock().unwrap();
-        if session.terminal_cutover {
-            return Err("Another project or Quit decision is already in progress.".into());
-        }
+pub(crate) async fn retire_for_cutover(
+    app: &AppHandle,
+    lease: &crate::workspace_admission::Lease,
+    ticket: Option<u64>,
+) -> CommandResult<()> {
+    let done = {
+        let core = app.state::<Core>();
+        let mut session = core.0.lock().unwrap();
         if ticket.is_some_and(|ticket| !crate::quit::live_ticket(app, ticket)) {
             return Err("The Quit decision expired before the terminal could close.".into());
         }
-        session.terminal_cutover = true;
-        Cutover { app: app.clone() }
+        lease.begin_teardown(&mut session)?;
+        session.request_terminal_stop(None)
     };
-    wait_stop(app.state::<Core>().inner(), None).await?;
+    wait_cleanup(done).await
+}
+
+pub(crate) async fn fence_cutover(
+    app: &AppHandle,
+    ticket: Option<u64>,
+) -> CommandResult<crate::workspace_admission::Lease> {
+    let fence = begin_cutover(app, ticket)?;
+    retire_for_cutover(app, &fence, ticket).await?;
     Ok(fence)
 }
 
 async fn wait_stop(core: &Core, id: Option<u64>) -> CommandResult<()> {
     let done = core.0.lock().unwrap().request_terminal_stop(id);
+    wait_cleanup(done).await
+}
+
+async fn wait_cleanup(done: Option<watch::Receiver<Cleanup>>) -> CommandResult<()> {
     if let Some(mut done) = done {
-        tokio::time::timeout(Duration::from_secs(5), done.wait_for(|done| *done)).await
+        let terminal = tokio::time::timeout(Duration::from_secs(5), done.wait_for(|status| {
+            matches!(status, Cleanup::Retired | Cleanup::Unconfirmed { .. })
+        })).await
             .map_err(|_| "Terminal cleanup could not be confirmed. The terminal is still tracked; try Close Terminal again.".to_owned())?
             .map_err(|_| "The native terminal closed without proving process cleanup.".to_owned())?;
+        if let Cleanup::Unconfirmed { reason, .. } = &*terminal {
+            return Err(reason.clone());
+        }
     }
     Ok(())
 }
@@ -249,6 +293,68 @@ fn check_owner(session: &Session, terminal: u64) -> CommandResult<&Owner> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_reap_retry_resamples_the_foreground_before_signaling_again() {
+        use std::{
+            cell::{Cell, RefCell},
+            future::ready,
+        };
+
+        let (request, mut stop) = watch::channel(1);
+        let current_group = Cell::new(1);
+        let trace = RefCell::new(Vec::new());
+        let mut foreground = Foreground::default();
+        let mut proof = std::pin::pin!(wait_for_cleanup_proof(
+            &mut foreground,
+            &mut stop,
+            |_| trace.borrow_mut().push(("sample", current_group.get())),
+            |_| trace.borrow_mut().push(("kill", current_group.get())),
+            false,
+            |waited| ready((
+                true,
+                if waited {
+                    Ok(())
+                } else {
+                    Err(("transient wait failure".into(), true))
+                },
+            )),
+            |status| if matches!(status, Cleanup::Unconfirmed { .. }) {
+                trace
+                    .borrow_mut()
+                    .push(("unconfirmed", current_group.get()));
+            },
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut proof => panic!("a failed reap must not release the terminal"),
+            () = ready(()) => {},
+        }
+        current_group.set(2);
+        request.send_replace(2);
+        proof.await;
+        assert_eq!(
+            *trace.borrow(),
+            [
+                ("sample", 1),
+                ("kill", 1),
+                ("unconfirmed", 1),
+                ("sample", 2),
+                ("kill", 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn incomplete_foreground_enumeration_requires_the_master_to_remain_available() {
+        let mut foreground = Foreground::default();
+        assert!(!foreground.needs_resample());
+        foreground.uncertain.insert(7);
+        assert!(foreground.needs_resample());
+        foreground.uncertain.clear();
+        foreground.missing_observation = true;
+        assert!(foreground.needs_resample());
+    }
+
     #[test]
     fn stale_requests_do_not_stop_or_credit_the_replacement_terminal() {
         let (owner, mut streams) = Owner::new(2, false, Size { cols: 80, rows: 24 });
@@ -259,7 +365,7 @@ mod tests {
 
         assert!(session.request_terminal_stop(Some(1)).is_none());
         session.ack_terminal(1, 12);
-        assert!(!*streams.stop.borrow());
+        assert_eq!(*streams.stop.borrow(), 0);
         assert!(matches!(
             streams.ack.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -268,8 +374,8 @@ mod tests {
         session.ack_terminal(2, 13);
         assert_eq!(streams.ack.try_recv().unwrap(), 13);
         let done = session.request_terminal_stop(Some(2)).unwrap();
-        assert!(*streams.stop.borrow());
-        assert!(!*done.borrow());
+        assert_eq!(*streams.stop.borrow(), 1);
+        assert_eq!(*done.borrow(), Cleanup::Retiring);
         assert_eq!(check_owner(&session, 2).unwrap().id, 2);
     }
 
@@ -284,9 +390,9 @@ mod tests {
             result = &mut wait => panic!("Stop completed before cleanup: {result:?}"),
             () = std::future::ready(()) => {}
         }
-        assert!(*streams.stop.borrow());
+        assert_eq!(*streams.stop.borrow(), 1);
         let owner = core.0.lock().unwrap().terminal.take().unwrap();
-        owner.done.send_replace(true);
+        owner.done.send_replace(Cleanup::Retired);
         assert!(wait.await.is_ok());
     }
 
@@ -301,12 +407,56 @@ mod tests {
             result = &mut wait => panic!("Stop completed before cleanup: {result:?}"),
             () = std::future::ready(()) => {}
         }
-        assert!(*streams.stop.borrow());
+        assert_eq!(*streams.stop.borrow(), 1);
         drop(core.0.lock().unwrap().terminal.take());
         assert_eq!(
             wait.await.unwrap_err(),
             "The native terminal closed without proving process cleanup."
         );
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_cleanup_rejects_stop_and_retains_the_same_owner_for_retry() {
+        let (owner, mut streams) = Owner::new(2, true, Size { cols: 80, rows: 24 });
+        let core = Core::default();
+        core.0.lock().unwrap().terminal = Some(owner);
+        let mut first = std::pin::pin!(wait_stop(&core, Some(2)));
+        tokio::select! {
+            biased;
+            result = &mut first => panic!("Stop completed before cleanup: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        assert_eq!(*streams.stop.borrow_and_update(), 1);
+        check_owner(&core.0.lock().unwrap(), 2)
+            .unwrap()
+            .done
+            .send_replace(Cleanup::Unconfirmed {
+                reason: "The foreground could not be observed.".into(),
+                retryable: true,
+            });
+        assert_eq!(
+            first.await.unwrap_err(),
+            "The foreground could not be observed."
+        );
+        assert!(core.0.lock().unwrap().terminal_go());
+
+        let mut retry = std::pin::pin!(wait_stop(&core, Some(2)));
+        tokio::select! {
+            biased;
+            result = &mut retry => panic!("Retry completed before cleanup: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        assert_eq!(*streams.stop.borrow(), 2);
+        assert_eq!(
+            *check_owner(&core.0.lock().unwrap(), 2)
+                .unwrap()
+                .done
+                .borrow(),
+            Cleanup::Retiring
+        );
+        let owner = core.0.lock().unwrap().terminal.take().unwrap();
+        owner.done.send_replace(Cleanup::Retired);
+        assert!(retry.await.is_ok());
     }
 }
 
@@ -315,7 +465,12 @@ pub fn terminal_input(state: State<'_, Core>, terminal: u64, text: String) -> Co
     if text.len() > INPUT {
         return Err("The terminal input chunk exceeds its limit.".into());
     }
-    check_owner(&state.0.lock().unwrap(), terminal)?
+    let session = state.0.lock().unwrap();
+    let owner = check_owner(&session, terminal)?;
+    if *owner.done.borrow() != Cleanup::Live {
+        return Err("The terminal is retiring and no longer accepts input.".into());
+    }
+    owner
         .input
         .try_send(text.into_bytes())
         .map_err(|_| "The terminal input queue is full or closed.".into())
@@ -346,7 +501,7 @@ pub async fn start_terminal(
     let size = size.validate()?;
     let mut session = state.0.lock().unwrap();
     session.root(id)?;
-    if session.terminal.is_some() || session.terminal_cutover {
+    if session.terminal.is_some() || session.cutover_pending() {
         return Err("Close the previous terminal before starting another.".into());
     }
     let terminal = session.next_id();
@@ -359,30 +514,35 @@ pub async fn start_terminal(
             let pty = Pty::spawn(&mut command, size)?;
             session.terminal = Some(owner);
             tauri::async_runtime::spawn(async move {
-                let reason = run(terminal, pty, streams, &events).await;
+                let reason = run(&app, terminal, pty, streams, &events).await;
                 finish(&app, terminal, reason, events);
             });
         }
         Launch::Go { package, launch } => {
-            if session.task.is_some() || session.debug.is_some() || session.program_debug.is_some()
-            {
+            if session.go_busy() || session.workspace_busy() {
                 return Err("A Go task or debug session is already running.".into());
             }
-            if package.len() > 512 || !literal_package_selector(&package) {
-                return Err("Choose one local executable package for the terminal.".into());
-            }
-            launch.validate()?;
             let workspace = session.workspace.as_ref().unwrap();
-            package_dir(&workspace.root, &package)?;
-            let cwd = run_directory(workspace, &launch.directory)?;
-            let directory = tempfile::Builder::new()
-                .prefix("iron-go-terminal-")
-                .tempdir()
-                .map_err(|error| error.to_string())?;
-            let binary = directory.path().join("program");
-            let mut go = command("go")?;
-            bind_child_directory(&mut go, run_directory(workspace, ".")?);
-            go.args(["build", "-o"]).arg(&binary).arg(&package);
+            let (
+                PreparedBinary {
+                    directory,
+                    binary,
+                    working,
+                },
+                mut go,
+            ) = prepare_build(
+                workspace,
+                &package,
+                &launch,
+                || {
+                    tempfile::Builder::new()
+                        .prefix("iron-go-terminal-")
+                        .tempdir()
+                        .map_err(|error| error.to_string())
+                },
+                "program",
+                &[],
+            )?;
             let child = spawn_child(&mut go)
                 .map_err(|error| format!("Start terminal Go build: {error}"))?;
             let (send, mut stop) = oneshot::channel();
@@ -394,7 +554,7 @@ pub async fn start_terminal(
             session.task = Some(RunningTask {
                 id: terminal,
                 stop: Some(send),
-                group: child.group.clone(),
+                group: Some(child.group.clone()),
             });
             session.terminal = Some(owner);
             tauri::async_runtime::spawn(async move {
@@ -422,11 +582,11 @@ pub async fn start_terminal(
                             id,
                             terminal,
                             &binary,
-                            cwd,
+                            working,
                             launch,
                             size,
                         ) {
-                            Ok(Some(pty)) => run(terminal, pty, streams, &events).await,
+                            Ok(Some(pty)) => run(&app, terminal, pty, streams, &events).await,
                             Ok(None) => "Terminal stopped".into(),
                             Err(error) => error,
                         }
@@ -463,8 +623,13 @@ fn finish(app: &AppHandle, terminal: u64, reason: String, events: Channel<Event>
         session.task.take();
     }
     session.run_directories.remove(&terminal);
-    if let Some(owner) = session.terminal.take() {
-        owner.done.send_replace(true);
+    if session
+        .terminal
+        .as_ref()
+        .is_some_and(|owner| owner.id == terminal)
+    {
+        let owner = session.terminal.take().unwrap();
+        owner.done.send_replace(Cleanup::Retired);
     }
     #[cfg(feature = "e2e")]
     core.2.notify_all();
@@ -501,8 +666,8 @@ fn admit_program(
 ) -> CommandResult<Option<Pty>> {
     let mut session = core.0.lock().unwrap();
     if session.root(workspace_id).is_err()
-        || session.terminal_cutover
-        || !check_owner(&session, terminal).is_ok_and(|owner| !*owner.stop.borrow())
+        || session.cutover_tearing_down()
+        || !check_owner(&session, terminal).is_ok_and(|owner| *owner.done.borrow() == Cleanup::Live)
     {
         return Ok(None);
     }
@@ -513,18 +678,12 @@ fn admit_program(
     {
         return Ok(None);
     }
-    let current = run_directory(session.workspace.as_ref().unwrap(), &launch.directory)?;
-    let identity = |file: &File| {
-        file.metadata()
-            .map(|info| (info.dev(), info.ino()))
-            .map_err(|error| error.to_string())
-    };
-    if identity(&current)? != identity(&cwd)? {
-        return Err(
-            "The configured terminal program directory was replaced during the build.".into(),
-        );
-    }
-    verify_executable(binary)?;
+    verify_handoff(
+        session.workspace.as_ref().unwrap(),
+        &launch.directory,
+        &cwd,
+        binary,
+    )?;
     let mut command = Command::new(binary);
     command.args(launch.args).envs(launch.environment);
     bind_child_directory(&mut command, cwd);
@@ -648,6 +807,10 @@ struct Foreground {
 }
 
 impl Foreground {
+    fn needs_resample(&self) -> bool {
+        self.missing_observation || !self.uncertain.is_empty()
+    }
+
     fn sample(&mut self, master: i32) {
         self.seen.retain(|_, process| !process.confirmed_gone());
         self.uncertain.retain(|group| !confirmed_absent(-*group));
@@ -709,9 +872,15 @@ fn send_foreground(master: i32, signal: i32) {
     unsafe { libc::ioctl(master, TIOCSIG, signal) };
 }
 
-async fn run(terminal: u64, pty: Pty, mut streams: Streams, events: &Channel<Event>) -> String {
+async fn run(
+    app: &AppHandle,
+    terminal: u64,
+    pty: Pty,
+    mut streams: Streams,
+    events: &Channel<Event>,
+) -> String {
     let master = pty.master.get_ref().as_raw_fd();
-    let mut child = pty.child;
+    let child = pty.child;
     let leader = child.child.id().expect("PTY child is not reaped") as i32;
     let mut foreground = Foreground::default();
     let mut outstanding = BTreeMap::<u64, usize>::new();
@@ -739,7 +908,7 @@ async fn run(terminal: u64, pty: Pty, mut streams: Streams, events: &Channel<Eve
             };
             tokio::select! {
                 biased;
-                _ = streams.stop.wait_for(|stop| *stop) => break "Terminal stopped".to_owned(),
+                _ = streams.stop.wait_for(|stop| *stop != 0) => break "Terminal stopped".to_owned(),
                 _ = ticker.tick() => {
                     let leader_exited = exited_without_reaping(leader as u32).unwrap_or(false);
                     foreground.sample(master);
@@ -789,6 +958,43 @@ async fn run(terminal: u64, pty: Pty, mut streams: Streams, events: &Channel<Eve
             }
         }
     };
+    retire_pty(child, pty.master, foreground, &mut streams.stop, |status| {
+        publish_cleanup(app, terminal, status, events);
+    })
+    .await;
+    reason
+}
+
+fn publish_cleanup(app: &AppHandle, terminal: u64, status: Cleanup, events: &Channel<Event>) {
+    let reason = match &status {
+        Cleanup::Retiring => "Retiring terminal processes…".into(),
+        Cleanup::Unconfirmed { reason, .. } => reason.clone(),
+        _ => return,
+    };
+    let core = app.state::<Core>();
+    {
+        let session = core.0.lock().unwrap();
+        let Ok(owner) = check_owner(&session, terminal) else {
+            return;
+        };
+        owner.done.send_replace(status);
+    }
+    let _ = events.send(Event::Cleanup {
+        id: terminal,
+        reason,
+    });
+}
+
+async fn retire_pty(
+    child: OwnedChild,
+    owned_master: AsyncFd<File>,
+    mut foreground: Foreground,
+    stop: &mut watch::Receiver<u64>,
+    mut publish: impl FnMut(Cleanup),
+) {
+    let master = owned_master.get_ref().as_raw_fd();
+    let leader = child.child.id().expect("PTY child is not reaped") as i32;
+    publish(Cleanup::Retiring);
     foreground.sample(master);
     send_foreground(master, libc::SIGHUP);
     let deadline = tokio::time::Instant::now() + HUP_GRACE;
@@ -800,12 +1006,109 @@ async fn run(terminal: u64, pty: Pty, mut streams: Streams, events: &Channel<Eve
         tokio::time::sleep(SAMPLE).await;
         foreground.sample(master);
     }
-    send_foreground(master, libc::SIGKILL);
-    child.group.kill();
-    let reaped = child.wait().await.is_ok();
-    drop(pty.master);
-    while !reaped || foreground.unresolved(leader) {
+    let group = child.group.clone();
+    wait_for_cleanup_proof(
+        &mut foreground,
+        stop,
+        |foreground| foreground.sample(master),
+        |reaped| {
+            send_foreground(master, libc::SIGKILL);
+            if !reaped {
+                group.kill();
+            }
+        },
+        child,
+        |mut child| async move {
+            let result = match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => Err((
+                    format!("Could not reap the terminal leader: {error}"),
+                    error.raw_os_error() != Some(libc::ECHILD),
+                )),
+                Err(_) => Err((
+                    "The terminal leader did not exit within the cleanup wait.".into(),
+                    true,
+                )),
+            };
+            (child, result)
+        },
+        publish,
+    )
+    .await;
+    drop(owned_master);
+    // Recorded process identities remain observable after the PTY is closed.
+    while foreground.unresolved(leader) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    reason
+}
+
+async fn wait_for_cleanup_proof<Child, Reap>(
+    foreground: &mut Foreground,
+    stop: &mut watch::Receiver<u64>,
+    mut sample: impl FnMut(&mut Foreground),
+    mut kill: impl FnMut(bool),
+    mut child: Child,
+    mut reap: impl FnMut(Child) -> Reap,
+    mut publish: impl FnMut(Cleanup),
+) where
+    Reap: std::future::Future<Output = (Child, Result<(), (String, bool)>)>,
+{
+    let mut reaped = false;
+    loop {
+        let attempt = *stop.borrow_and_update();
+        // The PTY may have acquired a different foreground group since a
+        // failed reap parked this worker. Renew evidence before every signal.
+        sample(foreground);
+        kill(reaped);
+        let wait_error = if reaped {
+            None
+        } else {
+            let (owned, result) = reap(child).await;
+            child = owned;
+            match result {
+                Ok(()) => {
+                    reaped = true;
+                    None
+                }
+                Err(error) => Some(error),
+            }
+        };
+        foreground
+            .uncertain
+            .retain(|group| !confirmed_absent(-*group));
+        let unconfirmed = wait_error.or_else(|| {
+            foreground.needs_resample().then(|| {
+                (
+                    "The terminal foreground could not be observed; try Close Terminal again."
+                        .into(),
+                    true,
+                )
+            })
+        });
+        let Some((reason, retryable)) = unconfirmed else {
+            break;
+        };
+        publish(Cleanup::Unconfirmed { reason, retryable });
+        if !retryable {
+            // No timer can change this result. Keep the owner reserved until shutdown.
+            std::future::pending::<()>().await;
+        }
+        let retry = tokio::select! {
+            result = stop.wait_for(|requested| *requested != attempt) => result.is_ok(),
+            () = async {
+                while foreground.uncertain.iter().any(|group| !confirmed_absent(-group)) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }, if reaped && !foreground.missing_observation && !foreground.uncertain.is_empty() => {
+                foreground.uncertain.clear();
+                // There is no new signal in this path. All uncertain groups
+                // disappeared; the caller will wait on the recorded stamps.
+                break;
+            }
+        };
+        if !retry {
+            std::future::pending::<()>().await;
+        }
+        publish(Cleanup::Retiring);
+    }
 }
