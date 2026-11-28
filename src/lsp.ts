@@ -117,6 +117,7 @@ export class GoLanguage {
     private readonly folder: NativeFolder,
     private readonly docs: Documents,
     private readonly status: (state: LanguageState, reason?: string) => void,
+    private readonly definitionGuard?: () => () => boolean,
   ) {}
 
   async start() {
@@ -388,7 +389,9 @@ export class GoLanguage {
       },
     }), monaco.languages.registerDefinitionProvider("go", {
       provideDefinition: async (model, pos, token) => {
-        return (await this.definitions(model, pos, token)).filter(target => this.docs.relative(target.uri));
+        const current = this.definitionGuard?.();
+        const targets = await this.definitions(model, pos, token);
+        return current && !current() ? [] : targets.filter(target => this.docs.relative(target.uri));
       },
     }), monaco.languages.registerCodeLensProvider("go", {
       provideCodeLenses: async (model, token) => {

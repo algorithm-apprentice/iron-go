@@ -99,6 +99,7 @@ export function installAcceptance(docs: Documents, workbench: {
     workspaceId: workbench.workspaceId,
     holdEditorSession: workbench.holdEditorSession,
     editorSession: () => docs.captureSession(),
+    codeLocation: () => docs.captureLocation(),
     editorInputOptions: () => {
       const { accessibilitySupport, editContext } = docs.editor.getRawOptions();
       return { accessibilitySupport, editContext };
@@ -183,6 +184,7 @@ export function installAcceptance(docs: Documents, workbench: {
     closeWindow: () => invoke<void>("test_perform_window_close"),
     quitWindowState: (minimize = false) => invoke<[boolean, boolean]>("test_quit_window_state", { minimize }),
     quitMenu: () => invoke<boolean>("test_quit_menu_action"),
+    menuItem: (menu: string, title: string, activate = false) => invoke<boolean | null>("test_menu_item", { menu, title, activate }),
     quitRequests: workbench.quitRequests,
     quitExpiry: workbench.quitExpiry,
     quitDeadline: (hold?: boolean) => invoke<[number, boolean] | null>("test_quit_deadline", { hold }),

@@ -16,6 +16,11 @@ From the welcome screen, select **Open Project** to open a Go module or `go.work
 
 **Open Recent** reopens a remembered project and restores available tabs, caret positions, and viewports. Iron Go always starts on Welcome.
 
+The macOS **File** menu works from Welcome and inside a project. Use
+**New Project** (`⌘N`), **Open Project** (`⌘O`), **Open Recent**, or **Close Project**.
+Use **Go → Back** (`⌃-`) and **Go → Forward** (`⌃⇧-`) to revisit code locations
+after a jump, with the original caret, selection, and viewport restored.
+
 For libraries without an executable package, the toolbar offers **Test** to run tests in the selected scope.
 
 When launched from Finder, Iron Go also searches common tool locations, including Homebrew, the official Go installation path, and `~/go/bin`. The status bar shows the Go version. To probe again, open **Settings** and select **Check tools**.

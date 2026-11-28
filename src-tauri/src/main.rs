@@ -13,6 +13,7 @@ mod tasks;
 mod terminal;
 mod tool_transport;
 mod tools;
+mod workbench_menu;
 mod workspace;
 mod workspace_disk;
 mod workspace_files;
@@ -287,6 +288,15 @@ fn main() {
         .manage(Core::default())
         .manage(drafts::DraftRuntime::default())
         .manage(quit::ExitGate::default())
+        .manage(workbench_menu::MenuState::default())
+        .menu(workbench_menu::build)
+        .on_menu_event(workbench_menu::dispatch)
+        .on_page_load(|webview, event| {
+            if webview.label() == "main" && event.event() == tauri::webview::PageLoadEvent::Started
+            {
+                workbench_menu::reset(webview.app_handle());
+            }
+        })
         .setup(|app| {
             quit::install(app.handle())?;
             #[cfg(feature = "e2e")]
@@ -297,6 +307,8 @@ fn main() {
             open_workspace,
             new_module,
             close_workspace,
+            workbench_menu::workbench_menu_generation,
+            workbench_menu::update_workbench_menu,
             workspace::snapshot,
             workspace::read_file,
             workspace::inspect_file,
@@ -355,6 +367,8 @@ fn main() {
             workspace::test_hold_save,
             #[cfg(feature = "e2e")]
             acceptance::test_cancel_next_picker,
+            #[cfg(feature = "e2e")]
+            acceptance::test_menu_item,
             #[cfg(feature = "e2e")]
             acceptance::test_hold_debug_disconnect,
             #[cfg(feature = "e2e")]

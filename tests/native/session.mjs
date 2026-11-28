@@ -370,6 +370,16 @@ function requestNativeQuit() {
 async function accessibilitySuite() {
   const native = request => JSON.parse(execFileSync(accessibilityHelper, [String(pid)], { input: JSON.stringify(request), encoding: "utf8", timeout: 6000 }));
   const keys = (...keys) => native({ action: "keys", keys });
+  await record("native Command-N opens New Project from Welcome", async () => {
+    await eventually("native New Project is ready", () => js("return window.__ironTest.menuItem('File', 'New Project…');"), value => value === true);
+    await js("return window.__ironTest.focusWindow().then(() => true);");
+    native({ action: "activate" });
+    keys({ code: 45, modifiers: ["command"] });
+    await eventually("the native accelerator opens the New Project form", () => js("return document.querySelector('#form-dialog').open;"));
+    assert.equal(await text("#form-title"), "New Project");
+    await click('[data-dialog-close="form-dialog"]');
+    await eventually("Welcome is still open", () => js("return !document.querySelector('#project-welcome').hidden;"));
+  });
   await record("native keyboard input preserves Unicode and workbench focus", async () => {
     const source = path.join(fixture, "cmd/orbit/main.go");
     const original = "package main\n\nfunc main() {}\n";
@@ -421,10 +431,18 @@ async function accessibilitySuite() {
     keys({ code: 53 });
     await eventually("Escape restores focus to the initiating close control", () => js("return document.activeElement?.classList.contains('tab-close');"));
     await js("window.__ironTest.revealLine(3); return true;");
+    const departure = await js("return window.__ironTest.codeLocation();");
     keys({ code: 14, modifiers: ["shift", "command"] });
     await eventually("the existing keyboard shortcut moves focus out of Monaco into Explorer", () => js("return document.querySelector('#explorer').contains(document.activeElement);"));
     keys({ code: 119 }, { code: 36 });
     await eventually("opening a focused file returns to the editor", () => js("return document.querySelector('#editor').contains(document.activeElement);"));
+    const arrival = (await current()).path;
+    assert.notEqual(arrival, departure.path);
+    keys({ code: 27, modifiers: ["control"] });
+    await eventually("Control-Minus returns to the original editor", current, entry => entry?.path === departure.path);
+    assert.deepEqual(await js("return window.__ironTest.codeLocation();"), departure);
+    keys({ code: 27, modifiers: ["control", "shift"] });
+    await eventually("Control-Shift-Minus goes forward", current, entry => entry?.path === arrival);
   });
 }
 
@@ -503,6 +521,10 @@ async function terminalSuite() {
     } finally { await js("window.__ironTest.holdTerminalAck(false); return true;"); }
     await send("printf 'replacement-shell\\n'\r");
     await eventually("late old credits cannot disrupt the replacement", snapshot, state => /(?:^|\n)replacement-shell/.test(state?.text));
+    const startShellEnabled = () => js("return window.__ironTest.menuItem('Run', 'Start Shell');");
+    await eventually("native Start Shell is disabled while the shell is active", startShellEnabled, value => value === false);
+    await send("exit\r");
+    await eventually("native Start Shell becomes available after a natural shell exit", startShellEnabled, value => value === true);
     await close();
   });
   await record("a foreground survivor after leader exit keeps the terminal slot reserved", async () => {
@@ -1164,6 +1186,27 @@ async function lifecycleSuite() {
     assert.doesNotMatch(await text("#project-welcome"), /orbit/i);
     assert.match(await text("#project-welcome"), /Open Project/);
     assert.match(await text("#project-welcome"), /New Project/);
+  });
+  await record("native File menu can start a New Project from Welcome", async () => {
+    await eventually("native New Project is enabled", () => js("return window.__ironTest.menuItem('File', 'New Project…');"), value => value === true);
+    assert.equal(await js("return window.__ironTest.menuItem('File', 'Close Project');"), false);
+    assert.equal(await js("return window.__ironTest.menuItem('File', 'New Project…', true);"), true);
+    await eventually("the existing project form opens", () => js("return document.querySelector('#form-dialog').open;"));
+    assert.equal(await text("#form-title"), "New Project");
+    await click('[data-dialog-close="form-dialog"]');
+    assert.equal((await current()).root ?? null, null);
+    await eventually("native New Project is enabled again after Cancel", () => js("return window.__ironTest.menuItem('File', 'New Project…');"), value => value === true);
+    assert.equal(await js("return window.__ironTest.menuItem('File', 'New Project…', true);"), true);
+    await eventually("the project form reopens", () => js("return document.querySelector('#form-dialog').open;"));
+    await set("#form-name", "native-menu-go");
+    await set("#form-module", "example.com/native-menu-go");
+    await click("#form-submit");
+    const root = path.join(path.dirname(fixture), "native-menu-go");
+    await eventually("the new project is open", current, entry => entry?.root === root && entry.path === "main.go");
+    assert.match(await readFile(path.join(root, "go.mod"), "utf8"), /^module example\.com\/native-menu-go/m);
+    await eventually("native Close Project becomes enabled", () => js("return window.__ironTest.menuItem('File', 'Close Project');"), value => value === true);
+    assert.equal(await js("return window.__ironTest.menuItem('File', 'Close Project', true);"), true);
+    await eventually("native Close Project returns to Welcome", () => js("return !document.querySelector('#project-welcome').hidden;"));
   });
   await record("native chrome suppresses browser-only keys, not editor keys", async () => {
     const result = await js(`
@@ -2009,7 +2052,8 @@ async function goSuite() {
       "gopls symbol and reference navigation uses unsaved UTF-16 locations", "Organize Imports updates only the Go buffer as one undoable edit",
       "Rename previews real cross-file changes and rejects a stale workspace",
       "opens Go standard library and offline dependency source in an isolated read-only viewer", "runs exactly one Go test from its editor action",
-      "whole-line selection highlights the selected number, not its endpoint", "gopls colors identifiers in an unsaved Go buffer"]) {
+      "whole-line selection highlights the selected number, not its endpoint", "gopls colors identifiers in an unsaved Go buffer",
+      "native Go Back and Forward restore a dirty editor across a gopls jump"]) {
       console.log(`  SKIP ${name} (gopls not installed)`);
       report.cases.push({ name, result: "skip", reason: "gopls not installed" });
     }
@@ -2036,6 +2080,41 @@ async function goSuite() {
         `), row => row?.text.includes("NewReport") && row.background === background && row.foreground === "rgb(255, 255, 255)", 20_000);
       }
       await setNativeTheme("dark");
+      await replace(clean);
+    });
+    await record("native Go Back and Forward restore a dirty editor across a gopls jump", async () => {
+      const clean = (await current()).text;
+      const local = clean + "\n// unsaved navigation fixture\n";
+      const codePoint = local.split("\n").findIndex(line => line.includes("status.NewReport"));
+      assert.ok(codePoint >= 0);
+      await replace(local);
+      await js("window.__ironTest.position(arguments[0], arguments[1]); return true;", codePoint + 1, local.split("\n")[codePoint].indexOf("NewReport") + 2);
+      const origin = await js("return window.__ironTest.codeLocation();");
+      const menu = (title, activate = false) => js("return window.__ironTest.menuItem('Go', arguments[0], arguments[1]);", title, activate);
+      await eventually("native definition command enabled", () => menu("Go to Definition"), value => value === true);
+      assert.equal(await menu("Go to Definition", true), true);
+      await eventually("definition opens the real target", current, entry => entry?.path === "internal/status/report.go");
+      const target = await js("return window.__ironTest.codeLocation();");
+      await eventually("native Back enabled", () => menu("Back"), value => value === true);
+      assert.equal(await menu("Back", true), true);
+      await eventually("Back restores the dirty origin", current, entry => entry?.path === "cmd/orbit/main.go" && entry.dirty && entry.text === local);
+      assert.deepEqual(await js("return window.__ironTest.codeLocation();"), origin);
+      await eventually("native Forward enabled", () => menu("Forward"), value => value === true);
+      assert.equal(await menu("Forward", true), true);
+      await eventually("Forward restores the definition", current, entry => entry?.path === "internal/status/report.go");
+      assert.deepEqual(await js("return window.__ironTest.codeLocation();"), target);
+      assert.equal(await readFile(path.join(fixture, "cmd/orbit/main.go"), "utf8"), clean);
+      await click('#tabs [data-path="cmd/orbit/main.go"]');
+      await js("window.__ironTest.action('editor.action.revealDefinition', arguments[0], 1); return true;", local.split("\n").length);
+      await eventually("the abandoned definition has no result", () => text("#toast"), value => /No definition found/.test(value));
+      await js("window.__ironTest.position(arguments[0], arguments[1]); return true;", origin.line, origin.column);
+      const laterOrigin = await js("return window.__ironTest.codeLocation();");
+      await js("window.__ironTest.action('editor.action.revealDefinitionAside', arguments[0], arguments[1]); return true;", origin.line, origin.column);
+      await eventually("a later Monaco command opens the real target", current, entry => entry?.path === "internal/status/report.go");
+      await eventually("native Back is enabled for the later jump", () => menu("Back"), value => value === true);
+      assert.equal(await menu("Back", true), true);
+      await eventually("Back restores the later origin", current, entry => entry?.path === "cmd/orbit/main.go");
+      assert.deepEqual(await js("return window.__ironTest.codeLocation();"), laterOrigin);
       await replace(clean);
     });
     await record("gopls colors identifiers in an unsaved Go buffer", async () => {
@@ -2146,6 +2225,7 @@ func (c SemanticCourier) SemanticDeliver(SemanticMessage string) string {
       await eventually("dirty Go target has a discard decision", () => js("return document.querySelector('#file-decision-dialog').open;"));
       await click("#file-decision-discard");
       await eventually("closing a model invalidates the displayed references", () => text("#references-results"), value => value.includes("out of date"));
+      await eventually("discard finishes closing the tab", () => js("return !document.querySelector('#tabs [data-path=\"cmd/orbit/navigation.go\"]');"));
       await js("window.__oldReference.click(); return true;");
       assert.equal(await js("return !!document.querySelector('#tabs [data-path=\"cmd/orbit/navigation.go\"]');"), false);
       assert.equal(await readFile(file, "utf8"), disk);

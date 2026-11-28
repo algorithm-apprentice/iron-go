@@ -26,7 +26,8 @@ export class TerminalPane {
   private holdAck = false;
   private readonly heldAcks: { ack(): void; bytes: number }[] = [];
 
-  constructor(private readonly reveal: (visible: boolean) => void, private readonly report: (error: unknown) => void) {}
+  constructor(private readonly reveal: (visible: boolean) => void, private readonly report: (error: unknown) => void,
+    private readonly activityChanged: () => void) {}
 
   get active() { return this.session?.active ?? false; }
   isGo(folder: NativeFolder) { return this.session?.folder === folder && this.session.launch.kind === "go" && this.session.active; }
@@ -73,6 +74,7 @@ export class TerminalPane {
         } else {
           session.active = false;
           session.closing = false;
+          this.activityChanged();
           this.status.textContent = event.reason;
           events?.closed(event.reason);
           if (session.discard) this.reset();

@@ -39,3 +39,4 @@ record detailed behavior, alternatives, implementation order, and acceptance.
 | [0032](0032-editor-accessibility-mode.md) | Use Monaco screen-reader modes in the native editor | Deferred |
 | [0033](0033-go-semantic-highlighting.md) | Overlay gopls semantic colors on Monaco lexical highlighting | Accepted |
 | [0034](0034-go-modern-color-baseline.md) | Use pinned VS Code Modern foreground colors for Go | Accepted |
+| [0035](0035-native-menu-and-navigation-history.md) | Route native menu commands through the workbench and keep jump history in the editor | Accepted design |

@@ -17,6 +17,10 @@ import { Breakpoints, DebugSession } from "./debugger";
 import { packageForFile, RunTargets } from "./run-targets";
 import { bindColorTheme, chooseColorTheme } from "./theme";
 import { basename, dirname, inPath, initialWorkspaceFile, makeTree, quickFiles, validateRelative, type FileMatch, type ProjectSnapshot, type TreeNode } from "./project-model";
+import { NavigationHistory } from "./navigation-history";
+// @ts-expect-error The pinned standalone Monaco runtime has no type declaration for this registry.
+import { CommandsRegistry } from "monaco-editor/platform/commands/common/commands.js";
+import { invoke } from "@tauri-apps/api/core";
 import { decideExit } from "./quit-flow";
 import { ExecutionLane } from "./execution";
 import { ProjectSnapshots } from "./project-workflow";
@@ -43,7 +47,8 @@ const feedback = new Feedback(() => docs.layout(), location => {
 const terminal = new TerminalPane(visible => {
   if (visible) feedback.show("terminal");
   else feedback.hide("terminal");
-}, showError);
+  queueMenuState();
+}, showError, queueMenuState);
 const workbench = byId("workbench");
 const btn = (id: string) => byId<HTMLButtonElement>(id);
 const input = (id: string) => byId<HTMLInputElement>(id);
@@ -91,6 +96,14 @@ let renderedActive: string | undefined;
 const snapshots = new ProjectSnapshots();
 let refreshDisk: ((tree?: boolean) => Promise<void>) | undefined;
 let navigation: { current(): boolean; cancel(): void } | undefined;
+const jumpHistory = new NavigationHistory();
+let jumpRevision = 0;
+let replaying: number | undefined;
+let menuGeneration: number | undefined;
+let menuRevision = 0;
+let menuSignature: string | undefined;
+let menuQueued = false;
+let composing = false;
 
 const diskMessage = {
   changed: "File changed on disk",
@@ -110,12 +123,18 @@ const docs = new Documents(byId("editor"), {
     drafts.schedule(project.native, tab);
     if (!tab.dirty && tab.diskChange === "changed") void refreshDisk?.();
   },
-  closed: tab => { breakpoints.close(tab); lsp?.closed(tab); invalidateNavigation(); queueMicrotask(renderProblems); },
+  closed: tab => { breakpoints.close(tab); lsp?.closed(tab); invalidateNavigation(); invalidateJumps(); queueMicrotask(renderProblems); },
   saved: tab => { lsp?.saved(tab); invalidateNavigation(); drafts.schedule(project.native, tab, true); },
   fileSettled: () => { void refreshDisk?.(); },
+  openLocation: openFile,
 });
 const execution = new ExecutionLane<NativeFolder, DebugSession>(syncControls);
 const { lookup: cursorTestLookup, projectWorkflow } = createCursorTestWorkflow(docs.editor, reserved => {
+  if (reserved) {
+    invalidateJumps();
+    navigation?.cancel();
+    docs.editor.trigger("iron-go", "closeReferenceSearch", {});
+  }
   docs.editor.updateOptions({ readOnly: reserved });
   syncControls();
 });
@@ -238,16 +257,71 @@ function revealParents(path: string) {
   while (parent) { opened.add(parent); parent = dirname(parent); }
 }
 
-async function openFile(path: string, target?: monaco.IRange) {
-  if (projectWorkflow.busy) return;
+function invalidateJumps() {
+  jumpRevision++;
+  replaying = undefined;
+  queueMenuState();
+}
+
+function beginJump() {
+  invalidateJumps();
+  const revision = jumpRevision;
+  const departure = docs.captureLocation();
+  const current = () => revision === jumpRevision && !projectWorkflow.busy;
+  return { current, commit() {
+    const arrival = docs.captureLocation();
+    if (current() && arrival) jumpHistory.record(departure, arrival);
+    queueMenuState();
+  } };
+}
+
+async function openFile(path: string, target?: monaco.IRange | monaco.IPosition) {
+  if (projectWorkflow.busy) return false;
+  const jump = beginJump();
+  let activated = false;
   try {
-    const tab = await docs.open(path, { focus: true, target });
-    if (tab && tab.path === docs.active?.path) {
+    await docs.open(path, { focus: true, target, userNavigation: true, current: jump.current,
+      afterActivate() { activated = true; jump.commit(); } });
+    if (activated) {
       revealParents(path);
       rootExpanded = true;
       renderExplorer();
     }
-  } catch (error) { showError(error); }
+  } catch (error) { if (jump.current()) showError(error); }
+  return activated;
+}
+
+function canReplay(direction: -1 | 1) {
+  const dialog = document.querySelector("dialog[open]");
+  return !projectWorkflow.busy && !mutatingPaths && replaying === undefined &&
+    (dialog ? direction === -1 && dialog.id === "go-source-dialog" : !!jumpHistory.candidate(direction));
+}
+
+async function replayLocation(direction: -1 | 1) {
+  if (!canReplay(direction)) return;
+  const viewer = byId<HTMLDialogElement>("go-source-dialog");
+  if (viewer.open) { viewer.close(); return; }
+  navigation?.cancel();
+  const revision = ++jumpRevision;
+  const folder = project;
+  const current = () => jumpRevision === revision && project === folder && !projectWorkflow.busy && !document.querySelector("dialog[open]");
+  replaying = revision;
+  queueMenuState();
+  jumpHistory.refresh(docs.captureLocation());
+  try {
+    await jumpHistory.replay(direction, {
+      current,
+      open(location, activated) {
+        return docs.open(location.path, { focus: true, current, userNavigation: true, restore: location,
+          afterActivate() { activated(); revealParents(location.path); renderExplorer(); } });
+      },
+      inspect: async path => folder.inspect?.(path),
+    });
+  } catch (error) { if (current()) showError(error); }
+  finally {
+    if (replaying === revision) replaying = undefined;
+    queueMenuState();
+  }
 }
 
 function renderDocuments() {
@@ -344,11 +418,12 @@ async function goToDefinition() {
   }
   if (projectWorkflow.busy || document.querySelector("dialog[open]")) return;
   navigation?.cancel();
+  const jump = beginJump();
   const live = captureTab(tab);
   const version = tab.model.getVersionId();
   const token = new CancellationTokenSource();
   const job = {
-    current: () => navigation === job && live() && docs.active === tab && lsp === service && gopls === "ready" &&
+    current: () => jump.current() && navigation === job && live() && docs.active === tab && lsp === service && gopls === "ready" &&
       !projectWorkflow.busy && tab.model.getVersionId() === version && monaco.Position.equals(position, docs.editor.getPosition()),
     cancel: () => { if (navigation === job) navigation = undefined; token.cancel(); token.dispose(); },
   };
@@ -362,12 +437,13 @@ async function goToDefinition() {
       return path ? [{ path, range: target.range }] : [];
     });
     if (local.length > 1) {
-      docs.editor.trigger("iron-go", "editor.action.revealDefinition", {});
+      docs.editor.trigger("iron-go", "ironGo.monacoDefinition", {});
       return;
     }
     if (local.length === 1) {
       const { path, range } = local[0];
-      await docs.open(path, { focus: true, target: { lineNumber: range.startLineNumber, column: range.startColumn }, current: job.current });
+      await docs.open(path, { focus: true, target: { lineNumber: range.startLineNumber, column: range.startColumn }, current: job.current,
+        userNavigation: true, afterActivate: jump.commit });
       return;
     }
     let unavailable: Error | undefined;
@@ -397,16 +473,18 @@ function goToLine() {
   const tab = docs.active;
   if (!tab || projectWorkflow.busy) return;
   const live = captureTab(tab);
+  const jump = beginJump();
   forms.show({
     title: "Go to Line", description: `Go to a line in ${tab.path}.`, submit: "Go to Line",
     fields: [{ name: "line", label: "Line number" }],
     async run({ line }) {
-      if (!live() || docs.active !== tab) throw new Error("This editor has changed. Open Go to Line again.");
+      if (!jump.current() || !live() || docs.active !== tab) throw new Error("This editor has changed. Open Go to Line again.");
       const last = tab.model.getLineCount();
       const value = Number(line);
       if (!/^[0-9]+$/.test(line) || value < 1 || value > last) throw new Error(`Enter a whole line number from 1 through ${last}.`);
       docs.editor.setPosition({ lineNumber: value, column: 1 });
       docs.editor.revealLineInCenterIfOutsideViewport(value);
+      jump.commit();
       byId("form-dialog").addEventListener("close", () => { if (live() && docs.active === tab) docs.editor.focus(); }, { once: true });
     },
   });
@@ -422,12 +500,13 @@ async function goNavigation(kind: "symbols" | "references") {
   }
   if (projectWorkflow.busy) return;
   navigation?.cancel();
+  const jump = beginJump();
   const inFile = kind === "symbols";
   const editRevision = docs.editRevision;
   const live = captureTab(tab);
   const tracked = new Map([...docs.tabs].filter(([, entry]) => entry.model.getLanguageId() === "go"));
   const valid = (selected?: string) => {
-    if (!live() || lsp !== service || gopls !== "ready" || docs.active !== tab || projectWorkflow.busy) return false;
+    if (!jump.current() || !live() || lsp !== service || gopls !== "ready" || docs.active !== tab || projectWorkflow.busy) return false;
     if (inFile) return true;
     const caret = docs.editor.getPosition();
     if (docs.editRevision !== editRevision || !caret || !position.equals(caret)) return false;
@@ -477,6 +556,7 @@ async function goNavigation(kind: "symbols" | "references") {
         finish();
         if (!inFile) note("Run Find References to refresh the results.");
       },
+      afterActivate: jump.commit,
     })
       .then(result => {
         if (navigation === job) job.cancel();
@@ -559,6 +639,7 @@ function syncControls() {
   btn("debug-step-in").disabled = busy || !debug?.paused;
   btn("debug-step-out").disabled = busy || !debug?.paused;
   btn("debug-stop").disabled = busy || !debug?.canStop;
+  queueMenuState();
 }
 
 function renderProblems() {
@@ -1094,6 +1175,7 @@ async function installProject(target: Project) {
   opened = new Set();
   rootExpanded = true;
   docs.reset(target);
+  jumpHistory.reset();
   byId("status-project").textContent = target.name;
   byId("quick-label").textContent = target.welcome ? "Search commands" : `Search files in ${target.name}`;
   const commandName = target.welcome ? "Search commands" : "Go to File";
@@ -1324,6 +1406,7 @@ async function mutateFiles(folder: NativeFolder, operation: WorkspaceMutation) {
     if (outcome.kind === "moved" && operation.kind === "move") {
       breakpoints.rebind(operation.source, outcome.path);
       const rebound = docs.rebindPaths(operation.source, outcome.path, outcome.versions, affected);
+      jumpHistory.updatePaths(path => inPath(path, operation.source) ? `${outcome.path}${path.slice(operation.source.length)}` : path);
       for (const tab of rebound) drafts.schedule(folder, tab, true);
       const mapped = [...opened].filter(path => inPath(path, operation.source));
       for (const path of mapped) { opened.delete(path); opened.add(`${outcome.path}${path.slice(operation.source.length)}`); }
@@ -1331,6 +1414,7 @@ async function mutateFiles(folder: NativeFolder, operation: WorkspaceMutation) {
       revealParents(outcome.path);
       status(`Moved ${operation.source} to ${outcome.path}`);
     } else if (outcome.kind === "trashed" && operation.kind === "trash") {
+      jumpHistory.updatePaths(path => inPath(path, operation.source) ? undefined : path);
       for (const tab of affected) docs.close(tab, { focus: false });
       breakpoints.rebind(operation.source);
       for (const path of [...opened]) if (inPath(path, operation.source)) opened.delete(path);
@@ -1714,12 +1798,16 @@ function createGoLanguage(folder: NativeFolder) {
   const service = new GoLanguage(folder, docs, (state, reason) => {
     if (lsp !== service || project.native !== folder) return;
     gopls = state;
+    queueMenuState();
     if (state === "failed") {
       lsp = undefined;
       feedback.row(`gopls: ${reason ?? "connection closed"}`, "quiet", "info");
     }
     updateTools();
     renderProblems();
+  }, () => {
+    const revision = jumpRevision;
+    return () => revision === jumpRevision && !projectWorkflow.busy;
   });
   lsp = service;
   return service;
@@ -1749,15 +1837,104 @@ function refreshProject() {
   void runTargets.refresh();
 }
 
+type WorkbenchCommand = { enabled: boolean; unavailable?: string; run(): unknown };
+
+function menuCommands(): Record<string, WorkbenchCommand> {
+  const workspace = !project.welcome;
+  const projectReady = !projectWorkflow.busy && transitionReady();
+  const fileReady = !fileActionsBlocked() && !!docs.active && !docs.active.saving && docs.active.reloading === undefined;
+  const goFile = fileReady && docs.active?.model.getLanguageId() === "go";
+  const semantic = goFile && gopls === "ready";
+  const canLaunch = !!project.native && !!tools?.goVersion && projectReady && !execution.occupied;
+  const canRun = canLaunch && !!runTargets.picker.value;
+  const atTest = semantic && !!docs.active?.path.endsWith("_test.go");
+  const item = (enabled: boolean, run: () => unknown, unavailable?: string): WorkbenchCommand => ({ enabled, run, unavailable });
+  return {
+    settings: item(true, () => showSettings()),
+    "new-project": item(projectReady, newModule), "open-project": item(projectReady, openFolder),
+    recent: item(projectReady && desktop, showRecentProjects), "close-project": item(projectReady && workspace, closeProject),
+    "new-file": item(workspace && !fileActionsBlocked(), newFile),
+    save: item(fileReady && !!docs.active?.dirty, saveActive), "save-all": item(docs.dirty && !fileActionsBlocked() && !filesBusy(), saveAll),
+    reload: item(fileReady, reloadActive),
+    find: item(!!docs.active && !document.activeElement?.closest("input, textarea:not(.inputarea), [contenteditable='true']:not(.native-edit-context), #terminal-pane"),
+      () => { docs.editor.focus(); return docs.editor.getAction("actions.find")?.run(); }),
+    format: item(goFile && desktop && !formatting, formatActive), organize: item(semantic && !filesBusy(), organizeImports),
+    rename: item(semantic && !filesBusy(), renameGoSymbol),
+    explorer: item(workspace, () => chooseView("explorer")), search: item(workspace, () => chooseView("search")),
+    sidebar: item(true, toggleSidebar), panel: item(true, () => feedback.toggle()), commands: item(true, () => showPalette(true)),
+    back: item(canReplay(-1), () => replayLocation(-1)), forward: item(canReplay(1), () => replayLocation(1)),
+    "quick-open": item(workspace, () => showPalette()), line: item(fileReady, goToLine),
+    symbol: item(semantic, () => goNavigation("symbols")), definition: item(semantic, goToDefinition),
+    references: item(semantic, () => goNavigation("references")),
+    "next-editor": item(docs.tabs.size > 1, () => cycleEditor(1)), "previous-editor": item(docs.tabs.size > 1, () => cycleEditor(-1)),
+    run: item(canRun, () => runTask("run")), build: item(canLaunch, () => runTask("build")), test: item(canLaunch, () => runTask("test")),
+    "test-at-cursor": item(canLaunch && atTest, () => testAtCursor("run")),
+    debug: item(canRun && !!tools?.delve, debugProgram), "debug-test": item(canLaunch && atTest && !!tools?.delve, () => testAtCursor("debug")),
+    stop: item(execution.canStopTask, stopTask),
+    shell: item(!!project.native && !terminal.active, startShell, "Close the active terminal before starting another."),
+    "run-in-terminal": item(canRun && !terminal.active, runInTerminal,
+      terminal.active ? "Close the active terminal before starting a Go program there." : undefined),
+    "close-terminal": item(!byId("terminal-tab").hidden, closeTerminal),
+  };
+}
+
+function allowedMenuCommand(id: string) {
+  if (composing || projectWorkflow.busy) return false;
+  const dialog = document.querySelector("dialog[open]");
+  return !dialog || (id === "back" && dialog.id === "go-source-dialog");
+}
+
+function executeMenuCommand(id: string, explainUnavailable = false) {
+  if (!allowedMenuCommand(id)) return;
+  const commands = menuCommands();
+  if (!Object.hasOwn(commands, id)) return;
+  if (!commands[id].enabled) {
+    const reason = commands[id].unavailable;
+    if (explainUnavailable && reason) toast(reason);
+    return;
+  }
+  try { void Promise.resolve(commands[id].run()).catch(showError); }
+  catch (error) { showError(error); }
+}
+
+function queueMenuState() {
+  if (menuGeneration === undefined || menuQueued) return;
+  menuQueued = true;
+  queueMicrotask(() => {
+    menuQueued = false;
+    const enabled = Object.entries(menuCommands()).filter(([id, entry]) => entry.enabled && allowedMenuCommand(id)).map(([id]) => id);
+    const signature = enabled.join(",");
+    if (signature === menuSignature) return;
+    menuSignature = signature;
+    void invoke("update_workbench_menu", { generation: menuGeneration, revision: ++menuRevision, enabled }).catch(showError);
+  });
+}
+
+async function bindWorkbenchMenu() {
+  await getCurrentWindow().listen<[number, string]>("iron-go-menu", event => {
+    const [generation, id] = event.payload;
+    if (generation === menuGeneration) executeMenuCommand(id);
+  });
+  menuGeneration = await invoke<number>("workbench_menu_generation");
+  document.addEventListener("focusin", queueMenuState);
+  document.addEventListener("focusout", queueMenuState);
+  document.addEventListener("compositionstart", () => { composing = true; queueMenuState(); }, true);
+  document.addEventListener("compositionend", () => { composing = false; queueMenuState(); }, true);
+  queueMenuState();
+}
+
 function showPalette(command = false, workspaceOnly = false) {
+  const nativeAction = (id: string, preview: () => unknown) => desktop ? () => executeMenuCommand(id) : preview;
   const actions: { label: string; detail?: string; icon: Icon; run(): void; workspace?: boolean }[] = [
-    { label: "Open Project…", detail: "⌘O", icon: "folderOpen", run: openFolder, workspace: true },
-    ...(desktop ? [{ label: "Open Recent…", icon: "folder" as const, run: showRecentProjects, workspace: true }] : []),
-    { label: "New Project…", icon: "package", run: newModule, workspace: true },
-    { label: "Close Project", icon: "close", run: closeProject, workspace: true },
-    { label: "Next Editor", detail: "⇧⌘]", icon: "files", run: () => cycleEditor(1) },
-    { label: "Previous Editor", detail: "⇧⌘[", icon: "files", run: () => cycleEditor(-1) },
-    { label: "New File…", icon: "filePlus", run: newFile, workspace: true },
+    { label: "Open Project…", detail: "⌘O", icon: "folderOpen", run: nativeAction("open-project", openFolder), workspace: true },
+    ...(desktop ? [{ label: "Open Recent…", icon: "folder" as const, run: () => executeMenuCommand("recent"), workspace: true }] : []),
+    { label: "New Project…", detail: desktop ? "⌘N" : undefined, icon: "package", run: nativeAction("new-project", newModule), workspace: true },
+    { label: "Close Project", icon: "close", run: nativeAction("close-project", closeProject), workspace: true },
+    { label: "Go Back", detail: "⌃-", icon: "chevron", run: () => executeMenuCommand("back") },
+    { label: "Go Forward", detail: "⌃⇧-", icon: "chevron", run: () => executeMenuCommand("forward") },
+    { label: "Next Editor", detail: "⇧⌘]", icon: "files", run: nativeAction("next-editor", () => cycleEditor(1)) },
+    { label: "Previous Editor", detail: "⇧⌘[", icon: "files", run: nativeAction("previous-editor", () => cycleEditor(-1)) },
+    { label: "New File…", icon: "filePlus", run: nativeAction("new-file", newFile), workspace: true },
     ...(project.native ? [
       { label: "New Folder…", icon: "folder" as const, run: () => { void fileOperation("folder").catch(showError); }, workspace: true },
       { label: "Rename File or Folder…", icon: "file" as const, run: () => { void fileOperation("rename").catch(showError); }, workspace: true },
@@ -1766,38 +1943,38 @@ function showPalette(command = false, workspaceOnly = false) {
     ] : []),
     { label: "Refresh Project", icon: "refresh", run: refreshProject, workspace: true },
     { label: "Collapse Folders", icon: "folder", run: () => { opened.clear(); renderExplorer(); }, workspace: true },
-    { label: "Search Saved Files", detail: "⇧⌘F", icon: "search", run: () => chooseView("search") },
-    { label: "Go to Line…", icon: "search", run: goToLine },
-    { label: "Go to Symbol in File…", icon: "search", run: () => { void goNavigation("symbols"); } },
-    { label: "Go to Definition", detail: "F12", icon: "search", run: goToDefinition },
-    { label: "Debug Go Program", icon: "play", run: debugProgram },
+    { label: "Search Saved Files", detail: "⇧⌘F", icon: "search", run: nativeAction("search", () => chooseView("search")) },
+    { label: "Go to Line…", icon: "search", run: nativeAction("line", goToLine) },
+    { label: "Go to Symbol in File…", icon: "search", run: nativeAction("symbol", () => goNavigation("symbols")) },
+    { label: "Go to Definition", detail: "F12", icon: "search", run: nativeAction("definition", goToDefinition) },
+    { label: "Debug Go Program", icon: "play", run: nativeAction("debug", debugProgram) },
     ...(project.native ? [{ label: "Recover Drafts…", icon: "file" as const, run: () => { void recoverDrafts(); } }] : []),
     ...(desktop ? [{ label: "Manage Recovery Drafts…", icon: "file" as const, run: () => { void recoverDrafts(true); } }] : []),
-    { label: "Find References", icon: "search", run: () => { void goNavigation("references"); } },
-    { label: "Save File", detail: "⌘S", icon: "save", run: saveActive },
+    { label: "Find References", icon: "search", run: nativeAction("references", () => goNavigation("references")) },
+    { label: "Save File", detail: "⌘S", icon: "save", run: nativeAction("save", saveActive) },
     { label: "Save Without Formatting", icon: "save", run: () => { void saveActive(false); } },
-    { label: "Save All", icon: "save", run: saveAll },
-    { label: "Reload File from Disk", icon: "refresh", run: reloadActive },
+    { label: "Save All", icon: "save", run: nativeAction("save-all", saveAll) },
+    { label: "Reload File from Disk", icon: "refresh", run: nativeAction("reload", reloadActive) },
     ...(project.native && docs.active ? [{ label: "Compare with Disk", icon: "files" as const, run: compareWithDisk }] : []),
     ...(project.native && docs.active ? [{ label: "Save to a New Path…", icon: "save" as const, run: saveToNewPath }] : []),
-    { label: "Format Go File", detail: "⇧⌥F", icon: "format", run: formatActive },
-    { label: "Go: Organize Imports", icon: "format", run: organizeImports },
-    { label: "Go: Rename Symbol…", icon: "files", run: renameGoSymbol },
-    { label: "Go: Run Selected Target", detail: "⌘↵", icon: "play", run: () => { void runTask("run"); } },
+    { label: "Format Go File", detail: "⇧⌥F", icon: "format", run: nativeAction("format", formatActive) },
+    { label: "Go: Organize Imports", icon: "format", run: nativeAction("organize", organizeImports) },
+    { label: "Go: Rename Symbol…", icon: "files", run: nativeAction("rename", renameGoSymbol) },
+    { label: "Go: Run Selected Target", detail: "⌘↵", icon: "play", run: nativeAction("run", () => runTask("run")) },
     ...(project.native ? [
-      { label: "Start Shell", icon: "terminal" as const, run: () => { void startShell().catch(showError); } },
-      { label: "Run Go Program in Terminal", icon: "terminal" as const, run: () => { void runInTerminal().catch(showError); } },
-      { label: "Close Terminal", icon: "close" as const, run: () => { void closeTerminal().catch(showError); } },
+      { label: "Start Shell", icon: "terminal" as const, run: () => executeMenuCommand("shell", true) },
+      { label: "Run Go Program in Terminal", icon: "terminal" as const, run: () => executeMenuCommand("run-in-terminal", true) },
+      { label: "Close Terminal", icon: "close" as const, run: () => executeMenuCommand("close-terminal") },
     ] : []),
     { label: "Go: Choose Run Target", icon: "package", run: () => runTargets.picker.focus() },
-    { label: "Go: Build Packages", icon: "hammer", run: () => { void runTask("build"); } },
-    { label: "Go: Run Tests", icon: "flask", run: () => { void runTask("test"); } },
-    { label: "Go: Run Test at Cursor", icon: "flask", run: () => { void testAtCursor("run"); } },
-    { label: "Go: Debug Test at Cursor", icon: "play", run: () => { void testAtCursor("debug"); } },
-    { label: "Go: Stop Task", icon: "stop", run: stopTask },
-    { label: "Toggle Sidebar", detail: "⌘B", icon: "files", run: toggleSidebar },
-    { label: "Toggle Bottom Panel", detail: "⌘J", icon: "layout", run: () => feedback.toggle() },
-    { label: "Workbench Settings", detail: "⌘,", icon: "settings", run: showSettings },
+    { label: "Go: Build Packages", icon: "hammer", run: nativeAction("build", () => runTask("build")) },
+    { label: "Go: Run Tests", icon: "flask", run: nativeAction("test", () => runTask("test")) },
+    { label: "Go: Run Test at Cursor", icon: "flask", run: nativeAction("test-at-cursor", () => testAtCursor("run")) },
+    { label: "Go: Debug Test at Cursor", icon: "play", run: nativeAction("debug-test", () => testAtCursor("debug")) },
+    { label: "Go: Stop Task", icon: "stop", run: nativeAction("stop", stopTask) },
+    { label: "Toggle Sidebar", detail: "⌘B", icon: "files", run: nativeAction("sidebar", toggleSidebar) },
+    { label: "Toggle Bottom Panel", detail: "⌘J", icon: "layout", run: nativeAction("panel", () => feedback.toggle()) },
+    { label: "Workbench Settings", detail: "⌘,", icon: "settings", run: nativeAction("settings", () => showSettings()) },
     { label: "Color Theme: Dark", icon: "settings", run: () => chooseColorTheme("dark") },
     { label: "Color Theme: Light", icon: "settings", run: () => chooseColorTheme("light") },
   ];
@@ -1944,6 +2121,13 @@ docs.editor.onMouseDown(event => {
   if (event.event.leftButton && event.target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) {
     toggleBreakpoint(event.target.position?.lineNumber);
   }
+  if (event.event.leftButton && (desktop ? event.event.metaKey : event.event.ctrlKey) &&
+      event.target.type === monaco.editor.MouseTargetType.CONTENT_TEXT && menuCommands().definition.enabled && allowedMenuCommand("definition")) {
+    // Reserve the gesture before Monaco starts its asynchronous lookup.
+    // The opener records only the location it actually activates; a
+    // canceled gesture leaves no departure for a later opener to consume.
+    invalidateJumps();
+  }
 });
 byId("debug-continue").addEventListener("click", () => { void execution.debug?.resume("continue"); });
 byId("debug-next").addEventListener("click", () => { void execution.debug?.resume("next"); });
@@ -1983,24 +2167,39 @@ document.addEventListener("keydown", event => {
     return;
   }
   const modal = !!document.querySelector("dialog[open]");
-  if (handleEditorCycle(event, modal || projectWorkflow.busy, direction => docs.cycle(direction))) return;
+  if (event.ctrlKey && !event.metaKey && !event.altKey && event.code === "Minus" &&
+      !document.activeElement?.closest("#terminal-pane") &&
+      (byId("editor").contains(document.activeElement) || !document.activeElement?.closest("input, textarea, [contenteditable='true']") ||
+        !!document.querySelector("#go-source-dialog[open]"))) {
+    const direction = event.shiftKey ? 1 : -1;
+    if (!composing && canReplay(direction)) {
+      event.preventDefault(); event.stopPropagation(); executeMenuCommand(direction === -1 ? "back" : "forward");
+    }
+    return;
+  }
+  if (handleEditorCycle(event, modal || projectWorkflow.busy || composing, direction => {
+    const id = direction === -1 ? "previous-editor" : "next-editor";
+    if (!allowedMenuCommand(id) || !menuCommands()[id].enabled) return false;
+    executeMenuCommand(id);
+    return true;
+  })) return;
   if (modal && event.key !== "Escape") return;
   const key = event.key.toLowerCase();
   const cmd = event.metaKey || (!desktop && event.ctrlKey);
   let apply: (() => unknown) | undefined;
   if (project.native && event.key === "F9" && !cmd && !event.altKey && !event.shiftKey && !event.ctrlKey) apply = () => toggleBreakpoint();
   if (cmd && !event.altKey) {
-    if (key === "p") apply = () => showPalette(event.shiftKey || !!project.welcome);
-    if (key === "o") apply = openFolder;
-    if (key === "s") apply = saveActive;
-    if (key === "f" && event.shiftKey) apply = () => chooseView("search");
-    if (key === "e" && event.shiftKey) apply = () => chooseView("explorer");
-    if (key === "j") apply = () => feedback.toggle();
-    if (key === "b") apply = toggleSidebar;
-    if (key === ",") apply = showSettings;
+    if (key === "p") apply = () => executeMenuCommand(event.shiftKey || project.welcome ? "commands" : "quick-open");
+    if (key === "o" && !desktop) apply = openFolder;
+    if (key === "s") apply = () => executeMenuCommand("save");
+    if (key === "f" && event.shiftKey) apply = () => executeMenuCommand("search");
+    if (key === "e" && event.shiftKey) apply = () => executeMenuCommand("explorer");
+    if (key === "j") apply = () => executeMenuCommand("panel");
+    if (key === "b") apply = () => executeMenuCommand("sidebar");
+    if (key === "," && !desktop) apply = showSettings;
     if (key === "enter") apply = runOrStop;
   }
-  if (event.altKey && event.shiftKey && (key === "f" || event.code === "KeyF")) apply = formatActive;
+  if (event.altKey && event.shiftKey && (key === "f" || event.code === "KeyF")) apply = () => executeMenuCommand("format");
   if (apply) { event.preventDefault(); event.stopPropagation(); void apply(); }
 }, true);
 
@@ -2012,11 +2211,22 @@ byId("terminal-close").addEventListener("click", () => { void closeTerminal().ca
 monaco.editor.onDidChangeMarkers(renderProblems);
 bindLayout();
 bindSettings();
+new MutationObserver(changes => {
+  if (replaying !== undefined && changes.some(change => change.target instanceof HTMLDialogElement && change.oldValue === null)) invalidateJumps();
+  queueMenuState();
+}).observe(document.body, { attributes: true, attributeOldValue: true, attributeFilter: ["open"], subtree: true });
+if (desktop) void bindWorkbenchMenu().catch(showError);
+const monacoDefinition = CommandsRegistry.getCommand("editor.action.revealDefinition");
+monaco.editor.registerCommand("ironGo.monacoDefinition", monacoDefinition.handler);
+monaco.editor.registerCommand("editor.action.revealDefinition", () => executeMenuCommand("definition"));
+// The workbench has one editor pane; both deliberate definition commands
+// use the same guarded jump rather than holding a reservation for an opener.
+monaco.editor.registerCommand("editor.action.revealDefinitionAside", () => executeMenuCommand("definition"));
 docs.editor.addAction({
   id: "ironGo.goToDefinition", label: "Go to Definition (Including Dependencies)",
   keybindings: [monaco.KeyCode.F12], keybindingContext: "editorTextFocus && editorLangId == go",
   contextMenuGroupId: "navigation", contextMenuOrder: 1.05, precondition: "editorLangId == go",
-  run: goToDefinition,
+  run: () => executeMenuCommand("definition"),
 });
 if (desktop) {
   const quitDialog = byId<HTMLDialogElement>("quit-dialog");

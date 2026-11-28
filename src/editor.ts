@@ -18,6 +18,7 @@ import "./editor-font.css";
 import EditorWorker from "monaco-editor/editor/editor.worker.js?worker";
 import type { DiskObservation, Project, ReadableDisk, SavedEditorSession, SavedEditorTab, VersionedText } from "./workspace";
 import { inPath } from "./project-model";
+import type { CodeLocation } from "./navigation-history";
 
 export { monaco };
 
@@ -66,6 +67,7 @@ export interface DocumentEvents {
   edited(tab: DocumentTab): void;
   saved(tab: DocumentTab): void;
   fileSettled?(): void;
+  openLocation?(path: string, target?: Target): Promise<boolean>;
 }
 
 export interface SaveOptions {
@@ -183,9 +185,10 @@ export class Documents {
     });
     this.bindGutterSelection();
     monaco.editor.registerEditorOpener({
-      openCodeEditor: async (_source, uri, selection) => {
+      openCodeEditor: async (source, uri, selection) => {
         const path = this.relative(uri);
-        if (path === undefined) return false;
+        if (path === undefined || source !== this.editor) return false;
+        if (this.events.openLocation) return this.events.openLocation(path, selection);
         return !!await this.open(path, { focus: true, target: selection });
       },
     });
@@ -263,7 +266,8 @@ export class Documents {
   }
 
   async open(path: string, options: { focus?: boolean; activate?: boolean; target?: Target; current?: () => boolean;
-    userNavigation?: boolean; observedDisk?: ReadableDisk; validate?: (tab: DocumentTab) => void; beforeActivate?: () => void } = {}) {
+    userNavigation?: boolean; observedDisk?: ReadableDisk; validate?: (tab: DocumentTab) => void; beforeActivate?: () => void;
+    restore?: CodeLocation; afterActivate?: () => void } = {}) {
     const folder = this.folder;
     const { focus = false, activate = true, target, current = () => true } = options;
     if (!folder || !current() || this.destinationReserved(path)) return;
@@ -304,8 +308,33 @@ export class Documents {
       options.validate?.(tab);
       options.beforeActivate?.();
       this.activate(tab, focus, target);
+      if (options.restore) this.restoreLocation(tab, options.restore);
+      options.afterActivate?.();
     }
     return tab;
+  }
+
+  captureLocation(): CodeLocation | undefined {
+    const selection = this.editor.getSelection();
+    if (!this.active || !selection) return;
+    return { path: this.active.path, anchorLine: selection.selectionStartLineNumber, anchorColumn: selection.selectionStartColumn,
+      line: selection.positionLineNumber, column: selection.positionColumn,
+      top: this.editor.getScrollTop(), left: this.editor.getScrollLeft() };
+  }
+
+  private restoreLocation(tab: DocumentTab, location: CodeLocation) {
+    const position = (lineNumber: number, column: number) => {
+      const valid = tab.model.validatePosition({ lineNumber, column });
+      const text = tab.model.getLineContent(valid.lineNumber);
+      const before = text.charCodeAt(valid.column - 2), after = text.charCodeAt(valid.column - 1);
+      return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff
+        ? new monaco.Position(valid.lineNumber, valid.column - 1) : valid;
+    };
+    const anchor = position(location.anchorLine, location.anchorColumn);
+    const head = position(location.line, location.column);
+    this.editor.setSelection(new monaco.Selection(anchor.lineNumber, anchor.column, head.lineNumber, head.column));
+    this.layout();
+    this.editor.setScrollPosition({ scrollTop: location.top, scrollLeft: location.left }, monaco.editor.ScrollType.Immediate);
   }
 
   private destinationReserved(path: string) {

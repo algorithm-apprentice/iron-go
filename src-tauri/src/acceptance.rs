@@ -2,6 +2,38 @@ use std::{io, time::Duration};
 
 use crate::{CommandResult, Core, Session};
 use tauri::{AppHandle, Manager};
+
+#[tauri::command]
+pub async fn test_menu_item(
+    app: AppHandle,
+    menu: String,
+    title: String,
+    activate: bool,
+) -> CommandResult<Option<bool>> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::NSApplication;
+        use objc2_foundation::NSString;
+        let found = MainThreadMarker::new().and_then(|mtm| {
+            let bar = NSApplication::sharedApplication(mtm).mainMenu()?;
+            let submenu = bar.itemWithTitle(&NSString::from_str(&menu))?.submenu()?;
+            let index = submenu.indexOfItemWithTitle(&NSString::from_str(&title));
+            if index < 0 {
+                return None;
+            }
+            let item = submenu.itemAtIndex(index)?;
+            let enabled = item.isEnabled();
+            if activate && enabled {
+                submenu.performActionForItemAtIndex(index);
+            }
+            Some(enabled)
+        });
+        let _ = send.send(found);
+    })
+    .map_err(|error| error.to_string())?;
+    receive.await.map_err(|error| error.to_string())
+}
 #[cfg(test)]
 use {crate::tools::short_output, tokio::process::Command};
 
