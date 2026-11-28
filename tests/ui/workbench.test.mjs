@@ -1352,9 +1352,12 @@ test("the dirty tab dialog defaults to Cancel and restores focus on Escape", asy
     assert.equal(await dialog.getByRole("button", { name: "Cancel" }).evaluate(button => document.activeElement === button), true);
     await page.keyboard.press("Escape");
     await dialog.waitFor({ state: "hidden" });
+    // The browser hides the dialog before its close event releases file activity.
+    await page.locator("#save:enabled").waitFor({ timeout: 3000 });
     assert.equal(await close.evaluate(button => document.activeElement === button), true);
     assert.match(await page.locator("#editor .view-lines").innerText(), /Unsaved\s+dialog\s+check/);
     await close.press("Enter");
+    await dialog.waitFor({ timeout: 3000 });
     await dialog.getByRole("button", { name: "Discard", exact: true }).click();
     await close.waitFor({ state: "detached" });
     assert.equal(await page.locator("#empty-quick-open").evaluate(button => document.activeElement === button), true);

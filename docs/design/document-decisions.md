@@ -114,3 +114,13 @@ Status: Implemented follow-up under the [daily Go workbench plan](../archive/dai
   was still pending before native callback delivery. An admitted write settled,
   a queued write was rejected, and a fresh successful Quit saved both files and
   stopped the child. The separate native Discard scenario still passed.
+
+### Chromium Escape follow-up
+
+The failing `test-results/ui/dirty-tab-dialog/trace.zip` shows that Escape
+hid the dialog and restored focus while Save was still disabled. The second
+Enter arrived before the dialog's `close` handler released file activity,
+so the request was ignored and the test waited for a nonexistent Discard
+button. The test now waits for Save to re-enable, keeps the focus and buffer
+assertions, and checks that the second request opens a new dialog.
+`npm run test:ui` passed all 52 cases and `npm run check` passed.
