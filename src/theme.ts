@@ -1,5 +1,6 @@
 import { byId } from "./dialogs";
 import { monaco } from "./editor";
+import { goSemanticLegend, semanticRoles } from "./go-semantic-tokens";
 
 type ColorTheme = "dark" | "light";
 const preferenceKey = "irongo.color-theme";
@@ -37,18 +38,33 @@ function applyTheme(theme: ColorTheme) {
   root.dataset.theme = theme;
   byId<HTMLSelectElement>("theme-setting").value = theme;
   const palette = getComputedStyle(root);
-  // The production CSS optimizer can shorten #ffffff to #fff. Monaco's
-  // syntax-token color parser needs a full hex triplet.
+  // The production CSS optimizer can shorten #ffffff to #fff.
   const color = (token: string) => palette.getPropertyValue(token).trim()
     .replace(/^#([0-9a-f]{3,4})$/i, (_, digits: string) => `#${[...digits].map(digit => digit.repeat(2)).join("")}`);
+  // It can also emit a named color (e.g. green for #008000). Canvas
+  // serializes opaque sRGB colors to the six hex digits Monaco requires.
+  const context = document.createElement("canvas").getContext("2d");
+  const foreground = (token: string) => {
+    let value = color(token);
+    if (context && !/^#[0-9a-f]{6}$/i.test(value)) {
+      context.fillStyle = "#000000";
+      context.fillStyle = value;
+      value = context.fillStyle;
+    }
+    return /^#[0-9a-f]{6}$/i.test(value) ? value.slice(1) : undefined;
+  };
   const name = `irongo-vscode-${theme}`;
   monaco.editor.defineTheme(name, {
     base: theme === "light" ? "vs" : "vs-dark",
     inherit: true,
-    rules: Object.entries(goSyntaxRoles).flatMap(([role, tokens]) => {
-      const foreground = color(`--go-syntax-${role}`).slice(1);
-      return tokens.map(token => ({ token, foreground }));
-    }),
+    rules: [
+      ...Object.entries(goSyntaxRoles).flatMap(([role, tokens]) => {
+        const value = foreground(`--go-syntax-${role}`);
+        return tokens.map(token => ({ token, foreground: value }));
+      }),
+      ...semanticRoles.map((role, index) => ({ token: goSemanticLegend.tokenTypes[index],
+        foreground: foreground(`--go-semantic-${role}`) })),
+    ],
     colors: {
       ...Object.fromEntries(Object.entries(editorRoles).map(([role, token]) => [role, color(token)])),
       "editor.lineHighlightBackground": "#00000000",

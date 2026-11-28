@@ -2009,7 +2009,7 @@ async function goSuite() {
       "gopls symbol and reference navigation uses unsaved UTF-16 locations", "Organize Imports updates only the Go buffer as one undoable edit",
       "Rename previews real cross-file changes and rejects a stale workspace",
       "opens Go standard library and offline dependency source in an isolated read-only viewer", "runs exactly one Go test from its editor action",
-      "whole-line selection highlights the selected number, not its endpoint"]) {
+      "whole-line selection highlights the selected number, not its endpoint", "gopls colors identifiers in an unsaved Go buffer"]) {
       console.log(`  SKIP ${name} (gopls not installed)`);
       report.cases.push({ name, result: "skip", reason: "gopls not installed" });
     }
@@ -2037,6 +2037,42 @@ async function goSuite() {
       }
       await setNativeTheme("dark");
       await replace(clean);
+    });
+    await record("gopls colors identifiers in an unsaved Go buffer", async () => {
+      const clean = (await current()).text;
+      const edit = clean + `
+const SemanticSuffix = "🚀"
+type SemanticCourier struct { SemanticAddress string }
+func (c SemanticCourier) SemanticDeliver(SemanticMessage string) string {
+	SemanticLocal := fmt.Sprintf("%s", c.SemanticAddress + "🚀" + SemanticMessage)
+	if true { return SemanticLocal + SemanticSuffix + string(rune(len(SemanticMessage))) }
+	return ""
+}
+`;
+      const identifiers = ["SemanticCourier", "SemanticDeliver", "SemanticAddress", "SemanticMessage", "SemanticLocal", "SemanticSuffix", "true", "fmt", "len", "%s"];
+      const palette = () => js(`
+        window.__ironTest.refreshView();
+        const spans = [...document.querySelectorAll('#editor .view-lines span[class*="mtk"]')];
+        return Object.fromEntries(arguments[0].map(word =>
+          [word, spans.filter(span => span.textContent.trim() === word).map(span => getComputedStyle(span).color)]));
+      `, identifiers);
+      try {
+        await js("return window.__ironTest.focusWindow().then(() => true);");
+        await replace(edit);
+        await js("window.__ironTest.revealLine(arguments[0]); return true;", edit.split("\n").length - 4);
+        for (const [theme, expected] of [
+          ["dark", ["rgb(78, 201, 176)", "rgb(220, 220, 170)", "rgb(156, 220, 254)", "rgb(156, 220, 254)", "rgb(156, 220, 254)", "rgb(79, 193, 255)", "rgb(86, 156, 214)", "rgb(78, 201, 176)", "rgb(220, 220, 170)", "rgb(156, 220, 254)"]],
+          ["light", ["rgb(38, 127, 153)", "rgb(121, 94, 38)", "rgb(0, 16, 128)", "rgb(0, 16, 128)", "rgb(0, 16, 128)", "rgb(0, 112, 193)", "rgb(0, 0, 255)", "rgb(38, 127, 153)", "rgb(121, 94, 38)", "rgb(0, 16, 128)"]],
+        ]) {
+          if (theme === "light") await setNativeTheme(theme);
+          await eventually(`${theme} semantic colors apply to unsaved identifiers`, palette, value => {
+            return identifiers.every((word, index) => value?.[word]?.length > 0 &&
+              value[word].every(color => color === expected[index]));
+          }, 20_000);
+        }
+        assert.equal((await current()).text, edit);
+        assert.equal(await readFile(path.join(fixture, "cmd/orbit/main.go"), "utf8"), clean);
+      } finally { await setNativeTheme("dark"); await replace(clean); }
     });
     await record("gopls symbol and reference navigation uses unsaved UTF-16 locations", async () => {
       const relative = "cmd/orbit/navigation.go";

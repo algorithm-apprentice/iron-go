@@ -50,10 +50,19 @@
   --go-syntax-declaration: #569cd6;
   --go-syntax-flow: #c586c0;
   --go-syntax-type: #4ec9b0;
-  --go-syntax-string: #d6a085;
+  --go-syntax-string: #ce9178;
   --go-syntax-escape: #d7ba7d;
   --go-syntax-number: #b5cea8;
-  --go-syntax-comment: #7a9f6b;
+  --go-syntax-comment: #6a9955;
+  --go-semantic-type: var(--go-syntax-type);
+  --go-semantic-function: #dcdcaa;
+  --go-semantic-variable: #9cdcfe;
+  --go-semantic-field: var(--go-semantic-variable);
+  --go-semantic-parameter: var(--go-semantic-variable);
+  --go-semantic-constant: #4fc1ff;
+  --go-semantic-namespace: var(--go-semantic-type);
+  --go-semantic-builtin: var(--go-semantic-function);
+  --go-semantic-format: var(--go-semantic-variable);
 }
 
 :root[data-theme="light"] {
@@ -101,11 +110,20 @@
   --editor-selection: #add6ff;
   --editor-active-number: #171184;
   --editor-line-border: #eeeeee;
-  --go-syntax-declaration: #245da8;
-  --go-syntax-flow: #862d94;
-  --go-syntax-type: #087569;
-  --go-syntax-string: #a23c2b;
-  --go-syntax-escape: #8b4e17;
-  --go-syntax-number: #176b44;
-  --go-syntax-comment: #34744f;
+  --go-syntax-declaration: #0000ff;
+  --go-syntax-flow: #af00db;
+  --go-syntax-type: #267f99;
+  --go-syntax-string: #a31515;
+  --go-syntax-escape: #ee0000;
+  --go-syntax-number: #098658;
+  --go-syntax-comment: #008000;
+  --go-semantic-type: var(--go-syntax-type);
+  --go-semantic-function: #795e26;
+  --go-semantic-variable: #001080;
+  --go-semantic-field: var(--go-semantic-variable);
+  --go-semantic-parameter: var(--go-semantic-variable);
+  --go-semantic-constant: #0070c1;
+  --go-semantic-namespace: var(--go-semantic-type);
+  --go-semantic-builtin: var(--go-semantic-function);
+  --go-semantic-format: var(--go-semantic-variable);
 }

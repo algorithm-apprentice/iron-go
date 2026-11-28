@@ -37,3 +37,5 @@ record detailed behavior, alternatives, implementation order, and acceptance.
 | [0030](0030-workspace-path-mutations.md) | Rebind editor paths after native exclusive file operations | Accepted design |
 | [0031](0031-native-terminal-ownership.md) | Own terminal sessions and output credit in the native host | Accepted design |
 | [0032](0032-editor-accessibility-mode.md) | Use Monaco screen-reader modes in the native editor | Deferred |
+| [0033](0033-go-semantic-highlighting.md) | Overlay gopls semantic colors on Monaco lexical highlighting | Accepted |
+| [0034](0034-go-modern-color-baseline.md) | Use pinned VS Code Modern foreground colors for Go | Accepted |

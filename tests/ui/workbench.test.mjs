@@ -1193,6 +1193,42 @@ test("Go navigation rejects malformed workspace locations and cancels an outstan
   });
 });
 
+test("an obsolete Go semantic token reply cannot style an edited or reopened model", async () => {
+  await documentScenario("go-semantic-stale", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { GoLanguage, CancellationTokenSource } = window.workflowFixture;
+      const docs = window.documents;
+      const native = { id: 1, path: "/semantic-fixture", name: "Fixture" };
+      docs.reset({ native, read: async () => "package main\n" });
+      const tab = await docs.open("source.go");
+      const language = new GoLanguage(native, docs, () => {});
+      const cancellations = new CancellationTokenSource();
+      let reply;
+      const send = () => language.request("textDocument/semanticTokens/full", tab.model, undefined, cancellations.token);
+      language.connection = {
+        sendRequest: () => new Promise(resolve => { reply = resolve; }),
+        sendNotification: async () => {},
+        dispose() {},
+      };
+      language.ready = true;
+      language.opened(tab);
+      try {
+        const editing = send();
+        tab.model.setValue("package main\nvar _ = 1\n");
+        reply({ data: [] });
+        const reopening = send();
+        language.closed(tab);
+        language.opened(tab);
+        reply({ data: [] });
+        const active = send();
+        reply({ data: [] });
+        return [await editing ?? null, await reopening ?? null, await active];
+      } finally { cancellations.dispose(); language.dispose(); }
+    });
+    assert.deepEqual(outcome, [null, null, { data: [] }]);
+  });
+});
+
 test("an explicit Go edit preserves unrelated auto-indent whitespace and line endings", async () => {
   await documentScenario("go-exact-edit", async page => {
     const outcome = await page.evaluate(async () => {
@@ -1351,7 +1387,8 @@ test("each theme separates rendered Go syntax roles on the real editor canvas", 
         await page.locator("#theme-setting").selectOption("light");
         await page.locator('[data-dialog-close="settings-dialog"]').click();
       }
-      await page.waitForFunction(() => [...document.querySelectorAll("#editor .view-lines .view-line span[class*='mtk']")].some(el => el.textContent.trim() === "func"));
+      await page.waitForFunction(color => [...document.querySelectorAll("#editor .view-lines .view-line span[class*='mtk']")]
+        .some(el => el.textContent.trim() === "func" && getComputedStyle(el).color === color), expectedGoSyntax[theme].declaration);
       const colors = await page.evaluate(renderedGoSyntax);
       assert.deepEqual(colors, expectedGoSyntax[theme]);
       const canvas = await page.locator(".monaco-editor-background").first().evaluate(el => getComputedStyle(el).backgroundColor);

@@ -1,5 +1,10 @@
 # Go syntax colors with clearer visual roles
 
+These rules provide baseline lexical colors. See
+[Go semantic highlighting](go-semantic-highlighting.md) for the gopls overlay.
+The role table below records the original custom palette; it is superseded by
+the [Modern color alignment](go-modern-color-alignment.md).
+
 ## Scope and evidence
 
 On the same disposable Go source, Iron Go's inherited Monaco colors rendered

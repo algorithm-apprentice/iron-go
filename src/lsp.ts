@@ -6,6 +6,7 @@ import { host, type NativeFolder } from "./workspace";
 import { goTestAt, isGoTestFunction } from "./go-test-target";
 import { validateRelative } from "./project-model";
 import { decodeLocalFileUri, goDefinitionPath, organizeImportEdits, workspaceTextEdits } from "./go-import-edits";
+import { fullSemanticLegend, goSemanticCapabilities, goSemanticData, goSemanticLegend } from "./go-semantic-tokens";
 
 export type LanguageState = "idle" | "missing" | "starting" | "ready" | "failed";
 const markerOwner = "gopls";
@@ -133,7 +134,8 @@ export class GoLanguage {
       this.connection = rpc;
       const root = monaco.Uri.file(this.folder.path).toString();
       const folders = [{ uri: root, name: this.folder.name }];
-      rpc.onRequest("workspace/configuration", (params: { items?: unknown[] }) => (params?.items ?? []).map(() => ({})));
+      rpc.onRequest("workspace/configuration", (params: { items?: { section?: string }[] }) =>
+        (params?.items ?? []).map(item => item.section === "gopls" ? { semanticTokens: true } : {}));
       rpc.onRequest("workspace/workspaceFolders", () => folders);
       rpc.onRequest("window/workDoneProgress/create", () => null);
       rpc.onRequest("client/registerCapability", () => null);
@@ -141,7 +143,8 @@ export class GoLanguage {
       rpc.onNotification("textDocument/publishDiagnostics", (params: { uri: string; version?: number; diagnostics: Diagnostic[] }) => this.mark(params));
       rpc.listen();
       const info = await Promise.race([
-        rpc.sendRequest<{ capabilities?: { positionEncoding?: string; completionProvider?: { triggerCharacters?: string[] } } }>("initialize", {
+        rpc.sendRequest<{ capabilities?: { positionEncoding?: string; completionProvider?: { triggerCharacters?: string[] };
+          semanticTokensProvider?: Parameters<typeof fullSemanticLegend>[0] } }>("initialize", {
           processId: null, rootUri: root, workspaceFolders: folders, clientInfo: { name: "Iron Go" },
           capabilities: {
             general: { positionEncodings: ["utf-16"] },
@@ -155,6 +158,7 @@ export class GoLanguage {
               codeAction: { codeActionLiteralSupport: { codeActionKind: { valueSet: ["source.organizeImports"] } } },
               rename: { prepareSupport: true },
               hover: { contentFormat: ["markdown", "plaintext"] },
+              semanticTokens: goSemanticCapabilities,
             },
           },
         }),
@@ -167,6 +171,17 @@ export class GoLanguage {
       this.ready = true;
       this.registerProviders(info.capabilities?.completionProvider?.triggerCharacters ?? ["."]);
       for (const tab of this.docs.tabs.values()) this.opened(tab);
+      const legend = fullSemanticLegend(info.capabilities?.semanticTokensProvider);
+      if (legend) this.providers.push(monaco.languages.registerDocumentSemanticTokensProvider("go", {
+        getLegend: () => goSemanticLegend,
+        provideDocumentSemanticTokens: async (model, _lastResultId, token) => {
+          const result = await this.request<{ data: unknown } | null>("textDocument/semanticTokens/full", model, undefined, token);
+          if (!result) return null;
+          const data = goSemanticData(result.data, legend, model.getLineCount(), line => model.getLineContent(line));
+          return data ? { data } : null;
+        },
+        releaseDocumentSemanticTokens() { /* This client does not retain result IDs or request deltas. */ },
+      }));
       this.status("ready");
     } catch (error) { this.fail(message(error)); }
     finally { window.clearTimeout(initializeTimer); }
@@ -231,7 +246,8 @@ export class GoLanguage {
   }
 
   private async request<T>(method: string, model: monaco.editor.ITextModel, pos: monaco.Position | undefined, token: monaco.CancellationToken, extra = {}) {
-    if (!this.ready || !this.models.has(model) || token.isCancellationRequested) return undefined;
+    const sync = this.models.get(model);
+    if (!this.ready || !sync || token.isCancellationRequested) return undefined;
     const version = model.getVersionId();
     this.flush(model);
     try {
@@ -239,7 +255,8 @@ export class GoLanguage {
         textDocument: { uri: model.uri.toString() },
         ...(pos ? { position: { line: pos.lineNumber - 1, character: pos.column - 1 } } : {}), ...extra,
       }, token);
-      return this.ready && !model.isDisposed() && version === model.getVersionId() && !token.isCancellationRequested ? result : undefined;
+      return this.ready && this.models.get(model) === sync && !model.isDisposed() &&
+        version === model.getVersionId() && !token.isCancellationRequested ? result : undefined;
     } catch { return undefined; }
   }
 

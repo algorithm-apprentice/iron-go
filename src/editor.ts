@@ -11,6 +11,7 @@ import "monaco-editor/editor/contrib/gotoSymbol/browser/goToCommands.js";
 import "monaco-editor/editor/contrib/gotoSymbol/browser/link/goToDefinitionAtPosition.js";
 import "monaco-editor/editor/contrib/hover/browser/hoverContribution.js";
 import "monaco-editor/editor/contrib/linesOperations/browser/linesOperations.js";
+import "monaco-editor/editor/contrib/semanticTokens/browser/documentSemanticTokens.js";
 import "monaco-editor/editor/contrib/suggest/browser/suggestController.js";
 import "monaco-editor/features/find/register.js";
 import "./editor-font.css";
@@ -168,7 +169,7 @@ export class Documents {
   constructor(private readonly element: HTMLElement, private readonly events: DocumentEvents) {
     this.editor = monaco.editor.create(element, {
       model: null, theme: "vs-dark", automaticLayout: true, editContext: false,
-      accessibilitySupport: "off", ariaLabel: "Code editor content",
+      accessibilitySupport: "off", ariaLabel: "Code editor content", "semanticHighlighting.enabled": true,
       ...editorTypography(), fontLigatures: false,
       lineNumbersMinChars: 3, lineDecorationsWidth: 8, padding: { top: 10, bottom: 8 },
       glyphMargin: true,
