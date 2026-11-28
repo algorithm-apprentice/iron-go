@@ -74,6 +74,7 @@ pub struct RunTarget {
 pub struct GoPackages {
     targets: Vec<RunTarget>,
     all_scopes: Vec<String>,
+    package_paths: BTreeMap<String, String>,
 }
 
 fn package_path(root: &Path, dir: &Path) -> Option<String> {
@@ -171,23 +172,30 @@ async fn discover(root: &Path, processes: &Processes) -> CommandResult<GoPackage
     args.extend(scopes.iter().map(String::as_str));
     let packages = list::<Package>(root, processes, &args).await?;
     let mut targets = BTreeMap::new();
-    for item in packages.into_iter().filter(|item| item.name == "main") {
+    let mut package_paths = BTreeMap::new();
+    for item in packages {
         let Some(dir) = item.dir.and_then(|dir| dir.canonicalize().ok()) else {
             continue;
         };
         if let Some(package) = package_path(root, &dir) {
-            targets.insert(
-                package.clone(),
-                RunTarget {
-                    package,
-                    import_path: item.import_path,
-                },
-            );
+            if !item.import_path.is_empty() {
+                package_paths.insert(item.import_path.clone(), package.clone());
+            }
+            if item.name == "main" {
+                targets.insert(
+                    package.clone(),
+                    RunTarget {
+                        package,
+                        import_path: item.import_path,
+                    },
+                );
+            }
         }
     }
     Ok(GoPackages {
         targets: targets.into_values().collect(),
         all_scopes: scopes.into_iter().collect(),
+        package_paths,
     })
 }
 

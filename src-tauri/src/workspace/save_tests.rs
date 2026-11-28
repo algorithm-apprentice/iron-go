@@ -50,6 +50,7 @@ impl Fixture {
                 Ok(())
             },
         )
+        .map(|_| ())
     }
 
     fn only_target(&self) {

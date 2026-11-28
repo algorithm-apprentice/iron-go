@@ -56,11 +56,22 @@ pub fn command(tool: &str) -> CommandResult<Command> {
 }
 
 pub(crate) async fn short_output(
+    core: &Core,
+    command: &mut Command,
+    input: Option<String>,
+    deadline: Duration,
+    tool: &str,
+) -> CommandResult<Output> {
+    short_output_limited(core, command, input, deadline, tool, usize::MAX).await
+}
+
+pub(crate) async fn short_output_limited(
     _core: &Core,
     command: &mut Command,
     input: Option<String>,
     deadline: Duration,
     tool: &str,
+    limit: usize,
 ) -> CommandResult<Output> {
     #[cfg(feature = "e2e")]
     let mut lease = crate::acceptance::ShortTool::admit(_core)?;
@@ -83,6 +94,7 @@ pub(crate) async fn short_output(
     let mut stderr = child.child.stderr.take().unwrap();
     let mut out = Vec::new();
     let mut err = Vec::new();
+    let read_limit = (limit as u64).saturating_add(1);
     let result = tokio::time::timeout(deadline, async {
         let (written, read_out, read_err) = tokio::join!(
             async move {
@@ -91,10 +103,15 @@ pub(crate) async fn short_output(
                 }
                 Ok::<_, io::Error>(())
             },
-            stdout.read_to_end(&mut out),
-            stderr.read_to_end(&mut err),
+            async { (&mut stdout).take(read_limit).read_to_end(&mut out).await },
+            async { (&mut stderr).take(read_limit).read_to_end(&mut err).await },
         );
         read_out.and(read_err)?;
+        if out.len() > limit || err.len() > limit {
+            return Err(io::Error::other(format!(
+                "{tool} exceeded its output limit."
+            )));
+        }
         // Keep the leader unreaped until EOF on both pipes. On a timeout
         // an inherited pipe can still belong to a live member of this group.
         Ok::<_, io::Error>((written, child.wait().await?))

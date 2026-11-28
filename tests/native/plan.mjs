@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { parseArgs } from "node:util";
 
-export const fixtureGroups = ["lifecycle", "files", "go", "debug", "quit", "quit-save"];
+export const fixtureGroups = ["lifecycle", "files", "go", "debug", "quit", "quit-save", "recovery", "recent", "trash", "terminal", "accessibility"];
 
 export function nativePlan(args) {
   const { values } = parseArgs({ args, options: {
@@ -24,7 +24,7 @@ export function nativePlan(args) {
     return { values, groups: ["external"] };
   }
   const groups = values.group ?? (values["quit-only"] ? ["quit"] : values["probe-runner-crash"] ? ["crash", "files"]
-    : fixtureGroups.filter(group => group !== "debug" || values["require-delve"]));
+    : fixtureGroups.filter(group => group !== "accessibility" && (group !== "debug" || values["require-delve"])));
   if (values.group) {
     for (const group of groups) if (!fixtureGroups.includes(group)) throw new Error(`Unknown native group: ${group}.`);
     if (new Set(groups).size !== groups.length) throw new Error("Do not select a native group more than once.");
@@ -49,7 +49,10 @@ export function validReport(group, report) {
 }
 
 export function validTerminal(group, terminal) {
-  const action = { lifecycle: "clean system Quit", quit: "dirty Discard", "quit-save": "dirty Save and Quit" }[group];
+  if (group === "recovery") return ["crash with completed draft", "discard recovery and Quit"].includes(terminal?.action)
+    && typeof terminal.rendererObserved === "string";
+  const action = { lifecycle: "clean system Quit", quit: "dirty Discard", "quit-save": "dirty Save and Quit", debug: "Quit with executable debugger",
+    recent: "Quit with editor session", terminal: "Quit with PTY" }[group];
   return typeof action === "string" && terminal?.action === action && typeof terminal.rendererObserved === "string";
 }
 
@@ -60,7 +63,7 @@ export function summarizeGroup(group, { worker, report, failure, cleanup, native
     || (!valid ? "Missing or invalid matching group report." : undefined)
     || (report.cases.some(entry => entry.result === "fail") ? "A worker case failed." : undefined)
     || (!report.cases.some(entry => entry.result === "pass") ? "No passing case in the selected group." : undefined)
-    || (["lifecycle", "quit", "quit-save"].includes(group) && (!validTerminal(group, report.terminal) || !nativeTerminal)
+    || (["lifecycle", "quit", "quit-save", "debug", "terminal"].includes(group) && (!validTerminal(group, report.terminal) || !nativeTerminal)
       ? "Missing verified native Quit; watchdog EOF is not the Quit oracle." : undefined);
   const secondary = [...diagnostics, ...(valid ? report.diagnostics ?? [] : [])];
   if (cleanup && primary) secondary.push(cleanup);

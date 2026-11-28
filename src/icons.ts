@@ -12,6 +12,8 @@ const paths = {
   refresh: '<path d="M19 11a7 7 0 0 0-12-5l-3 3m0-5v5h5m-4 4a7 7 0 0 0 12 5l3-3m0 5v-5h-5"/>',
   more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
   chevron: '<path d="m9 6 6 6-6 6"/>',
+  stepIn: '<path d="M12 4v13m-5-5 5 5 5-5M6 21h12"/>',
+  stepOut: '<path d="M12 17V4m-5 5 5-5 5 5M6 21h12"/>',
   down: '<path d="m6 9 6 6 6-6"/>',
   close: '<path d="m6 6 12 12M18 6 6 18"/>',
   package: '<path d="m12 3 8 4.5v9L12 21l-8-4.5v-9zm-8 4.5 8 4.5 8-4.5M12 12v9m-4-15.7 8 4.5"/>',

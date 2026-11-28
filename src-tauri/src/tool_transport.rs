@@ -36,42 +36,45 @@ pub enum ServerEvent {
 pub enum ToolKind {
     Gopls,
     Delve,
+    DebugProgram { allow_disconnect: bool },
 }
 
 impl ToolKind {
     fn slot(self, session: &mut Session) -> &mut Option<RunningServer> {
         match self {
             Self::Gopls => &mut session.lsp,
-            Self::Delve => &mut session.debug,
+            Self::Delve | Self::DebugProgram { .. } => &mut session.debug,
         }
     }
 
     fn stopped(self) -> &'static str {
         match self {
             Self::Gopls => "gopls stopped",
-            Self::Delve => "Debug session stopped",
+            Self::Delve | Self::DebugProgram { .. } => "Debug session stopped",
         }
     }
 
     fn input_closed(self) -> &'static str {
         match self {
             Self::Gopls => "gopls input closed",
-            Self::Delve => "Delve input closed",
+            Self::Delve | Self::DebugProgram { .. } => "Delve input closed",
         }
     }
 
     fn output_closed(self) -> &'static str {
         match self {
             Self::Gopls => "gopls output closed",
-            Self::Delve => "Delve disconnected",
+            Self::Delve | Self::DebugProgram { .. } => "Delve disconnected",
         }
     }
 
     fn exited(self, status: ExitStatus, connected: bool) -> String {
         match (self, connected) {
             (Self::Gopls, _) => format!("gopls exited: {status}"),
-            (Self::Delve, true) => format!("Delve exited: {status}"),
-            (Self::Delve, false) => format!("Delve stopped before connecting: {status}"),
+            (Self::Delve | Self::DebugProgram { .. }, true) => format!("Delve exited: {status}"),
+            (Self::Delve | Self::DebugProgram { .. }, false) => {
+                format!("Delve stopped before connecting: {status}")
+            }
         }
     }
 }
@@ -85,10 +88,16 @@ pub struct RunningServer {
 
 impl Drop for RunningServer {
     fn drop(&mut self) {
+        self.request_stop();
+        self.group.kill();
+    }
+}
+
+impl RunningServer {
+    pub(crate) fn request_stop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        self.group.kill();
     }
 }
 
@@ -153,14 +162,33 @@ async fn frame(reader: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Option<Va
 async fn write_frames(
     writer: &mut (impl AsyncWrite + Unpin),
     outgoing: &mut mpsc::Receiver<String>,
+    mut disconnect: oneshot::Receiver<bool>,
 ) -> io::Result<()> {
-    while let Some(message) = outgoing.recv().await {
+    loop {
+        let next = tokio::select! {
+            biased;
+            stop = &mut disconnect => {
+                if matches!(stop, Ok(true)) {
+                    // The native owner reserves sequence zero and never queues
+                    // its disconnect behind application messages.
+                    let request = r#"{"seq":0,"type":"request","command":"disconnect","arguments":{"terminateDebuggee":true}}"#;
+                    writer.write_all(format!("Content-Length: {}\r\n\r\n{request}", request.len()).as_bytes()).await?;
+                    writer.flush().await?;
+                }
+                return Ok(());
+            }
+            next = outgoing.recv() => next,
+        };
+        let Some(message) = next else {
+            return Ok(());
+        };
+        // A stop is observed only at a frame boundary. If the peer is no
+        // longer reading, the relay's deadline owns cancellation/force kill.
         writer
             .write_all(format!("Content-Length: {}\r\n\r\n", message.len()).as_bytes())
             .await?;
         writer.write_all(message.as_bytes()).await?;
     }
-    Ok(())
 }
 
 struct End {
@@ -180,15 +208,22 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let send = write_frames(&mut writer, outgoing);
+    let (disconnect, request) = oneshot::channel();
+    let mut disconnect = Some(disconnect);
+    let send = write_frames(&mut writer, outgoing, request);
     tokio::pin!(send);
+    let mut sending = true;
+    let mut stop_deadline = None;
     let mut reaped = false;
     let mut drain: Option<(Instant, String)> = None;
     let reason = 'frames: loop {
         let next = frame(&mut reader);
         tokio::pin!(next);
         loop {
-            let deadline = drain.as_ref().map(|(deadline, _)| *deadline);
+            let deadline = [stop_deadline, drain.as_ref().map(|(deadline, _)| *deadline)]
+                .into_iter()
+                .flatten()
+                .min();
             let expired = async move {
                 match deadline {
                     Some(deadline) if deadline > Instant::now() => sleep_until(deadline).await,
@@ -198,8 +233,17 @@ where
             };
             tokio::select! {
                 biased;
-                _ = &mut *stop => break 'frames kind.stopped().to_owned(),
-                _ = expired => break 'frames drain.take().unwrap().1,
+                _ = &mut *stop, if stop_deadline.is_none() => {
+                    match kind {
+                        ToolKind::DebugProgram { allow_disconnect } if !reaped => {
+                            stop_deadline = Some(Instant::now() + Duration::from_secs(2));
+                            drain = None;
+                            if let Some(disconnect) = disconnect.take() { let _ = disconnect.send(allow_disconnect); }
+                        }
+                        _ => break 'frames kind.stopped().to_owned(),
+                    }
+                }
+                _ = expired => break 'frames if stop_deadline.is_some() { kind.stopped().to_owned() } else { drain.take().unwrap().1 },
                 status = &mut wait, if !reaped => match status {
                     Ok(status) => {
                         reaped = true;
@@ -207,14 +251,17 @@ where
                     }
                     Err(error) => break 'frames format!("Wait for protocol process: {error}"),
                 },
-                result = &mut send, if drain.is_none() => {
-                    let reason = result.err().map_or_else(|| kind.input_closed().to_owned(), |error| error.to_string());
-                    drain = Some((Instant::now() + DRAIN_LIMIT, reason));
+                result = &mut send, if sending && drain.is_none() => {
+                    sending = false;
+                    if stop_deadline.is_none() {
+                        let reason = result.err().map_or_else(|| kind.input_closed().to_owned(), |error| error.to_string());
+                        drain = Some((Instant::now() + DRAIN_LIMIT, reason));
+                    }
                 }
                 result = &mut next => {
                     // A frame poll can parse JSON synchronously. Stop or
                     // expiry can arrive after select's initial checks.
-                    if !matches!(stop.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+                    if !matches!(kind, ToolKind::DebugProgram { .. }) && !matches!(stop.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
                         break 'frames kind.stopped().to_owned();
                     }
                     if drain.as_ref().is_some_and(|(deadline, _)| Instant::now() >= *deadline) {
@@ -227,7 +274,8 @@ where
                             tokio::task::yield_now().await;
                             continue 'frames;
                         }
-                        Ok(None) => break 'frames drain.take().map_or_else(|| kind.output_closed().to_owned(), |(_, reason)| reason),
+                        Ok(None) => break 'frames if stop_deadline.is_some() { kind.stopped().to_owned() }
+                            else { drain.take().map_or_else(|| kind.output_closed().to_owned(), |(_, reason)| reason) },
                         Err(error) => break 'frames error.to_string(),
                     }
                 }
@@ -250,7 +298,13 @@ where
     W: AsyncWrite + Unpin,
 {
     let end = {
-        let wait = child.wait();
+        let wait = async {
+            if matches!(kind, ToolKind::DebugProgram { .. }) {
+                child.wait_and_retire_group().await
+            } else {
+                child.wait().await
+            }
+        };
         tokio::pin!(wait);
         tokio::select! {
             biased;
@@ -296,17 +350,14 @@ where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let child = OwnedChild::new(child);
-    let group = child.group.clone();
-    let (input, outgoing) = mpsc::channel(32);
-    let (send, receive) = oneshot::channel();
+    let delivery = events.clone();
+    let (server, worker) = prepare_server(kind, id, child, connect, move |message| {
+        delivery
+            .send(ServerEvent::Message { message })
+            .map_err(io::Error::other)
+    });
     tauri::async_runtime::spawn(async move {
-        let reason = supervise(kind, child, connect, outgoing, receive, |message| {
-            events
-                .send(ServerEvent::Message { message })
-                .map_err(io::Error::other)
-        })
-        .await;
+        let reason = worker.await;
         drop(resource);
         finish(
             reason,
@@ -316,12 +367,34 @@ where
             },
         );
     });
-    RunningServer {
+    server
+}
+
+pub(crate) fn prepare_server<R, W>(
+    kind: ToolKind,
+    id: u64,
+    child: Child,
+    connect: impl Future<Output = CommandResult<(R, W)>> + Send + 'static,
+    emit: impl FnMut(Value) -> io::Result<()> + Send + 'static,
+) -> (RunningServer, impl Future<Output = String> + Send)
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let child = OwnedChild::new(child);
+    let group = child.group.clone();
+    let (input, outgoing) = mpsc::channel(32);
+    let (send, receive) = oneshot::channel();
+    let server = RunningServer {
         id,
         input,
         stop: Some(send),
         group,
-    }
+    };
+    (
+        server,
+        supervise(kind, child, connect, outgoing, receive, emit),
+    )
 }
 
 pub async fn send(core: &Core, kind: ToolKind, id: u64, message: String) -> CommandResult<()> {
@@ -331,7 +404,7 @@ pub async fn send(core: &Core, kind: ToolKind, id: u64, message: String) -> Comm
             "The Go language server is not running.",
             "The Go language server closed its input.",
         ),
-        ToolKind::Delve => (
+        ToolKind::Delve | ToolKind::DebugProgram { .. } => (
             "Debugger message is too large.",
             "The debugger is not running.",
             "The debugger closed its input.",

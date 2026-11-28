@@ -1,6 +1,7 @@
 import { byId, element, message } from "./dialogs";
 import { basename, dirname } from "./project-model";
 import { host, type GoPackages, type Project } from "./workspace";
+import { RunConfigurations } from "./run-configurations";
 
 export class RunTargets {
   readonly picker = byId<HTMLSelectElement>("run-target");
@@ -12,9 +13,21 @@ export class RunTargets {
   private generation = 0;
   private loading = false;
   private failure?: string;
+  private readonly configurations: RunConfigurations;
 
   constructor(private readonly revealAdvanced: (focus: HTMLElement) => void, private readonly changed: () => void) {
+    this.configurations = new RunConfigurations(
+      () => this.configurations.options().find(item => item.value === this.picker.value)?.package ||
+        (this.picker.value === "custom" ? this.runPath.value.trim() : this.picker.value) || ".",
+      value => this.render(value),
+    );
     this.picker.addEventListener("change", () => {
+      try { this.configurations.select(this.picker.value); }
+      catch (error) {
+        this.render(this.configurations.restored);
+        byId("run-target-status").textContent = message(error);
+        return;
+      }
       this.renderStatus();
       if (this.picker.value === "custom") this.revealAdvanced(this.runPath);
     });
@@ -23,10 +36,12 @@ export class RunTargets {
     });
     this.runPath.addEventListener("input", () => this.renderStatus());
     byId("refresh-targets").addEventListener("click", () => { void this.refresh(); });
+    byId("run-configurations").addEventListener("click", () => this.configurations.show(this.picker.value));
   }
 
   reset(project: Project) {
     this.project = project;
+    this.configurations.reset(project.native?.path);
     this.generation++;
     this.info = undefined;
     this.failure = undefined;
@@ -36,7 +51,7 @@ export class RunTargets {
     this.runPath.value = "";
     this.scopePath.value = "./...";
     byId<HTMLDetailsElement>("advanced-targets").open = false;
-    this.render("");
+    this.render(this.configurations.restored);
   }
 
   async refresh() {
@@ -66,6 +81,7 @@ export class RunTargets {
   private render(previous: string) {
     const available = !!this.project?.native;
     const targets = this.info?.targets ?? [];
+    const configured = this.configurations.options();
     const append = (value: string, label: string, title?: string) => {
       const row = element("option", "", label);
       row.value = value;
@@ -84,8 +100,9 @@ export class RunTargets {
         const label = labels[index];
         append(target.package, counts.get(label) === 1 ? label : `${label} — ${target.package}`, target.package);
       }
+      for (const config of configured) append(config.value, `${config.name} (configuration)`, config.package);
       append("custom", "Custom target…");
-      this.picker.value = previous === "custom" || targets.some(target => target.package === previous)
+      this.picker.value = previous === "custom" || targets.some(target => target.package === previous) || configured.some(config => config.value === previous)
         ? previous : targets.length === 1 ? targets[0].package : "";
     }
     this.renderStatus();
@@ -93,8 +110,9 @@ export class RunTargets {
 
   private renderStatus() {
     const selected = this.picker.value;
-    this.picker.title = selected === "custom" ? this.runPath.value.trim() || "Custom run package" : selected || "Go executable package";
-    byId("run-target-status").textContent = this.loading ? "Scanning Go packages…"
+    const configuration = this.configurations.options().find(config => config.value === selected);
+    this.picker.title = configuration ? `${configuration.name} — ${configuration.package}` : selected === "custom" ? this.runPath.value.trim() || "Custom run package" : selected || "Go executable package";
+    byId("run-target-status").textContent = configuration ? `Run configuration: ${configuration.name} — ${configuration.package}` : this.loading ? "Scanning Go packages…"
       : this.failure ?? (selected === "custom" ? this.runPath.value.trim() || "Enter a custom package below."
         : selected ? `Run target: ${selected}` : this.info?.targets.length ? "Choose a run target in the editor toolbar."
           : this.project?.native ? "No executable Go package found. Use Test, or choose a custom run target."
@@ -103,7 +121,7 @@ export class RunTargets {
   }
 
   primaryAction(): "run" | "test" {
-    return this.info?.targets.length === 0 && this.picker.value !== "custom" ? "test" : "run";
+    return this.info?.targets.length === 0 && !this.picker.value ? "test" : "run";
   }
 
   setDisabled(busy: boolean, running: boolean) {
@@ -113,7 +131,12 @@ export class RunTargets {
     this.runPath.disabled = disabled;
     this.scopePath.disabled = disabled;
     byId<HTMLButtonElement>("refresh-targets").disabled = disabled;
+    byId<HTMLButtonElement>("run-configurations").disabled = disabled;
   }
+
+  configuredLaunch() { return this.configurations.launch(this.picker.value); }
+
+  testPackagePaths() { return new Map(Object.entries(this.info?.packagePaths ?? {})); }
 
   runArguments() {
     if (this.picker.value === "custom") {

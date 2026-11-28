@@ -26,3 +26,14 @@ record detailed behavior, alternatives, implementation order, and acceptance.
 | [0019](0019-go-navigation-snapshots.md) | Bind Go navigation results to the originating editor snapshot | Accepted design |
 | [0020](0020-explicit-go-import-edits.md) | Apply only direct, version-bound Go import edits | Accepted design |
 | [0021](0021-preview-go-renames.md) | Rebuild and verify Go workspace state before applying a rename preview | Accepted design |
+| [0022](0022-parallel-feedback.md) | Overlap independent feedback layers and preserve native teardown | Accepted design |
+| [0023](0023-build-and-run-configurations.md) | Build and run configured Go executables under one task owner | Accepted design |
+| [0024](0024-structured-go-test-results.md) | Decode bounded Go test events independently of the visible output limit | Accepted design |
+| [0025](0025-verify-go-test-reruns.md) | Verify the Go package snapshot before rerunning a named test | Accepted design |
+| [0026](0026-read-only-go-source.md) | Open Go toolchain and module cache source as read-only snapshots | Accepted design |
+| [0027](0027-pause-scoped-debug-inspection.md) | Bind debug frames, scopes, and variables to one pause and selection | Accepted design |
+| [0028](0028-executable-debug-handoff.md) | Build and hand off an executable to Delve under one native launch identity | Accepted design |
+| [0029](0029-native-project-recovery.md) | Persist immutable crash snapshots and incarnation-bound project sessions | Accepted design |
+| [0030](0030-workspace-path-mutations.md) | Rebind editor paths after native exclusive file operations | Accepted design |
+| [0031](0031-native-terminal-ownership.md) | Own terminal sessions and output credit in the native host | Accepted design |
+| [0032](0032-editor-accessibility-mode.md) | Use Monaco screen-reader modes in the native editor | Deferred |

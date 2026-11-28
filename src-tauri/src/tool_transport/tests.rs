@@ -73,6 +73,59 @@ async fn cancellation_while_completing_a_frame_prevents_delivery() {
 }
 
 #[tokio::test]
+async fn executable_stop_finishes_one_frame_and_observes_the_late_inferior() {
+    let (peer, adapter) = async_io::duplex(16);
+    let (mut peer_read, mut peer_write) = async_io::split(peer);
+    let (adapter_read, adapter_write) = async_io::split(adapter);
+    let (input, mut outgoing) = mpsc::channel(1);
+    let (stop, mut cancel) = oneshot::channel();
+    let launch = serde_json::json!({"seq": 9, "command": "launch", "arguments": {"program": "x".repeat(256)}});
+    input.send(launch.to_string()).await.unwrap();
+    let mut observed = Vec::new();
+    let mut observe = |event| {
+        observed.push(event);
+        Ok(())
+    };
+    let wait = pending::<io::Result<ExitStatus>>();
+    tokio::pin!(wait);
+    let run = relay(
+        ToolKind::DebugProgram {
+            allow_disconnect: true,
+        },
+        (BufReader::new(adapter_read), adapter_write),
+        &mut outgoing,
+        &mut cancel,
+        wait,
+        &mut observe,
+    );
+    let exchange = async {
+        let mut prefix = [0; 5];
+        peer_read.read_exact(&mut prefix).await.unwrap();
+        stop.send(()).unwrap();
+        let mut reader = BufReader::new(prefix.as_slice().chain(peer_read));
+        assert_eq!(frame(&mut reader).await.unwrap().unwrap(), launch);
+        assert_eq!(
+            frame(&mut reader).await.unwrap().unwrap()["command"],
+            "disconnect"
+        );
+        let process =
+            r#"{"seq":10,"type":"event","event":"process","body":{"systemProcessId":17}}"#;
+        peer_write
+            .write_all(format!("Content-Length: {}\r\n\r\n{process}", process.len()).as_bytes())
+            .await
+            .unwrap();
+        peer_write.shutdown().await.unwrap();
+    };
+    let (end, _) = timeout(Duration::from_secs(3), async {
+        tokio::join!(run, exchange)
+    })
+    .await
+    .unwrap();
+    assert_eq!(end.reason, "Debug session stopped");
+    assert_eq!(observed[0]["body"]["systemProcessId"], 17);
+}
+
+#[tokio::test]
 async fn frames_unicode_and_multiple_messages_by_byte_length() {
     let first = r#"{"text":"Go 🚀"}"#;
     let second = r#"{"id":2}"#;

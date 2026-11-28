@@ -161,6 +161,13 @@ kbd { font: 11px/1.35 var(--mono); color: var(--muted); padding: 1px 5px; backgr
 .problem-warning { color: var(--warning); }
 .go-symbol-results { max-height: 48vh; overflow: auto; margin-top: 8px; }
 .go-reference-heading { color: var(--muted); padding: 8px 10px 3px; }
+.test-package { padding: 5px 10px; }
+.test-package h3 { margin: 3px 0; font-size: 12px; overflow-wrap: anywhere; }
+.test-result-row { display: flex; align-items: baseline; gap: 8px; padding: 3px 0 3px 12px; }
+.test-result-row > span { min-width: 0; overflow-wrap: anywhere; }
+.test-result-link { min-width: 0; text-align: left; overflow-wrap: anywhere; }
+.test-result-status { color: var(--muted); flex: none; }
+.test-result-status[data-result="fail"] { color: var(--danger); }
 .problem-info { color: var(--accent); }
 
 .statusbar { min-width: 0; display: flex; align-items: stretch; font-size: 11px; background: var(--side); border-top: 1px solid var(--edge); }
@@ -222,17 +229,41 @@ dialog::backdrop { background: var(--backdrop); }
 .dialog-field { margin-top: 14px; }
 .form-error { color: var(--danger); margin-top: 9px; font-size: 12px; }
 .dialog-actions { margin-top: 16px; display: flex; gap: var(--control-gap); justify-content: end; }
+.run-config-dialog { width: min(525px, 92vw); max-height: 92vh; overflow: auto; }
+.run-config-dialog form > label { display: block; margin: 8px 0 3px; }
+.run-config-dialog textarea { resize: vertical; }
+.run-config-choice { display: flex; gap: 6px; }
+.run-config-dialog .dialog-actions { flex-wrap: wrap; }
 .disk-compare-dialog { width: min(1120px, 94vw); }
 .disk-compare-dialog .dialog-actions { flex-wrap: wrap; }
 #disk-compare-path { overflow-wrap: anywhere; }
 .disk-compare-headings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 8px 0; }
 #disk-compare-view, #rename-preview-view { height: min(55vh, 620px); border: 1px solid var(--edge); }
+.go-source-dialog { width: min(850px, 94vw); }
+#go-source-path { overflow-wrap: anywhere; }
+.draft-list { max-height: 55vh; overflow: auto; }
+.draft-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin: 6px 0; }
+#draft-state { max-width: 32ch; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+#go-source-editor { height: min(63vh, 680px); border: 1px solid var(--edge); margin-top: 8px; }
+.debug-pane { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 12px; padding: 8px; }
+.debug-pane section { min-width: 0; overflow: auto; }
+.debug-pane h3 { margin: 0 0 4px; font-size: 12px; }
+.debug-frame { display: block; max-width: 100%; overflow-wrap: anywhere; text-align: left; }
+.debug-frame[aria-pressed="true"] { font-weight: 700; }
+.debug-variable { padding: 2px 0; overflow-wrap: anywhere; }
+.debug-variable-children { padding-left: 12px; }
+#terminal-pane { min-height: 0; display: flex; flex-direction: column; }
+.terminal-toolbar { display: flex; align-items: center; justify-content: space-between; padding: 2px 8px; border-bottom: 1px solid var(--edge); }
+#terminal-view { flex: 1; min-height: 0; min-width: 0; padding: 4px; background: #111111; }
+#disk-compare-view { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+#disk-compare-view > .editor { min-width: 0; min-height: 0; }
+#disk-compare-view > .modified { border-left: 1px solid var(--edge); }
 #rename-preview-view { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 8px; }
 #rename-preview-view section { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 #rename-preview-view section + section { border-left: 1px solid var(--edge); }
 #rename-preview-view h3 { margin: 0; padding: 5px 8px; font-size: 12px; color: var(--muted); }
 #rename-preview-original, #rename-preview-modified { flex: 1; min-height: 0; }
-.rename-preview-change { background: var(--selection); }
+.rename-preview-change, .disk-compare-changed-line { background: var(--selection); }
 .settings-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; }
 .settings-row small { display: block; color: var(--muted); }
 #theme-setting, #editor-font { width: auto; min-width: 145px; }

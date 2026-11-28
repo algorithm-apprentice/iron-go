@@ -52,7 +52,7 @@ export async function prepareGoRename(options: {
       const disk = await inspect!(path);
       verifyEditors();
       if (disk.kind !== "text") throw new Error(`Could not verify the disk version of ${path}.`);
-      const tab = await docs.open(path, { activate: false, observedText: disk.text, current: options.current });
+      const tab = await docs.open(path, { activate: false, observedDisk: disk, current: options.current });
       if (!tab || tab.disk !== disk.text || tab.model.getLanguageId() !== "go") throw changed();
       if (!tracked.has(tab)) tracked.set(tab, tab.model.getVersionId());
       verifyEditors();
@@ -164,7 +164,9 @@ export async function reviewGoRename(load: Promise<Awaited<ReturnType<typeof pre
       const highlight = (editor: monaco.editor.IStandaloneCodeEditor, model: monaco.editor.ITextModel, ranges: monaco.IRange[]) => {
         model.deltaDecorations([], ranges.map(range => ({ range, options: { isWholeLine: true, className: "rename-preview-change" } })));
         editor.setModel(model);
+        editor.layout();
         if (ranges.length) editor.revealLineInCenter(ranges[0].startLineNumber);
+        editor.render(true);
       };
       highlight(editors[0], original, currentRanges);
       highlight(editors[1], modified, proposedRanges);

@@ -5,8 +5,14 @@ Status: Follow-up to [external file reconciliation](external-file-reconciliation
 ## Scope and choices
 
 - **Compare with Disk** is available from the active tab's disk notice and
-  the command palette for a native file. A workbench dialog shows a read-only
-  Monaco diff, with disk on the left and the captured editor buffer on the right.
+  the command palette for a native file. A workbench dialog shows read-only
+  Monaco panes, with disk on the left and the captured editor buffer on the
+  right. Highlight the regions between the common prefix and suffix of
+  lines, and reveal their first changed line immediately. The full snapshots
+  remain available for independent review and scrolling. Compute the suffix
+  only from lines left after taking the prefix. For insertion or deletion,
+  the empty side has no highlight and reveals the corresponding line, clamped
+  to its last line. Identical displayed text has no highlight or forced scroll.
   The dialog names the captured path. It offers **Keep Editing**, **Reload
   Reviewed Disk Version**, and, for a dirty buffer, **Save Over Reviewed Disk
   Version**. Escape cancels. Missing or unsupported disk files have no reviewed
@@ -67,8 +73,11 @@ Status: Follow-up to [external file reconciliation](external-file-reconciliation
 - An overwrite-anyway button or updating the baseline when opening the dialog
   would let the next ordinary Save overwrite unseen content. Bind each
   destructive action to the reviewed snapshot instead.
-- Use Monaco's existing diff and model APIs rather than building a merge engine.
-  Side-by-side snapshots are deliberately separate from the live model.
+- Use Monaco's editor and model APIs rather than its asynchronous diff worker.
+  The worker can reject when a preview closes before synchronization, or
+  never signal completion after failure. The bounded changed region does not
+  claim to be a minimal diff, needs no worker or cancellation handoff, and
+  never hides text from either snapshot. No merge is performed.
 
 ## Acceptance
 
@@ -85,6 +94,10 @@ Status: Follow-up to [external file reconciliation](external-file-reconciliation
 - Exercise Escape while loading, native Quit during a held reviewed save, and
   newer typing while the save is held. Verify a whitespace-only diff and a
   changed BOM or line-ending convention are visible before applying an action.
+- Check a line added below the viewport, a pure insertion and deletion with
+  an empty region on the other side, and identical displayed text. Close and
+  immediately reopen the comparison with different contents; both panes must
+  show the new snapshots, without invoking the diff worker or leaking models.
 - In a filesystem regression, replace the root or destination parent across
   lock acquisition and change same-inode metadata after staging. Verify no
   unexpected path is written and replacement staging names are never removed.
@@ -103,3 +116,14 @@ Status: Follow-up to [external file reconciliation](external-file-reconciliation
   and unreadable-stage regressions. The final focused browser case verified
   Escape during loading, mixed-ending and BOM display, disabled destructive
   actions for mixed endings, and disposal after closing the preview.
+- A later Files regression showed blank or stale diff panes, followed by a
+  Monaco worker error when temporary models were disposed mid-comparison.
+  An earlier worker-based fix passed the native Files group once
+  (`test-results/native/1795812053873-5918`) but remained vulnerable to delayed
+  worker results. It was superseded by the worker-free preview design above.
+- The worker-free preview passed the changed-region unit cases and a Chromium
+  rapid-reopen case with a change below the initial viewport, zero worker
+  requests, and no retained models after close. The native Files group passed
+  with the same preview (`test-results/native/1795812537392-6701`).
+  The subsequent full feedback run also passed
+  (`test-results/native/1795812597296-7292`).

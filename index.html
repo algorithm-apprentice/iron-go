@@ -59,6 +59,7 @@
             <div class="task-settings side-scroll">
               <p id="run-target-status" class="run-target-status" role="status">Open a Go workspace to discover run targets.</p>
               <button type="button" class="button quiet" id="refresh-targets"><span data-icon="refresh"></span>Refresh Targets</button>
+              <button type="button" class="button quiet" id="run-configurations">Run Configurations</button>
               <label for="package-scope">Build and test</label>
               <select id="package-scope" class="text-field">
                 <option value="all">All packages</option>
@@ -96,6 +97,8 @@
               <div id="debug-controls" class="inline-actions" hidden>
                 <button id="debug-continue" class="icon-button" title="Continue" aria-label="Continue Debugging" data-icon="play"></button>
                 <button id="debug-next" class="icon-button" title="Step Over" aria-label="Step Over" data-icon="chevron"></button>
+                <button id="debug-step-in" class="icon-button" title="Step Into" aria-label="Step Into" data-icon="stepIn"></button>
+                <button id="debug-step-out" class="icon-button" title="Step Out" aria-label="Step Out" data-icon="stepOut"></button>
                 <button id="debug-stop" class="icon-button" title="Stop Debugging" aria-label="Stop Debugging" data-icon="stop"></button>
               </div>
             </div>
@@ -110,6 +113,7 @@
               <div class="welcome-actions">
                 <button id="welcome-open" class="button primary"><span data-icon="folderOpen"></span>Open Project</button>
                 <button id="welcome-new" class="button quiet"><span data-icon="filePlus"></span>New Project</button>
+                <button id="welcome-recent" class="button quiet" hidden><span data-icon="folder"></span>Open Recent</button>
               </div>
             </div>
             <div id="empty-editor" class="empty-editor" hidden>
@@ -126,6 +130,9 @@
                 <button class="panel-tab" id="problems-tab" role="tab" aria-controls="problems-pane" aria-selected="false" data-panel="problems">Problems <span id="problem-count" class="count">0</span></button>
                 <button class="panel-tab active" id="output-tab" role="tab" aria-controls="output-pane" aria-selected="true" data-panel="output">Output</button>
                 <button class="panel-tab" id="references-tab" role="tab" aria-controls="references-pane" aria-selected="false" data-panel="references" hidden>References</button>
+                <button class="panel-tab" id="test-results-tab" role="tab" aria-controls="test-results-pane" aria-selected="false" data-panel="test-results" hidden>Test Results</button>
+                <button class="panel-tab" id="debug-tab" role="tab" aria-controls="debug-pane" aria-selected="false" data-panel="debug" hidden>Debug</button>
+                <button class="panel-tab" id="terminal-tab" role="tab" aria-controls="terminal-pane" aria-selected="false" data-panel="terminal" hidden>Terminal</button>
               </div>
               <div class="panel-actions inline-actions">
                 <button id="panel-stop" class="icon-button" title="Stop Task" aria-label="Stop Task" data-icon="stop" hidden></button>
@@ -136,15 +143,28 @@
               <div id="output-log" class="output-log"></div>
             </div>
             <div id="problems-pane" class="problems-pane" role="tabpanel" aria-labelledby="problems-tab" hidden></div>
+            <div id="test-results-pane" class="problems-pane" role="tabpanel" aria-labelledby="test-results-tab" hidden>
+              <p id="test-results-summary" class="view-note tree-note" role="status"></p>
+              <div id="test-results-list"></div>
+            </div>
             <div id="references-pane" class="problems-pane" role="tabpanel" aria-labelledby="references-tab" hidden>
               <button id="close-references" type="button" class="button quiet">Close References</button>
               <div id="references-results"></div>
+            </div>
+            <div id="debug-pane" class="problems-pane debug-pane" role="tabpanel" aria-labelledby="debug-tab" hidden>
+              <section aria-labelledby="debug-stack-title"><h3 id="debug-stack-title">Call Stack</h3><div id="debug-stack"></div></section>
+              <section aria-labelledby="debug-variables-title"><h3 id="debug-variables-title">Variables</h3><div id="debug-variables"></div></section>
+            </div>
+            <div id="terminal-pane" role="tabpanel" aria-labelledby="terminal-tab" hidden>
+              <div class="terminal-toolbar"><span id="terminal-status" role="status">Terminal</span><button id="terminal-close" type="button" class="button quiet">Close Terminal</button></div>
+              <div id="terminal-view" aria-label="Interactive terminal"></div>
             </div>
           </section>
         </section>
       </main>
 
       <footer class="statusbar" aria-label="Workspace status">
+        <span id="draft-state" role="status" hidden></span>
         <span class="status-context"><span data-icon="branch"></span><span id="status-project">No Project</span></span>
         <button id="status-problems" class="status-button" title="Show Problems" aria-label="Show Problems">
           <span data-icon="error"></span><span id="error-count">0</span><span data-icon="warning"></span><span id="warning-count">0</span>
@@ -176,6 +196,26 @@
         <div class="dialog-actions"><button type="button" class="button quiet" data-dialog-close="form-dialog">Cancel</button><button type="submit" id="form-submit" class="button primary">Create</button></div>
       </form>
     </dialog>
+    <dialog id="run-config-dialog" class="form-dialog run-config-dialog" aria-labelledby="run-config-title">
+      <form id="run-config-form" method="dialog">
+        <div class="dialog-header"><h2 id="run-config-title">Go Run Configurations</h2><button type="button" class="icon-button" data-dialog-close="run-config-dialog" aria-label="Close run configurations" data-icon="close"></button></div>
+        <label for="run-config-list">Configuration</label>
+        <div class="run-config-choice"><select id="run-config-list" class="text-field"></select><button type="button" class="button quiet" id="run-config-new">New</button></div>
+        <label for="run-config-name">Name</label><input id="run-config-name" class="text-field" required maxlength="120" />
+        <label for="run-config-package">Go package</label><input id="run-config-package" class="text-field mono" required placeholder="./cmd/app" />
+        <label for="run-config-directory">Working directory relative to the project</label><input id="run-config-directory" class="text-field mono" placeholder="." />
+        <label for="run-config-arguments">Program arguments (JSON string array)</label><textarea id="run-config-arguments" class="text-field mono" rows="2" spellcheck="false"></textarea>
+        <label for="run-config-environment">Saved environment (NAME=value per line)</label><textarea id="run-config-environment" class="text-field mono" rows="2" spellcheck="false"></textarea>
+        <label for="run-config-session">Session-only environment (NAME=value per line)</label><textarea id="run-config-session" class="text-field mono" rows="2" spellcheck="false" autocomplete="off"></textarea>
+        <p class="view-note">Saved arguments and saved environment values are ordinary local preferences. Use the session-only field for secrets.</p>
+        <p id="run-config-error" class="form-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" id="run-config-delete" class="button quiet">Delete</button>
+          <button type="button" id="run-config-use" class="button quiet">Use Configuration</button>
+          <button type="submit" id="run-config-save" class="button primary">Save Configuration</button>
+        </div>
+      </form>
+    </dialog>
     <dialog id="settings-dialog" class="form-dialog" aria-labelledby="settings-title">
       <div class="dialog-header"><h2 id="settings-title">Workbench Settings</h2><button type="button" class="icon-button" data-dialog-close="settings-dialog" aria-label="Close settings" data-icon="close"></button></div>
       <label class="settings-row" for="theme-setting"><strong>Color Theme</strong><select id="theme-setting" class="text-field">
@@ -196,7 +236,37 @@
       </div>
       <label class="settings-row"><div><strong>Minimap</strong><small>Show a compact overview of the file.</small></div><input id="minimap-setting" type="checkbox" /></label>
       <label class="settings-row"><div><strong>Word wrap</strong><small>Wrap long lines to the editor width.</small></div><input id="wrap-setting" type="checkbox" /></label>
+      <label class="settings-row"><div><strong>Format Go files on save</strong><small>Use gofmt for native Go files when choosing Save File or Save All.</small></div><input id="format-save-setting" type="checkbox" /></label>
       <div class="settings-tools"><h3>Go Toolchain</h3><div id="settings-tools-info" class="view-note"></div><button id="probe-tools" class="button quiet"><span data-icon="refresh"></span>Check tools</button></div>
+    </dialog>
+    <dialog id="terminal-close-dialog" class="form-dialog" aria-labelledby="terminal-close-title">
+      <form method="dialog">
+        <h2 id="terminal-close-title">Close the active terminal?</h2>
+        <p>The shell or Go program and its foreground job will stop.</p>
+        <div class="dialog-actions">
+          <button type="submit" class="button primary" value="cancel" autofocus>Cancel</button>
+          <button id="terminal-close-confirm" type="submit" class="button quiet" value="close">Close Terminal</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="recent-dialog" class="form-dialog" aria-labelledby="recent-title">
+      <div class="dialog-header"><h2 id="recent-title">Open Recent</h2><button type="button" class="icon-button" data-dialog-close="recent-dialog" aria-label="Close recent projects" data-icon="close"></button></div>
+      <p id="recent-note" class="view-note" role="status"></p>
+      <div id="recent-list" class="draft-list"></div>
+      <button id="clear-recent" type="button" class="button quiet">Clear History</button>
+    </dialog>
+    <dialog id="draft-dialog" class="form-dialog" aria-labelledby="draft-title">
+      <div class="dialog-header"><h2 id="draft-title">Recover Drafts</h2><button type="button" class="icon-button" data-dialog-close="draft-dialog" aria-label="Close recovery" data-icon="close"></button></div>
+      <p id="draft-dialog-note" class="view-note" role="status"></p>
+      <div id="draft-list" class="draft-list"></div>
+    </dialog>
+    <dialog id="go-source-dialog" class="form-dialog go-source-dialog" aria-labelledby="go-source-title" aria-describedby="go-source-path go-source-location">
+      <form method="dialog">
+        <div class="dialog-header"><h2 id="go-source-title">Read-only Go source</h2><button id="go-source-close" class="button quiet" autofocus>Close</button></div>
+        <div id="go-source-path" class="view-note mono"></div>
+        <div id="go-source-location" class="view-note"></div>
+        <div id="go-source-editor"></div>
+      </form>
     </dialog>
     <dialog id="go-symbol-dialog" class="form-dialog" aria-labelledby="go-symbol-title">
       <div class="dialog-header"><h2 id="go-symbol-title">Go to Symbol in File</h2><button type="button" class="icon-button" data-dialog-close="go-symbol-dialog" aria-label="Close symbol search" data-icon="close"></button></div>

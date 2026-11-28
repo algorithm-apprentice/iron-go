@@ -5,7 +5,7 @@ import { exactModelRange, monaco, type DocumentTab, type Documents } from "./edi
 import { host, type NativeFolder } from "./workspace";
 import { goTestAt, isGoTestFunction } from "./go-test-target";
 import { validateRelative } from "./project-model";
-import { decodeLocalFileUri, organizeImportEdits, workspaceTextEdits } from "./go-import-edits";
+import { decodeLocalFileUri, goDefinitionPath, organizeImportEdits, workspaceTextEdits } from "./go-import-edits";
 
 export type LanguageState = "idle" | "missing" | "starting" | "ready" | "failed";
 const markerOwner = "gopls";
@@ -371,14 +371,7 @@ export class GoLanguage {
       },
     }), monaco.languages.registerDefinitionProvider("go", {
       provideDefinition: async (model, pos, token) => {
-        this.flushOpen();
-        const location = await this.request<Location | Location[] | LocationLink[] | null>("textDocument/definition", model, pos, token);
-        if (!location) return [];
-        return (Array.isArray(location) ? location : [location]).flatMap(item => {
-          const uri = monaco.Uri.parse("targetUri" in item ? item.targetUri : item.uri);
-          if (!this.docs.relative(uri)) return [];
-          return [{ uri, range: fromRange("targetUri" in item ? item.targetSelectionRange : item.range) }];
-        });
+        return (await this.definitions(model, pos, token)).filter(target => this.docs.relative(target.uri));
       },
     }), monaco.languages.registerCodeLensProvider("go", {
       provideCodeLenses: async (model, token) => {
@@ -402,6 +395,17 @@ export class GoLanguage {
     if (this.disposed) return;
     this.dispose();
     this.status("failed", reason);
+  }
+
+  async definitions(model: monaco.editor.ITextModel, position: monaco.Position, token: monaco.CancellationToken) {
+    this.flushOpen();
+    const result = await this.request<Location | Location[] | LocationLink[] | null>("textDocument/definition", model, position, token);
+    return (Array.isArray(result) ? result : [result]).flatMap(item => {
+      if (!item || typeof item !== "object") return [];
+      const path = goDefinitionPath("targetUri" in item ? item.targetUri : item.uri);
+      const range = "targetUri" in item ? item.targetSelectionRange : item.range;
+      return path && validRange(range) ? [{ uri: monaco.Uri.file(path), range: fromRange(range) }] : [];
+    });
   }
 
   dispose() {

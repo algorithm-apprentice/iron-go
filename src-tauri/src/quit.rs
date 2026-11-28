@@ -301,9 +301,67 @@ pub async fn present_app_exit(app: AppHandle, ticket: u64) -> CommandResult<bool
 }
 
 #[tauri::command]
-pub async fn resolve_app_exit(app: AppHandle, ticket: u64, approve: bool) -> CommandResult<bool> {
+pub async fn resolve_app_exit(
+    app: AppHandle,
+    ticket: u64,
+    approve: bool,
+    retirement: Option<crate::drafts::Retirement>,
+) -> CommandResult<bool> {
+    let retire = retirement.is_some();
+    let mut staged = false;
+    let mut terminal_fence = None;
+    #[cfg(feature = "e2e")]
+    let mut refuse = false;
+    if approve
+        && app
+            .state::<ExitGate>()
+            .0
+            .lock()
+            .unwrap()
+            .live(ticket, Instant::now())
+    {
+        if let Some(plan) = retirement {
+            if let Err(error) = crate::drafts::prepare_quit(app.clone(), ticket, plan).await {
+                app.state::<ExitGate>().0.lock().unwrap().take(ticket);
+                return Err(error);
+            }
+            staged = true;
+            #[cfg(feature = "e2e")]
+            {
+                let probe = app
+                    .state::<crate::Core>()
+                    .0
+                    .lock()
+                    .unwrap()
+                    .acceptance
+                    .draft_quit
+                    .clone();
+                refuse = probe.wait().await;
+            }
+        }
+        match crate::terminal::fence_cutover(&app, Some(ticket)).await {
+            Ok(fence) => terminal_fence = Some(fence),
+            Err(error) => {
+                app.state::<ExitGate>().0.lock().unwrap().take(ticket);
+                if staged {
+                    let _ = crate::drafts::cancel_quit(app, ticket).await;
+                }
+                return Err(error);
+            }
+        }
+        if let Err(error) =
+            crate::debug_program::stop_program(app.state::<crate::Core>().inner(), None).await
+        {
+            app.state::<ExitGate>().0.lock().unwrap().take(ticket);
+            let _ = crate::drafts::cancel_quit(app, ticket).await;
+            return Err(error);
+        }
+    }
     let (send, receive) = oneshot::channel();
+    let decision_app = app.clone();
     queue_on_main(move || {
+        let _terminal_fence = terminal_fence;
+        let app = decision_app;
         let accepted = app
             .state::<ExitGate>()
             .inner()
@@ -316,6 +374,17 @@ pub async fn resolve_app_exit(app: AppHandle, ticket: u64, approve: bool) -> Com
         } else if !approve {
             let _ = send.send(Ok(true));
         } else {
+            if retire {
+                if let Err(error) = crate::drafts::approve_quit(&app, ticket) {
+                    let _ = send.send(Err(error));
+                    return;
+                }
+            }
+            #[cfg(feature = "e2e")]
+            if refuse {
+                let _ = send.send(Ok(false));
+                return;
+            }
             if let Some(mtm) = MainThreadMarker::new() {
                 APPROVED_RETRY.with(|permit| {
                     permit.set(true);
@@ -328,7 +397,11 @@ pub async fn resolve_app_exit(app: AppHandle, ticket: u64, approve: bool) -> Com
             let _ = send.send(Ok(false));
         }
     });
-    receive.await.map_err(|error| error.to_string())?
+    let result = receive.await.map_err(|error| error.to_string())?;
+    if staged {
+        crate::drafts::cancel_quit(app, ticket).await?;
+    }
+    result
 }
 
 #[cfg(feature = "e2e")]

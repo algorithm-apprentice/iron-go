@@ -1,4 +1,5 @@
 export interface Entry { path: string; directory: boolean }
+export const inPath = (path: string, parent: string) => path === parent || path.startsWith(`${parent}/`);
 export interface FileMatch { path: string; line: number; column: number; length: number; preview: string }
 export interface SearchResult { matches: FileMatch[]; truncated: boolean }
 export interface ProjectSnapshot { entries: Entry[]; truncated: boolean; module: string | null; goWork: boolean; packageRevision?: string }

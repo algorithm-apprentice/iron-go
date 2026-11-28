@@ -1,7 +1,9 @@
 # Daily Go workbench: feature completion plan
 
-Status: Proposed. This document defines the implementation scope and acceptance
-criteria. It does not claim that the proposed features are implemented.
+Status: The personal-use features are implemented. The integrated feedback run
+passed (`test-results/native/1795846668738-68435`), and the explicitly selected
+native keyboard/AX run passed (`test-results/native/1795846886360-71711`).
+VoiceOver support and public distribution are deferred.
 
 ## Goal and baseline
 
@@ -160,6 +162,9 @@ With `gopls` missing, Go to Line, ordinary editing, and `gofmt` still work.
 
 ## 3. Run configurations and test results
 
+See [named Go run configurations](go-run-configurations.md) and
+[structured Go test results](go-test-results.md).
+
 - Keep automatic package selection and the scope picker. Add named setups
   stored locally per project: target, an ordered argument list (including
   whitespace and empty strings), project-relative working directory, and
@@ -190,6 +195,8 @@ next.
 
 ## 4. Debug inspection and executable launch
 
+See [paused inspection](debug-inspection.md) and [executable debugging](debug-go-program.md).
+
 - Extend the current named-test session with a call stack, selected frame,
   expandable scopes and local variables, and **Step Into** / **Step Out**.
   Request variables lazily and bound large displays. Every frame and variable
@@ -211,6 +218,9 @@ Stop and switch projects during inspection; stale replies must not update a
 new session and the debuggee must exit.
 
 ## 5. Project continuity and file management
+
+See [recent projects](recent-projects.md), [crash drafts](crash-drafts.md), and
+[workspace file operations](workspace-file-operations.md).
 
 - Add **Open Recent** on Welcome and in the palette, with Remove from Recent
   and Clear History. Keep the [project-first welcome](../adr/0006-project-first-welcome.md):
@@ -258,6 +268,8 @@ breakpoint and draft state, and that nothing writes outside the project root.
 
 ## 6. Interactive terminal
 
+See [interactive terminal](interactive-terminal.md).
+
 Provide a separate **Terminal** pane for an explicitly started local shell
 or an interactive Go Run. Prototype the existing terminal-emulator and native
 PTY libraries before adding infrastructure. Rust owns each PTY, foreground
@@ -276,14 +288,16 @@ or child handle remains and no stale output appears in a new terminal.
 
 ## Accessibility and distribution
 
-- Remove the forced-off Monaco screen-reader setting after proving the
-  supported WKWebView path. Test editor text input and navigation with
-  accessibility enabled, visible focus, and keyboard access through the
-  explorer, result lists, dialogs and debug controls. Verify dialog focus
-  returns to the initiating control or a valid replacement. With VoiceOver,
-  verify reading a Go line, moving the caret and editing text, hearing a
-  confirmation and its options, and navigating announced search results.
-  Record this separately from automated keyboard and accessibility-tree checks.
+See [keyboard access](workbench-accessibility.md).
+
+Public distribution is deferred during the personal-use roadmap. Keep the
+release checklist for a future decision; signing, notarization, and Gatekeeper
+checks are not part of the current development work.
+
+- Test editor text input and navigation, visible focus, and keyboard access
+  through the explorer, result lists, dialogs and debug controls. Verify dialog
+  focus returns to the initiating control or a valid replacement. VoiceOver
+  and a dedicated screen-reader mode are outside the personal-use scope.
 - Before public binary distribution, complete the [release checklist](#release-checklist).
   Local development builds do not require distribution credentials.
 

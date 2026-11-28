@@ -36,8 +36,12 @@ const SAVE_STAGE_PREFIX: &str = ".~73827978-";
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceInfo {
     pub id: u64,
-    name: String,
+    pub(crate) name: String,
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) editor_session: Option<crate::recent::EditorSession>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recent_error: Option<String>,
 }
 
 pub struct Workspace {
@@ -63,7 +67,13 @@ impl Workspace {
             .to_owned();
         let anchor = RootAnchor::new(&root).map_err(fail("Open workspace directory"))?;
         Ok(Self {
-            info: WorkspaceInfo { id: 0, name, path },
+            info: WorkspaceInfo {
+                id: 0,
+                name,
+                path,
+                editor_session: None,
+                recent_error: None,
+            },
             root,
             anchor,
         })
@@ -74,7 +84,7 @@ fn fail(action: &'static str) -> impl FnOnce(io::Error) -> String {
     move |error| format!("{action}: {error}")
 }
 
-fn components(relative: &str) -> CommandResult<Vec<&str>> {
+pub(crate) fn components(relative: &str) -> CommandResult<Vec<&str>> {
     let parts: Vec<_> = relative.split('/').collect();
     if parts.len() > MAX_DEPTH
         || parts.iter().any(|part| {
@@ -230,7 +240,7 @@ impl SaveStage {
     }
 }
 
-fn open_save_lock(data_dir: &Path) -> CommandResult<File> {
+pub(crate) fn open_save_lock(data_dir: &Path) -> CommandResult<File> {
     fs::create_dir_all(data_dir).map_err(fail("Prepare save lock directory"))?;
     // Keep this file and inode stable for all cooperating writers in the
     // profile, including when a workspace encloses the data directory.
@@ -245,7 +255,7 @@ fn open_save_lock(data_dir: &Path) -> CommandResult<File> {
         .map_err(fail("Open save lock"))
 }
 
-fn verify_save_directory(
+pub(crate) fn verify_save_directory(
     root: &Path,
     anchor: &RootAnchor,
     parents: &[&str],
@@ -292,6 +302,7 @@ fn persist_text(
     persist_text_impl(root, data_dir, relative, expected, text, None, &mut |_| {
         Ok(())
     })
+    .map(|_| ())
 }
 
 fn persist_text_impl(
@@ -302,7 +313,7 @@ fn persist_text_impl(
     text: &str,
     bound: Option<(&RootAnchor, Option<&str>)>,
     #[cfg(test)] observe: &mut impl FnMut(SavePoint) -> CommandResult<()>,
-) -> CommandResult<()> {
+) -> CommandResult<Option<String>> {
     if text.len() as u64 > MAX_FILE_BYTES || text.as_bytes().contains(&0) {
         return Err("Save a UTF-8 text file smaller than 2 MB.".into());
     }
@@ -392,7 +403,19 @@ fn persist_text_impl(
     stage.verify()?;
     #[cfg(test)]
     observe(SavePoint::Validated)?;
-    stage.persist(leaf, false)
+    stage.persist(leaf, false)?;
+    Ok(stage
+        .temporary
+        .as_file()
+        .metadata()
+        .ok()
+        .map(|metadata| review_version(&metadata)))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SavedFile {
+    path: String,
+    version: Option<String>,
 }
 
 fn persist_new_text(
@@ -402,7 +425,7 @@ fn persist_new_text(
     relative: &str,
     text: &str,
     #[cfg(test)] before_commit: impl FnOnce(),
-) -> CommandResult<String> {
+) -> CommandResult<SavedFile> {
     if text.len() as u64 > MAX_FILE_BYTES || text.as_bytes().contains(&0) {
         return Err("Save a UTF-8 text file smaller than 2 MB.".into());
     }
@@ -452,10 +475,17 @@ fn persist_new_text(
     verify_save_directory(root, anchor, parents, &parent)?;
     stage.verify()?;
     stage.persist(leaf, true)?;
-    Ok(descriptor_path(stage.temporary.as_file())
+    let path = descriptor_path(stage.temporary.as_file())
         .ok()
         .and_then(|path| relative_path(&path))
-        .unwrap_or(fallback_path))
+        .unwrap_or(fallback_path);
+    let version = stage
+        .temporary
+        .as_file()
+        .metadata()
+        .ok()
+        .map(|metadata| review_version(&metadata));
+    Ok(SavedFile { path, version })
 }
 
 fn reject_profile_save_parent(data_dir: &Path, parent: &Metadata) -> CommandResult<()> {
@@ -477,7 +507,7 @@ fn reject_profile_save_parent(data_dir: &Path, parent: &Metadata) -> CommandResu
     Err("Unable to resolve the app profile directory.".into())
 }
 
-fn descriptor_path(file: &File) -> io::Result<PathBuf> {
+pub(crate) fn descriptor_path(file: &File) -> io::Result<PathBuf> {
     let mut buffer = [0u8; libc::PATH_MAX as usize];
     // Darwin writes a NUL-terminated path into the PATH_MAX buffer.
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } != 0 {
@@ -551,6 +581,9 @@ pub struct Snapshot {
 }
 
 pub fn excluded_name(name: &str) -> bool {
+    if name.starts_with(".iron-go-trash-") {
+        return true;
+    }
     HIDDEN.contains(&name) || name.contains('\\') || name.starts_with(SAVE_STAGE_PREFIX)
 }
 
@@ -672,15 +705,16 @@ fn source_input(path: &str) -> bool {
 #[tauri::command]
 pub async fn go_source_revision(state: State<'_, Core>, id: u64) -> CommandResult<String> {
     let (root, anchor) = observation_root(&state, id)?;
-    blocking(move || {
-        source_revision(
-            &root,
-            &anchor,
-            #[cfg(test)]
-            || {},
-        )
-    })
-    .await
+    blocking(move || go_source_signature(&root, &anchor)).await
+}
+
+pub fn go_source_signature(root: &Path, anchor: &RootAnchor) -> CommandResult<String> {
+    source_revision(
+        root,
+        anchor,
+        #[cfg(test)]
+        || {},
+    )
 }
 
 fn source_revision(
@@ -691,7 +725,7 @@ fn source_revision(
     anchor.verify(root)?;
     let (entries, truncated, directories) = collect_entries(root, Some(anchor))?;
     if truncated {
-        return Err("This workspace is too large to verify a rename.".into());
+        return Err("This workspace is too large to verify Go sources.".into());
     }
     let mut signature = DefaultHasher::new();
     let stamp = |path: &str| {
@@ -856,6 +890,19 @@ pub(crate) fn observation_root(state: &Core, id: u64) -> CommandResult<(PathBuf,
     Ok((root, anchor))
 }
 
+pub fn run_directory(workspace: &Workspace, path: &str) -> CommandResult<File> {
+    workspace.anchor.verify(&workspace.root)?;
+    let parts = if path == "." {
+        Vec::new()
+    } else {
+        components(path)?
+    };
+    workspace
+        .anchor
+        .open_directory(&parts)
+        .map_err(fail("Open configured working directory"))
+}
+
 #[tauri::command]
 pub async fn inspect_file(
     state: State<'_, Core>,
@@ -867,16 +914,26 @@ pub async fn inspect_file(
 }
 
 #[tauri::command]
-pub async fn read_file(state: State<'_, Core>, id: u64, path: String) -> CommandResult<String> {
+pub async fn read_file(
+    state: State<'_, Core>,
+    id: u64,
+    path: String,
+) -> CommandResult<VersionedText> {
     use DiskObservation::*;
     match inspect_file(state, id, path).await? {
-        Text { text, .. } => Ok(text),
+        Text { text, version } => Ok(VersionedText { text, version }),
         Missing => Err("The file no longer exists.".into()),
         Unavailable => {
             Err("The file is unavailable. Open a regular UTF-8 text file smaller than 2 MB.".into())
         }
         Retry => Err("The file changed while opening. Try again.".into()),
     }
+}
+
+#[derive(serde::Deserialize, Serialize)]
+pub struct VersionedText {
+    pub(crate) text: String,
+    pub(crate) version: String,
 }
 
 #[tauri::command]
@@ -889,7 +946,7 @@ pub async fn save_file(
     text: String,
     reviewed_version: Option<String>,
     quit_ticket: Option<u64>,
-) -> CommandResult<()> {
+) -> CommandResult<Option<String>> {
     let (root, anchor) = observation_root(&state, id)?;
     let data_dir = app
         .path()
@@ -922,7 +979,7 @@ pub async fn save_new_file(
     id: u64,
     path: String,
     text: String,
-) -> CommandResult<String> {
+) -> CommandResult<SavedFile> {
     let (root, anchor) = observation_root(&state, id)?;
     let data_dir = app
         .path()
@@ -962,7 +1019,7 @@ impl Default for TestSaveHold {
 
 #[cfg(feature = "e2e")]
 impl TestSaveHold {
-    async fn wait(&self, path: &str) -> CommandResult<()> {
+    pub(crate) async fn wait(&self, path: &str) -> CommandResult<()> {
         use std::sync::atomic::Ordering;
         let mut held = self.gate.subscribe();
         let holds_path = |(enabled, target): &(bool, Option<String>)| {

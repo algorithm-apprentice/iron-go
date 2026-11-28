@@ -61,7 +61,7 @@ fn open_at_mode(
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn open_root(path: &Path) -> io::Result<File> {
+pub(crate) fn open_root(path: &Path) -> io::Result<File> {
     let mut parts = path.components();
     if parts.next() != Some(Component::RootDir) {
         return Err(io::Error::new(

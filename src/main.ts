@@ -4,21 +4,26 @@ import { CancellationTokenSource } from "vscode-jsonrpc/lib/browser/main.js";
 import { byId, element, Forms, message, Palette } from "./dialogs";
 import { showDiskComparison } from "./disk-compare";
 import { prepareGoRename, reviewGoRename } from "./go-rename";
-import { applyExactTextEdits, bufferText, defaultEditorFontSize, Documents, editorTypography, exactModelRange, monaco, type DocumentTab } from "./editor";
+import { showGoSource } from "./go-source-view";
+import { DebugInspectionView } from "./debug-inspection-view";
+import type { DebugInspectionState } from "./debug-inspection";
+import { DraftRecorder } from "./draft-recorder";
+import { TerminalPane } from "./terminal-pane";
+import { applyExactTextEdits, bufferText, defaultEditorFontSize, Documents, editorTypography, exactModelRange, monaco, type DocumentTab, type SaveOptions } from "./editor";
 import { Feedback } from "./feedback";
 import { fileIcon, icon, prepareIcons, type Icon } from "./icons";
 import { GoLanguage, debugTestCommand, runTestCommand, type GoLocation, type GoSymbol, type LanguageState } from "./lsp";
 import { Breakpoints, DebugSession } from "./debugger";
 import { packageForFile, RunTargets } from "./run-targets";
 import { bindColorTheme, chooseColorTheme } from "./theme";
-import { basename, dirname, initialWorkspaceFile, makeTree, quickFiles, validateRelative, type FileMatch, type ProjectSnapshot, type TreeNode } from "./project-model";
+import { basename, dirname, inPath, initialWorkspaceFile, makeTree, quickFiles, validateRelative, type FileMatch, type ProjectSnapshot, type TreeNode } from "./project-model";
 import { decideExit } from "./quit-flow";
 import { ExecutionLane } from "./execution";
 import { ProjectSnapshots } from "./project-workflow";
 import { saveDirtyTabs } from "./save-batch";
 import { createCursorTestWorkflow } from "./cursor-test-workflow";
 import { handleEditorCycle } from "./editor-shortcuts";
-import { desktop, host, importedProject, nativeProject, welcomeProject, type NativeFolder, type Project, type ReadableDisk, type TaskKind, type ToolStatus } from "./workspace";
+import { desktop, host, importedProject, nativeProject, welcomeProject, type DraftItem, type NativeFolder, type Project, type ReadableDisk, type RunLaunch, type TaskKind, type ToolStatus, type WorkspaceMutation } from "./workspace";
 
 type View = "explorer" | "search" | "tasks";
 
@@ -26,7 +31,19 @@ prepareIcons();
 document.body.classList.toggle("desktop", desktop);
 const palette = new Palette();
 const forms = new Forms();
-const feedback = new Feedback(() => docs.layout());
+const feedback = new Feedback(() => docs.layout(), location => {
+  const target = project;
+  const relative = docs.relative(monaco.Uri.file(location.absolute));
+  if (!relative) return;
+  try { validateRelative(relative); } catch { return; }
+  return () => {
+    if (project === target) void openFile(relative, new monaco.Range(location.line, location.column, location.line, location.column));
+  };
+});
+const terminal = new TerminalPane(visible => {
+  if (visible) feedback.show("terminal");
+  else feedback.hide("terminal");
+}, showError);
 const workbench = byId("workbench");
 const btn = (id: string) => byId<HTMLButtonElement>(id);
 const input = (id: string) => byId<HTMLInputElement>(id);
@@ -43,7 +60,11 @@ let tree: TreeNode[] = [];
 let opened = new Set<string>();
 let view: View = "explorer";
 let rootExpanded = true;
+let explorerSelection: string | undefined;
+let mutatingPaths = false;
 const breakpoints = new Breakpoints();
+const drafts = new DraftRecorder(byId("draft-state"));
+const debugInspection = new DebugInspectionView(byId("debug-stack"), byId("debug-variables"));
 let executionLine: { model: monaco.editor.ITextModel; ids: string[] } | undefined;
 let formatting = false;
 let fileMutations = 0;
@@ -51,6 +72,15 @@ let fileDecisionPending = false;
 let testQuitRequests = 0;
 let quitDialogTicket: number | undefined;
 let lastExpiredQuitTicket = 0;
+const sessionExpiry = new Map<number, () => void>();
+let restoringSession = false;
+let failedSessionRestore: Project | undefined;
+let sessionInstall = 0;
+let sessionTimer: number | undefined;
+let sessionWrite: Promise<void> | undefined;
+let sessionDirty = false;
+let sessionRevision = 0;
+let holdSessionDebounce = false;
 let tools: ToolStatus | undefined;
 let lsp: GoLanguage | undefined;
 let gopls: LanguageState = "idle";
@@ -70,14 +100,18 @@ const diskMessage = {
 
 const docs = new Documents(byId("editor"), {
   changed: renderDocuments,
-  opened: tab => { breakpoints.open(tab); lsp?.opened(tab); invalidateNavigation(); void refreshDisk?.(); },
+  opened: tab => {
+    if (!restoringSession && failedSessionRestore === project) failedSessionRestore = undefined;
+    breakpoints.open(tab); lsp?.opened(tab); invalidateNavigation(); void refreshDisk?.();
+  },
   edited: tab => {
     lsp?.edited(tab);
     invalidateNavigation();
+    drafts.schedule(project.native, tab);
     if (!tab.dirty && tab.diskChange === "changed") void refreshDisk?.();
   },
   closed: tab => { breakpoints.close(tab); lsp?.closed(tab); invalidateNavigation(); queueMicrotask(renderProblems); },
-  saved: tab => { lsp?.saved(tab); invalidateNavigation(); },
+  saved: tab => { lsp?.saved(tab); invalidateNavigation(); drafts.schedule(project.native, tab, true); },
   fileSettled: () => { void refreshDisk?.(); },
 });
 const execution = new ExecutionLane<NativeFolder, DebugSession>(syncControls);
@@ -95,7 +129,9 @@ const fileActionsBlocked = () => projectWorkflow.busy || execution.preparing || 
 const saveBarrier = {
   revision: () => docs.editRevision,
   dirty: () => docs.dirty,
-  async save() { for (const tab of docs.tabs.values()) if (tab.dirty) await docs.save(tab); },
+  async save() {
+    for (const tab of docs.tabs.values()) if (tab.dirty && await docs.save(tab)) await drafts.settled(tab);
+  },
 };
 
 function reserveFileActivity() {
@@ -143,6 +179,7 @@ function renderExplorer() {
   root.setAttribute("aria-expanded", String(rootExpanded));
   if (!project.native) root.append(element("span", "root-tag", "COPY"));
   root.addEventListener("click", () => {
+    explorerSelection = undefined;
     rootExpanded = !rootExpanded;
     renderExplorer();
     explorer.querySelector("button")?.focus();
@@ -155,11 +192,13 @@ function renderExplorer() {
       row.dataset.path = item.path;
       row.style.setProperty("--depth", String(depth));
       row.title = item.path;
+      if (item.path === explorerSelection) row.setAttribute("aria-current", "true");
       row.innerHTML = `<span class="tree-twist">${item.directory ? icon(expanded ? "down" : "chevron") : ""}</span>` +
         (item.directory ? `<span class="tree-folder">${icon(expanded ? "folderOpen" : "folder")}</span>` : fileIcon(item.path));
       row.append(element("span", "tree-name", item.name));
       if (item.directory) row.setAttribute("aria-expanded", String(expanded));
       row.addEventListener("click", () => {
+        explorerSelection = item.path;
         if (!item.directory) { void openFile(item.path); return; }
         if (expanded) opened.delete(item.path); else opened.add(item.path);
         renderExplorer();
@@ -179,7 +218,13 @@ function renderExplorer() {
   explorer.replaceChildren(root, list);
   explorer.scrollTop = scroll;
   if (focused) {
-    const restored = [...list.querySelectorAll<HTMLButtonElement>(".tree-row")].find(row => row.dataset.path === focused.dataset.path);
+    const buttons = [...list.querySelectorAll<HTMLButtonElement>(".tree-row")];
+    let path = focused.dataset.path;
+    let restored: HTMLButtonElement | undefined;
+    while (path && !restored) {
+      restored = buttons.find(row => row.dataset.path === path);
+      path = dirname(path);
+    }
     (restored ?? root).focus({ preventScroll: true });
   }
   byId("module-kind").textContent = snapshot.goWork ? "Go workspace" : snapshot.module ? "Go module" : "Folder";
@@ -207,6 +252,7 @@ async function openFile(path: string, target?: monaco.IRange) {
 
 function renderDocuments() {
   invalidateNavigation();
+  queueEditorSession();
   const tabs = byId("tabs");
   const active = docs.active;
   const scroll = tabs.scrollLeft;
@@ -270,7 +316,7 @@ function renderDocuments() {
   disk.textContent = active?.diskChange ? diskMessage[active.diskChange] : "";
   disk.hidden = !disk.textContent;
   byId("compare-disk").hidden = !project.native || active?.diskChange !== "changed";
-  byId("save-new-path").hidden = !project.native || (active?.diskChange !== "missing" && active?.diskChange !== "unavailable");
+  byId("save-new-path").hidden = !project.native || (!active?.requiresReviewedSave && active?.diskChange !== "missing" && active?.diskChange !== "unavailable");
   updateCursor();
   syncControls();
 }
@@ -285,6 +331,66 @@ function updateCursor() {
 
 function invalidateNavigation() {
   if (navigation && !navigation.current()) navigation.cancel();
+}
+
+async function goToDefinition() {
+  const folder = project.native;
+  const tab = docs.active;
+  const service = lsp;
+  const position = docs.editor.getPosition();
+  if (!folder || !tab || !service || gopls !== "ready" || !position || tab.model.getLanguageId() !== "go") {
+    toast("Open a Go file with gopls running to go to a definition.");
+    return;
+  }
+  if (projectWorkflow.busy || document.querySelector("dialog[open]")) return;
+  navigation?.cancel();
+  const live = captureTab(tab);
+  const version = tab.model.getVersionId();
+  const token = new CancellationTokenSource();
+  const job = {
+    current: () => navigation === job && live() && docs.active === tab && lsp === service && gopls === "ready" &&
+      !projectWorkflow.busy && tab.model.getVersionId() === version && monaco.Position.equals(position, docs.editor.getPosition()),
+    cancel: () => { if (navigation === job) navigation = undefined; token.cancel(); token.dispose(); },
+  };
+  navigation = job;
+  let shown = false;
+  try {
+    const targets = await service.definitions(tab.model, position, token.token);
+    if (!job.current()) return;
+    const local = targets.flatMap(target => {
+      const path = docs.relative(target.uri);
+      return path ? [{ path, range: target.range }] : [];
+    });
+    if (local.length > 1) {
+      docs.editor.trigger("iron-go", "editor.action.revealDefinition", {});
+      return;
+    }
+    if (local.length === 1) {
+      const { path, range } = local[0];
+      await docs.open(path, { focus: true, target: { lineNumber: range.startLineNumber, column: range.startColumn }, current: job.current });
+      return;
+    }
+    let unavailable: Error | undefined;
+    for (const { uri, range } of targets) {
+      if (!uri.path.endsWith(".go")) continue;
+      try {
+        const source = await host.readGoSource(folder.id, uri.path);
+        if (!job.current() || document.querySelector("dialog[open]")) return;
+        await showGoSource(source, range);
+        shown = true;
+        return;
+      } catch (error) {
+        if (!job.current() || document.querySelector("dialog[open]")) return;
+        unavailable ??= new Error(`${uri.path}: ${message(error)}`);
+      }
+    }
+    if (unavailable) throw unavailable;
+    toast("No definition found.");
+  } catch (error) { if (job.current()) showError(error); }
+  finally {
+    if (shown && job.current() && !document.querySelector("dialog[open]")) docs.editor.focus();
+    if (navigation === job) job.cancel();
+  }
 }
 
 function goToLine() {
@@ -450,6 +556,8 @@ function syncControls() {
   byId("debug-controls").hidden = !debug;
   btn("debug-continue").disabled = busy || !debug?.paused;
   btn("debug-next").disabled = busy || !debug?.paused;
+  btn("debug-step-in").disabled = busy || !debug?.paused;
+  btn("debug-step-out").disabled = busy || !debug?.paused;
   btn("debug-stop").disabled = busy || !debug?.canStop;
 }
 
@@ -528,24 +636,40 @@ async function closeTab(tab: DocumentTab) {
   try {
     const choice = await askFileDecision(tab, "close");
     if (!live()) return;
-    if (choice === "discard" || (choice === "save" && await saveDocument(tab) && live(1) && !tab.dirty)) closeDocument(tab, true);
+    if (choice === "discard") {
+      const thaw = projectWorkflow.reserve();
+      if (!thaw) return;
+      try { await drafts.discard(project.native, tab); if (live()) closeDocument(tab, true); }
+      finally { thaw(); }
+    } else if (choice === "save" && await saveDocument(tab) && live(1) && !tab.dirty) closeDocument(tab, true);
   } catch (error) { showError(new Error(`${tab.path}: ${message(error)}`)); }
   finally { release(); }
 }
 
-async function saveActive() {
+function saveFormatter(tab: DocumentTab, enabled: boolean) {
+  if (!enabled || !project.native || !tab.path.endsWith(".go")) return undefined;
+  return async (text: string) => {
+    try { return await host.format(text); }
+    catch (error) { throw new Error(`Could not format the buffer: ${message(error)}. Use Save Without Formatting to keep the original text.`); }
+  };
+}
+
+async function saveActive(useFormatting = true) {
   if (fileActionsBlocked() || !docs.active) return;
   const tab = docs.active;
   const target = project;
   try {
     if (!tab.dirty) { status(`${basename(tab.path)} is saved`); return; }
-    await saveDocument(tab);
-  } catch (error) { if (project === target && docs.active === tab) showError(error); }
+    await saveDocument(tab, { format: saveFormatter(tab, useFormatting && input("format-save-setting").checked) });
+  } catch (error) {
+    if (project === target && docs.tabs.get(tab.path) === tab) showError(new Error(`${tab.path}: ${message(error)}`));
+  }
 }
 
-async function saveDocument(tab: DocumentTab, options: { reviewed?: ReadableDisk; quitTicket?: number } = {}) {
+async function saveDocument(tab: DocumentTab, options: SaveOptions = {}) {
   const target = project;
   if (!await docs.save(tab, options)) return false;
+  await drafts.settled(tab);
   if (project !== target) return true;
   if (docs.active === tab) status(`Saved ${basename(tab.path)}`);
   if (/(^|\/)go\.(mod|work)$/.test(tab.path)) {
@@ -556,8 +680,8 @@ async function saveDocument(tab: DocumentTab, options: { reviewed?: ReadableDisk
   return true;
 }
 
-async function saveAllDocuments(ticket?: number) {
-  const result = await saveDirtyTabs(() => [...docs.tabs.values()], tab => saveDocument(tab, { quitTicket: ticket }),
+async function saveAllDocuments(ticket?: number, format = false) {
+  const result = await saveDirtyTabs(() => [...docs.tabs.values()], tab => saveDocument(tab, { quitTicket: ticket, format: saveFormatter(tab, format) }),
     () => ticket === undefined || ticket > lastExpiredQuitTicket);
   if (result.committed.length) {
     feedback.row(`Saved: ${result.committed.join(", ")}`, "success", "check");
@@ -572,7 +696,7 @@ async function saveAll() {
   if (!release) return;
   try {
     if (!docs.dirty) status("No unsaved files");
-    else await saveAllDocuments();
+    else await saveAllDocuments(undefined, input("format-save-setting").checked);
   } finally { release(); }
 }
 
@@ -595,7 +719,7 @@ async function compareWithDisk() {
     if (!current()) throw staleEditor();
     if (decision.action === "save") await saveDocument(tab, { reviewed: decision.observed });
     else {
-      if (!await docs.reload(tab, decision.observed)) throw staleEditor();
+      if (!await reloadDocument(tab, decision.observed)) throw staleEditor();
       if (docs.active === tab) status(`Reloaded ${basename(tab.path)}`);
     }
   } catch (error) { if (project === target) showError(error); }
@@ -620,6 +744,11 @@ function saveToNewPath() {
       if (project !== target) return false;
       validateRelative(path);
       const rebound = await docs.saveToNew(tab, path);
+      if (rebound && target === project) {
+        drafts.schedule(project.native, rebound, true);
+        await drafts.settled(rebound);
+        if (!rebound.dirty || drafts.recorded(rebound)) await drafts.discard(project.native, tab).catch(showError);
+      }
       if (!rebound) return false;
       revealParents(rebound.path);
       rootExpanded = true;
@@ -628,6 +757,76 @@ function saveToNewPath() {
       status(`Saved ${rebound.path}`);
     },
   });
+}
+
+async function recoverDrafts(manage = false) {
+  const target = project;
+  const folder = manage ? undefined : target.native;
+  const dialog = byId<HTMLDialogElement>("draft-dialog");
+  if ((!folder && !manage) || fileActionsBlocked() || document.querySelector("dialog[open]")) return;
+  const list = byId("draft-list");
+  const note = byId("draft-dialog-note");
+  const current = () => project === target && dialog.open;
+
+  async function load() {
+    note.textContent = "Reading local recovery drafts…";
+    list.replaceChildren();
+    const records = await host.listDrafts(folder?.id);
+    if (!current()) return;
+    note.textContent = manage ? (records.length ? "Remove detached drafts for any project, including projects that no longer exist." : "No detached drafts are stored.") :
+      (records.length ? "Choose a draft to recover as an unsaved buffer. Detached drafts can also be removed." : "No drafts were recorded for this project.");
+    for (const draft of records) {
+      const row = element("div", "draft-row");
+      if (folder) {
+        const recover = element("button", "button quiet", draft.path);
+        recover.type = "button";
+        recover.addEventListener("click", () => { void restore(folder, draft).catch(report); });
+        row.append(recover);
+      } else row.append(element("span", "view-note", `${draft.projectPath}/${draft.path}`));
+      row.append(element("span", "view-note", `${new Date(draft.modified).toLocaleString()} · ${draft.detached ? "Detached writer" : "Open writer"}`));
+      if (draft.detached) {
+        const remove = element("button", "button quiet", "Remove Draft");
+        remove.type = "button";
+        remove.addEventListener("click", () => {
+          if (remove.dataset.confirm !== "true") {
+            remove.dataset.confirm = "true";
+            remove.textContent = "Confirm Removal";
+            return;
+          }
+          remove.disabled = true;
+          void host.removeDraft(folder?.id, draft).then(load).catch(error => { remove.disabled = false; report(error); });
+        });
+        row.append(remove);
+      }
+      list.append(row);
+    }
+  }
+
+  function report(error: unknown) { if (current()) note.textContent = message(error); else if (project === target) showError(error); }
+
+  async function restore(folder: NativeFolder, draft: DraftItem) {
+    const { payload, observed } = await host.recoverDraft(folder.id, draft);
+    if (!current()) return;
+    if (observed.kind === "retry") throw new Error("This file changed while reading. Try recovering again.");
+    const tab = docs.tabs.get(draft.path);
+    if (tab?.dirty) {
+      const live = captureTab(tab);
+      dialog.close();
+      await showDiskComparison({ path: draft.path, language: tab.model.getLanguageId(), buffer: bufferText(tab.model), dirty: false,
+        readOnly: { original: "Recovery draft", modified: "Open editor" }, current: live,
+        load: async () => ({ kind: "text", text: payload.text, version: payload.version }) });
+      if (live()) docs.editor.focus();
+      return;
+    }
+    docs.recover(draft.path, payload.text, { kind: "text", text: payload.baseline, version: payload.version }, observed);
+    dialog.close();
+    docs.editor.focus();
+    status(`Recovered ${draft.path} as an unsaved buffer`);
+  }
+
+  byId("draft-title").textContent = manage ? "Manage Recovery Drafts" : "Recover Drafts";
+  dialog.showModal();
+  await load().catch(report);
 }
 
 async function reloadActive() {
@@ -639,10 +838,19 @@ async function reloadActive() {
   const live = captureTab(tab);
   try {
     if (tab.dirty && await askFileDecision(tab, "reload") !== "discard") return;
-    if (live() && await docs.reload(tab) && project === target && docs.active === tab) status(`Reloaded ${basename(tab.path)}`);
+    if (live() && await reloadDocument(tab) && project === target && docs.active === tab) status(`Reloaded ${basename(tab.path)}`);
   }
   catch (error) { if (project === target && docs.active === tab) showError(error); }
   finally { release(); }
+}
+
+async function reloadDocument(tab: DocumentTab, reviewed?: ReadableDisk) {
+  if (!project.native || !tab.dirty) return docs.reload(tab, reviewed);
+  const folder = project.native;
+  const thaw = projectWorkflow.reserve();
+  if (!thaw) return false;
+  try { return await docs.reload(tab, reviewed, () => drafts.discard(folder, tab, reviewed)); }
+  finally { thaw(); }
 }
 
 async function formatActive() {
@@ -742,6 +950,7 @@ function renameGoSymbol() {
 }
 
 function refresh() {
+  if (mutatingPaths) return Promise.resolve(false);
   return snapshots.refresh(project, {
     current: () => project,
     read: target => target.snapshot(),
@@ -772,7 +981,7 @@ function watchProject(target: Project) {
   let running: Promise<void> | undefined;
 
   function request(tree = false) {
-    if (project !== target) return Promise.resolve();
+    if (project !== target || mutatingPaths) return Promise.resolve();
     pending = true;
     treePending ||= tree;
     return running ??= reconcile();
@@ -817,16 +1026,60 @@ function watchProject(target: Project) {
   });
 }
 
+function queueEditorSession() {
+  if (!project.native || restoringSession || failedSessionRestore === project) return;
+  sessionDirty = true;
+  clearTimeout(sessionTimer);
+  if (import.meta.env.VITE_IRON_E2E === "1" && holdSessionDebounce) return;
+  if (!sessionWrite) sessionTimer = window.setTimeout(() => { void flushEditorSession(); }, 280);
+}
+
+async function flushEditorSession(quitTicket?: number) {
+  clearTimeout(sessionTimer);
+  sessionDirty = false;
+  const folder = project.native;
+  if (!folder || restoringSession || failedSessionRestore === project) return;
+  const snapshot = docs.captureSession();
+  const revision = ++sessionRevision;
+  await sessionWrite;
+  if (project.native !== folder || revision !== sessionRevision || (quitTicket !== undefined && quitTicket <= lastExpiredQuitTicket)) return;
+  const write = host.writeEditorSession(folder.id, revision, snapshot, quitTicket).catch(error => {
+    if (project.native === folder && (quitTicket === undefined || quitTicket > lastExpiredQuitTicket)) showError(error);
+  });
+  sessionWrite = write;
+  try { await write; }
+  finally {
+    if (sessionWrite === write) sessionWrite = undefined;
+    if (sessionDirty) queueEditorSession();
+  }
+}
+
 async function install(target: Project) {
+  const generation = ++sessionInstall;
+  clearTimeout(sessionTimer);
+  sessionDirty = false;
+  restoringSession = true;
+  try { await installProject(target); }
+  finally {
+    if (sessionInstall === generation) { restoringSession = false; queueEditorSession(); }
+  }
+}
+
+async function installProject(target: Project) {
   navigation?.cancel();
-  btn("references-tab").hidden = true;
+  feedback.hide("references");
   execution.retire()?.retire();
+  terminal.reset();
+  renderDebugInspection();
   clearExecutionLine();
   breakpoints.reset();
   const previousLsp = lsp;
   refreshDisk = undefined;
   lsp = undefined;
   project = target;
+  explorerSelection = undefined;
+  failedSessionRestore = undefined;
+  drafts.reset();
   previousLsp?.dispose();
   runTargets.reset(target);
   gopls = "idle";
@@ -847,13 +1100,20 @@ async function install(target: Project) {
   btn("quick-open").title = `${commandName} (⌘P)`;
   btn("quick-open").setAttribute("aria-label", commandName);
   feedback.clear();
+  feedback.clearTests();
   if (target.welcome) feedback.toggle(false); else feedback.show("output");
   chooseView("explorer", false);
   status("Opening workspace…");
-  await refresh();
+  const indexed = await refresh();
   if (target !== project) return;
   if (target.native) void runTargets.refresh();
-  const initial = initialWorkspaceFile(snapshot.entries);
+  const saved = target.native?.editorSession;
+  if (!indexed) failedSessionRestore = target;
+  const restored = saved && indexed ? await docs.restoreSession(saved,
+    new Set(snapshot.entries.filter(entry => !entry.directory).map(entry => entry.path)), () => project === target) : undefined;
+  if (target !== project) return;
+  if (restored?.opened && docs.active) revealParents(docs.active.path);
+  const initial = restored?.opened ? undefined : initialWorkspaceFile(snapshot.entries);
   if (initial) {
     try { await docs.open(initial); revealParents(initial); }
     catch (error) { if (target === project) showError(error); }
@@ -868,6 +1128,8 @@ async function install(target: Project) {
   updateTools();
   maybeStartLsp();
   watchProject(target);
+  if (target.native?.recentError) showError(target.native.recentError);
+  else if (restored?.skipped) toast(`Skipped ${restored.skipped} missing or unavailable ${restored.skipped === 1 ? "editor tab" : "editor tabs"}.`);
 }
 
 const transitionReady = () => !filesBusy() && !execution.preparing;
@@ -877,6 +1139,7 @@ async function confirmTransition() {
     docs.dirty && "This project has unsaved edits.",
     execution.task && "The current Go task will be stopped.",
     execution.debug && "The debug session will be stopped.",
+    terminal.active && "The active terminal and its foreground job will be stopped.",
   ].filter(Boolean);
   if (!warnings.length) return true;
   const dialog = byId<HTMLDialogElement>("project-transition-dialog");
@@ -890,7 +1153,8 @@ async function confirmTransition() {
 }
 
 function changeProject(choose: () => Promise<Project | undefined>) {
-  return projectWorkflow.transition({ ready: transitionReady, confirm: confirmTransition, choose, install });
+  return projectWorkflow.transition({ ready: transitionReady, confirm: confirmTransition,
+    choose: async () => { await flushEditorSession(); return choose(); }, install });
 }
 
 function openFolder() {
@@ -899,7 +1163,7 @@ function openFolder() {
     return;
   }
   void changeProject(async () => {
-    const folder = await host.open();
+    const folder = await host.open(drafts.plan(project.native));
     return folder ? nativeProject(folder) : undefined;
   }).catch(showError);
 }
@@ -908,9 +1172,58 @@ function closeProject() {
   const target = project;
   if (target.welcome) return;
   void changeProject(async () => {
-    if (target.native) await host.close(target.native.id);
+    if (target.native) await host.close(target.native.id, drafts.plan(target.native));
     return welcomeProject();
   }).catch(showError);
+}
+
+async function showRecentProjects() {
+  if (!desktop || projectWorkflow.busy || document.querySelector("dialog[open]")) return;
+  const dialog = byId<HTMLDialogElement>("recent-dialog");
+  const list = byId("recent-list");
+  const note = byId("recent-note");
+  const clear = btn("clear-recent");
+  let reading = 0;
+  const report = (error: unknown) => { if (dialog.open) note.textContent = message(error); };
+  const forget = async (control: HTMLButtonElement, entry?: string) => {
+    if (control.dataset.confirm !== "true") {
+      control.dataset.confirm = "true";
+      control.textContent = entry ? "Confirm Removal" : "Confirm Clear History";
+      return;
+    }
+    control.disabled = true;
+    try { await host.forgetRecent(entry); await load(); }
+    catch (error) { report(error); }
+    finally { control.disabled = false; }
+  };
+  async function load() {
+    const revision = ++reading;
+    list.replaceChildren();
+    note.textContent = "Reading recent projects…";
+    delete clear.dataset.confirm;
+    clear.textContent = "Clear History";
+    const projects = await host.listRecent();
+    if (!dialog.open || reading !== revision) return;
+    note.textContent = projects.length ? "Choose a project to reopen its last saved editor session." : "No recent projects.";
+    for (const entry of projects) {
+      const row = element("div", "draft-row");
+      const open = element("button", "button quiet recent-open", entry.name);
+      open.title = entry.path;
+      open.addEventListener("click", () => {
+        dialog.close();
+        void changeProject(async () => nativeProject(await host.openRecent(entry.id, drafts.plan(project.native)))).catch(showError);
+      });
+      const remove = element("button", "button quiet recent-remove", "Remove from Recent");
+      remove.addEventListener("click", () => { void forget(remove, entry.id); });
+      row.append(open, element("span", "view-note", entry.path), remove);
+      list.append(row);
+    }
+  }
+  const clearHistory = () => { void forget(clear); };
+  clear.addEventListener("click", clearHistory);
+  dialog.addEventListener("close", () => clear.removeEventListener("click", clearHistory), { once: true });
+  dialog.showModal();
+  await load().catch(report);
 }
 
 function newModule() {
@@ -923,7 +1236,7 @@ function newModule() {
     ],
     async run({ name, module }) {
       return changeProject(async () => {
-        const folder = await host.create(name, module);
+        const folder = await host.create(name, module, drafts.plan(project.native));
         return folder ? nativeProject(folder) : undefined;
       });
     },
@@ -952,6 +1265,98 @@ function newFile() {
   });
 }
 
+async function fileOperation(kind: "folder" | "rename" | "move" | "trash") {
+  const folder = project.native;
+  if (!folder || projectWorkflow.busy || fileActionsBlocked() || filesBusy() || execution.occupied) return;
+  const selected = snapshot.entries.find(entry => entry.path === explorerSelection);
+  const source = selected?.path ?? docs.active?.path;
+  if (kind !== "folder" && !source) { toast("Select an Explorer item or open a file first."); return; }
+  const confirmed = kind === "folder" ? undefined : await host.inspectFileOperation(folder.id, source!);
+  if (project.native !== folder) return;
+  const release = reserveFileActivity();
+  if (!release) return;
+  const parent = selected?.directory ? selected.path : source ? dirname(source) : "";
+  const dirty = source ? [...docs.tabs.values()].filter(tab => tab.dirty && inPath(tab.path, source)).length : 0;
+  byId("form-dialog").addEventListener("close", release, { once: true });
+  const verb = kind === "folder" ? "New Folder" : kind === "rename" ? "Rename" : kind === "move" ? "Move" : "Move to Trash";
+  forms.show({
+    title: verb,
+    description: kind === "folder" ? "Create a folder at a workspace-relative path." :
+      `${verb} ${source}.${kind === "trash" && dirty ? ` This discards unsaved edits in ${dirty} ${dirty === 1 ? "buffer" : "buffers"}.` : ""}`,
+    submit: kind === "trash" && dirty ? "Discard and Move to Trash" : verb,
+    fields: kind === "trash" ? [] : [{ name: "destination", label: kind === "rename" ? "New name" : "Workspace-relative path",
+      value: kind === "rename" ? basename(source!) : kind === "folder" && parent ? `${parent}/` : undefined }],
+    async run({ destination }) {
+      if (project.native !== folder || execution.occupied) return false;
+      if (kind === "trash") return mutateFiles(folder, { kind: "trash", source: source!, version: confirmed!.version, revision: drafts.plan(folder)!.revision });
+      if (kind === "rename" && destination.includes("/")) throw new Error("Enter a name without a folder path.");
+      const path = kind === "rename" && dirname(source!) ? `${dirname(source!)}/${destination}` : destination;
+      validateRelative(path);
+      if (kind === "folder") return mutateFiles(folder, { kind: "new_folder", path });
+      return mutateFiles(folder, { kind: "move", source: source!, destination: path, version: confirmed!.version,
+        revision: drafts.plan(folder)!.revision, baselines: [] });
+    },
+  });
+}
+
+async function mutateFiles(folder: NativeFolder, operation: WorkspaceMutation) {
+  const release = projectWorkflow.reserve();
+  if (!release) return false;
+  const resumeDrafts = drafts.freeze();
+  let releasePaths: (() => void) | undefined;
+  let affected: DocumentTab[] = [];
+  mutatingPaths = true;
+  snapshots.invalidate();
+  navigation?.cancel();
+  cursorTestLookup.invalidate();
+  try {
+    if (operation.kind !== "new_folder") {
+      const reservation = docs.reservePaths(operation.source, operation.kind === "move" ? operation.destination : undefined);
+      affected = reservation.affected;
+      releasePaths = reservation.release;
+      if (operation.kind === "move") {
+        operation.baselines = affected.flatMap(tab => tab.diskVersion ? [{ path: tab.path, version: tab.diskVersion }] : []);
+      }
+    }
+    const { outcome, warning } = await host.mutateWorkspace(folder.id, operation);
+    if (folder !== project.native) return false;
+    if (operation.kind !== "new_folder") drafts.forget(affected);
+    if (outcome.kind === "moved" && operation.kind === "move") {
+      breakpoints.rebind(operation.source, outcome.path);
+      const rebound = docs.rebindPaths(operation.source, outcome.path, outcome.versions, affected);
+      for (const tab of rebound) drafts.schedule(folder, tab, true);
+      const mapped = [...opened].filter(path => inPath(path, operation.source));
+      for (const path of mapped) { opened.delete(path); opened.add(`${outcome.path}${path.slice(operation.source.length)}`); }
+      explorerSelection = outcome.path;
+      revealParents(outcome.path);
+      status(`Moved ${operation.source} to ${outcome.path}`);
+    } else if (outcome.kind === "trashed" && operation.kind === "trash") {
+      for (const tab of affected) docs.close(tab, { focus: false });
+      breakpoints.rebind(operation.source);
+      for (const path of [...opened]) if (inPath(path, operation.source)) opened.delete(path);
+      explorerSelection = undefined;
+      status(`Moved ${operation.source} to Trash`);
+    } else if (outcome.kind === "stranded" || outcome.kind === "unverified_move") {
+      docs.requirePathReview(affected);
+      for (const tab of affected) drafts.schedule(folder, tab, true);
+      showError(outcome.kind === "stranded" ? `Trash did not complete. The original item is at ${outcome.path}. ${outcome.error}` :
+        `The rename ran but its destination could not be verified at ${outcome.path}. Open buffers and drafts were retained. ${outcome.error}`);
+    } else if (outcome.kind === "folder") {
+      explorerSelection = outcome.path;
+      revealParents(outcome.path);
+      status(`Created ${outcome.path}`);
+    }
+    if (warning) showError(warning);
+    return true;
+  } finally {
+    mutatingPaths = false;
+    releasePaths?.();
+    resumeDrafts();
+    release();
+    if (folder === project.native) { await refresh(); void refreshDisk?.(); void runTargets.refresh(); }
+  }
+}
+
 function chooseView(next: View, focus = true) {
   const reopen = workbench.classList.contains("sidebar-closed");
   showSidebar(true);
@@ -963,7 +1368,42 @@ function chooseView(next: View, focus = true) {
     byId(`${button.dataset.view}-view`).hidden = !active;
   }
   if (next === "search") { scheduleSearch(); if (focus || reopen) input("search-text").focus(); }
+  else if (next === "explorer" && (focus || reopen)) {
+    const rows = explorerButtons();
+    (rows.find(row => row.dataset.path === (explorerSelection ?? docs.active?.path)) ?? rows[0])?.focus();
+  }
 }
+
+function explorerButtons() { return [...byId("explorer").querySelectorAll<HTMLButtonElement>("button")]; }
+
+byId("explorer").addEventListener("keydown", event => {
+  if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || projectWorkflow.busy) return;
+  const rows = explorerButtons();
+  const at = rows.findIndex(row => row === event.target);
+  if (at < 0) return;
+  const row = rows[at];
+  let next: HTMLButtonElement | undefined;
+  switch (event.key) {
+    case "ArrowUp": next = rows[Math.max(at - 1, 0)]; break;
+    case "ArrowDown": next = rows[Math.min(at + 1, rows.length - 1)]; break;
+    case "Home": next = rows[0]; break;
+    case "End": next = rows.at(-1); break;
+    case "ArrowRight":
+      if (row.getAttribute("aria-expanded") === "false") row.click();
+      else if (row.getAttribute("aria-expanded") === "true") {
+        const child = rows[at + 1];
+        if (child && (!row.dataset.path || child.dataset.path?.startsWith(`${row.dataset.path}/`))) next = child;
+      }
+      break;
+    case "ArrowLeft":
+      if (row.getAttribute("aria-expanded") === "true") row.click();
+      else if (row.dataset.path) next = rows.find(parent => parent.dataset.path === dirname(row.dataset.path!)) ?? rows[0];
+      break;
+    default: return;
+  }
+  event.preventDefault();
+  next?.focus();
+});
 
 function showSidebar(visible: boolean) {
   workbench.classList.toggle("sidebar-closed", !visible);
@@ -1012,7 +1452,7 @@ function searchRow(result: FileMatch) {
   return row;
 }
 
-async function runTask(kind: TaskKind, singleTest?: { path: string; name: string }) {
+async function runTask(kind: TaskKind, singleTest?: { path: string; name: string }, rerun?: { package: string; importPath: string; name: string }) {
   if (execution.occupied || projectWorkflow.busy || filesBusy()) return;
   const target = project.native;
   if (!target) {
@@ -1021,22 +1461,41 @@ async function runTask(kind: TaskKind, singleTest?: { path: string; name: string
   }
   if (!tools?.goVersion) { toast("Install Go, then check the toolchain in Settings.", true); return; }
   let packages: string[];
+  let configured: ReturnType<RunTargets["configuredLaunch"]>;
   try {
-    packages = singleTest ? [packageForFile(singleTest.path)]
-      : kind === "run" ? runTargets.runArguments() : runTargets.buildTestArguments(docs.active?.path);
+    configured = kind === "run" ? runTargets.configuredLaunch() : undefined;
+    packages = rerun ? [rerun.package] : singleTest ? [packageForFile(singleTest.path)]
+      : configured ? [configured.package] : kind === "run" ? runTargets.runArguments() : runTargets.buildTestArguments(docs.active?.path);
   } catch (error) { showError(error); return; }
   feedback.show("output");
   status(`Preparing Go ${kind}…`);
+  const packagePaths = runTargets.testPackagePaths();
+  const testContext = kind === "test" ? {
+    expected: rerun && { package: rerun.importPath, name: rerun.name },
+    rerun(importPath: string, name: string) {
+      const directory = packagePaths.get(importPath);
+      const parts = name.split("/");
+      const root = parts[0];
+      const suffix = root.startsWith("Test") ? root.slice(4) : undefined;
+      const encoder = new TextEncoder();
+      if (!directory || directory.includes("...") || suffix === undefined || /^\p{Ll}/u.test(suffix) ||
+          !/^[\p{Alphabetic}\p{Number}_]*$/u.test(suffix) || /\p{Cc}/u.test(name) || parts.length > 32 ||
+          encoder.encode(name).length > 1024 || encoder.encode(root).length > 200) return;
+      return () => {
+        if (project.native === target) void runTask("test", undefined, { package: directory, importPath, name });
+      };
+    },
+  } : undefined;
   try {
-    await execution.start(target, kind, saveBarrier, token => host.task(target.id, kind, packages, singleTest?.name, event => {
+    await execution.start(target, kind, saveBarrier, token => host.task(target.id, kind, packages, rerun?.name ?? singleTest?.name, event => {
       if (project.native !== target || !execution.taskEvent(token, event.type)) return;
-      const result = feedback.task(event);
+      const result = feedback.task(event, testContext);
       if (event.type === "started") {
         status(`Go ${kind} running…`);
       } else if (event.type === "finished") {
         status(result ?? "Ready");
       }
-    }));
+    }, configured?.launch, rerun?.importPath));
   } catch (error) {
     if (project.native !== target) return;
     status(`Go ${kind} not started`);
@@ -1050,6 +1509,16 @@ function clearExecutionLine() {
   executionLine = undefined;
 }
 
+function renderDebugInspection(state?: DebugInspectionState) {
+  const tab = byId("debug-tab");
+  const focused = document.activeElement;
+  debugInspection.render(state);
+  if (state && tab.hidden) {
+    tab.hidden = false;
+    feedback.show("debug");
+  } else if (!state && !tab.hidden) feedback.hide("debug", focused && !focused.isConnected ? tab : focused);
+}
+
 function toggleBreakpoint(line = docs.editor.getPosition()?.lineNumber) {
   const tab = docs.active;
   if (projectWorkflow.busy || !project.native || !tab?.path.endsWith(".go") || !line) return;
@@ -1059,39 +1528,68 @@ function toggleBreakpoint(line = docs.editor.getPosition()?.lineNumber) {
   if (debug?.ready) void debug.setBreakpoints(tab.path).catch(error => { if (execution.debug === debug) showError(error); });
 }
 
-async function debugTest(path: string, name: string) {
+function debugTest(path: string, name: string) { return startDebug({ path, name }); }
+
+async function debugProgram() {
+  if (!project.native || execution.occupied || projectWorkflow.busy || filesBusy()) return;
+  if (!tools?.goVersion) { toast("Install Go, then check the toolchain in Settings.", true); return; }
+  try {
+    const configured = runTargets.configuredLaunch();
+    const packageName = configured?.package ?? runTargets.runArguments()[0];
+    await startDebug({ package: packageName, launch: configured?.launch ?? { directory: ".", args: [], environment: {} } });
+  } catch (error) { showError(error); }
+}
+
+async function startDebug(target: { path: string; name: string } | { package: string; launch: RunLaunch }) {
   const folder = project.native;
   if (!folder || execution.occupied || projectWorkflow.busy || filesBusy()) return;
   if (!tools?.delve) {
     toast("Install Delve with `brew install delve`, then select Check tools in Settings.", true);
     return;
   }
+  const name = "package" in target ? target.package : target.name;
   try {
     await execution.start(folder, "debug", saveBarrier, async token => {
       const isCurrent = () => execution.owns(token) && project.native === folder;
       const session = new DebugSession(folder, breakpoints, {
         isCurrent,
         admitted() { if (isCurrent()) syncControls(); },
-        paused(file, line, reason, currentPause) {
-          const current = () => isCurrent() && currentPause();
+        pauseReady() {
+          if (!isCurrent()) return;
+          clearExecutionLine();
+          status("Paused — loading call stack…");
+          syncControls();
+        },
+        inspection(state) {
+          if (isCurrent()) renderDebugInspection(state);
+        },
+        paused(file, line, reason, currentSelection, focus) {
+          const current = () => isCurrent() && currentSelection();
           if (!current()) return;
           void (async () => {
             clearExecutionLine();
-            const tab = file ? await docs.open(file, { focus: true, target: { lineNumber: line, column: 1 }, current }).catch(() => undefined) : undefined;
+            const indexed = file && snapshot.entries.some(entry => entry.path === file && !entry.directory);
+            const tab = indexed && line >= 1 ? await docs.open(file, { focus, target: { lineNumber: line, column: 1 }, current }).catch(() => undefined) : undefined;
             if (!current()) return;
-            if (tab) {
+            const prefix = reason === "breakpoint" ? "Breakpoint hit" : "Paused";
+            if (tab && line <= tab.model.getLineCount()) {
               const ids = tab.model.deltaDecorations([], [{ range: new monaco.Range(line, 1, line, 1), options: { isWholeLine: true, className: "debug-execution-line" } }]);
               executionLine = { model: tab.model, ids };
+              status(`${prefix} — ${basename(tab.path)}:${line}`);
+            } else {
+              status(`${prefix} — source unavailable`);
             }
-            const prefix = reason === "breakpoint" ? "Breakpoint hit" : "Paused";
-            status(`${prefix}${file ? ` — ${basename(file)}:${line}` : " outside project source"}`);
-            syncControls();
           })();
         },
         running() {
           if (!isCurrent()) return;
           clearExecutionLine();
           status(`Debugging ${name}…`);
+          syncControls();
+        },
+        closing() {
+          if (!isCurrent()) return;
+          clearExecutionLine();
           syncControls();
         },
         finished(reason) {
@@ -1102,21 +1600,55 @@ async function debugTest(path: string, name: string) {
           feedback.row(reason, reason.startsWith("Debug failed") ? "error" : "quiet");
         },
         output(value) { if (isCurrent() && value.trim()) feedback.row(value.trimEnd()); },
+        build(event) { if (isCurrent()) feedback.task(event); },
+        stopError(error) { if (isCurrent()) { showError(error); syncControls(); } },
       });
       if (!execution.attachDebug(token, session)) return;
       feedback.clear();
       feedback.show("output");
       feedback.row(`Launching ${name} with Delve…`, "command", "command");
       status(`Launching ${name}…`);
-      await session.start(path, name);
+      if ("package" in target) await session.startProgram(target.package, target.launch);
+      else await session.start(target.path, target.name);
     });
   } catch (error) { if (project.native === folder) showError(error); }
 }
 
 async function stopTask() {
   if (projectWorkflow.busy) return;
-  try { await execution.stopTask(target => host.stop(target.id)); }
+  try { await execution.stopTask(target => terminal.isGo(target) ? terminal.stop() : host.stop(target.id)); }
   catch (error) { showError(error); }
+}
+
+async function startShell() {
+  const folder = project.native;
+  if (!folder || projectWorkflow.busy) return;
+  await terminal.start(folder, { kind: "shell" });
+}
+
+async function runInTerminal() {
+  const folder = project.native;
+  if (!folder || execution.occupied || projectWorkflow.busy || filesBusy()) return;
+  if (terminal.active) { toast("Close the active terminal before starting a Go program there."); return; }
+  if (!tools?.goVersion) { toast("Install Go, then check the toolchain in Settings.", true); return; }
+  const configured = runTargets.configuredLaunch();
+  const packageName = configured?.package ?? runTargets.runArguments()[0];
+  const launch = configured?.launch ?? { directory: ".", args: [], environment: {} };
+  await execution.start(folder, "run", saveBarrier, token => terminal.start(folder, { kind: "go", package: packageName, launch }, {
+    started() { if (execution.taskEvent(token, "started")) status("Go program owns the terminal…"); },
+    build(event) { if (execution.owns(token)) feedback.task(event); },
+    closed(reason) { if (execution.taskEvent(token, "finished")) status(reason); },
+  }));
+}
+
+async function closeTerminal() {
+  if (projectWorkflow.busy || document.querySelector("dialog[open]")) return;
+  if (!terminal.active) { await terminal.stop(true); return; }
+  const dialog = byId<HTMLDialogElement>("terminal-close-dialog");
+  dialog.returnValue = "cancel";
+  const chosen = new Promise<string>(resolve => dialog.addEventListener("close", () => resolve(dialog.returnValue), { once: true }));
+  dialog.showModal();
+  if (await chosen === "close") await terminal.stop(true);
 }
 
 async function testAtCursor(kind: "run" | "debug") {
@@ -1193,7 +1725,22 @@ function createGoLanguage(folder: NativeFolder) {
   return service;
 }
 
-function showSettings() { byId<HTMLDialogElement>("settings-dialog").showModal(); }
+function showSettings(trigger?: HTMLElement) {
+  const dialog = byId<HTMLDialogElement>("settings-dialog");
+  if (dialog.open) return;
+  const previous = document.activeElement;
+  const initiator = trigger ?? previous;
+  const fromEditor = byId("editor").contains(initiator);
+  dialog.addEventListener("close", () => {
+    const focused = document.activeElement;
+    if (focused && focused !== document.body && focused !== previous && focused !== initiator && !dialog.contains(focused)) return;
+    if (fromEditor && docs.active) docs.editor.focus();
+    else if (initiator instanceof HTMLElement && initiator !== document.body && initiator.isConnected && !initiator.closest("[hidden]")) initiator.focus();
+    else if (docs.active) docs.editor.focus();
+    else btn("settings").focus();
+  }, { once: true });
+  dialog.showModal();
+}
 
 function refreshProject() {
   if (projectWorkflow.busy || project.welcome) return;
@@ -1205,18 +1752,30 @@ function refreshProject() {
 function showPalette(command = false, workspaceOnly = false) {
   const actions: { label: string; detail?: string; icon: Icon; run(): void; workspace?: boolean }[] = [
     { label: "Open Project…", detail: "⌘O", icon: "folderOpen", run: openFolder, workspace: true },
+    ...(desktop ? [{ label: "Open Recent…", icon: "folder" as const, run: showRecentProjects, workspace: true }] : []),
     { label: "New Project…", icon: "package", run: newModule, workspace: true },
     { label: "Close Project", icon: "close", run: closeProject, workspace: true },
     { label: "Next Editor", detail: "⇧⌘]", icon: "files", run: () => cycleEditor(1) },
     { label: "Previous Editor", detail: "⇧⌘[", icon: "files", run: () => cycleEditor(-1) },
     { label: "New File…", icon: "filePlus", run: newFile, workspace: true },
+    ...(project.native ? [
+      { label: "New Folder…", icon: "folder" as const, run: () => { void fileOperation("folder").catch(showError); }, workspace: true },
+      { label: "Rename File or Folder…", icon: "file" as const, run: () => { void fileOperation("rename").catch(showError); }, workspace: true },
+      { label: "Move File or Folder…", icon: "files" as const, run: () => { void fileOperation("move").catch(showError); }, workspace: true },
+      { label: "Move to Trash…", icon: "trash" as const, run: () => { void fileOperation("trash").catch(showError); }, workspace: true },
+    ] : []),
     { label: "Refresh Project", icon: "refresh", run: refreshProject, workspace: true },
     { label: "Collapse Folders", icon: "folder", run: () => { opened.clear(); renderExplorer(); }, workspace: true },
     { label: "Search Saved Files", detail: "⇧⌘F", icon: "search", run: () => chooseView("search") },
     { label: "Go to Line…", icon: "search", run: goToLine },
     { label: "Go to Symbol in File…", icon: "search", run: () => { void goNavigation("symbols"); } },
+    { label: "Go to Definition", detail: "F12", icon: "search", run: goToDefinition },
+    { label: "Debug Go Program", icon: "play", run: debugProgram },
+    ...(project.native ? [{ label: "Recover Drafts…", icon: "file" as const, run: () => { void recoverDrafts(); } }] : []),
+    ...(desktop ? [{ label: "Manage Recovery Drafts…", icon: "file" as const, run: () => { void recoverDrafts(true); } }] : []),
     { label: "Find References", icon: "search", run: () => { void goNavigation("references"); } },
     { label: "Save File", detail: "⌘S", icon: "save", run: saveActive },
+    { label: "Save Without Formatting", icon: "save", run: () => { void saveActive(false); } },
     { label: "Save All", icon: "save", run: saveAll },
     { label: "Reload File from Disk", icon: "refresh", run: reloadActive },
     ...(project.native && docs.active ? [{ label: "Compare with Disk", icon: "files" as const, run: compareWithDisk }] : []),
@@ -1225,6 +1784,11 @@ function showPalette(command = false, workspaceOnly = false) {
     { label: "Go: Organize Imports", icon: "format", run: organizeImports },
     { label: "Go: Rename Symbol…", icon: "files", run: renameGoSymbol },
     { label: "Go: Run Selected Target", detail: "⌘↵", icon: "play", run: () => { void runTask("run"); } },
+    ...(project.native ? [
+      { label: "Start Shell", icon: "terminal" as const, run: () => { void startShell().catch(showError); } },
+      { label: "Run Go Program in Terminal", icon: "terminal" as const, run: () => { void runInTerminal().catch(showError); } },
+      { label: "Close Terminal", icon: "close" as const, run: () => { void closeTerminal().catch(showError); } },
+    ] : []),
     { label: "Go: Choose Run Target", icon: "package", run: () => runTargets.picker.focus() },
     { label: "Go: Build Packages", icon: "hammer", run: () => { void runTask("build"); } },
     { label: "Go: Run Tests", icon: "flask", run: () => { void runTask("test"); } },
@@ -1298,6 +1862,7 @@ function bindEditorTypography() {
     if (size.validity.valid && Number.isInteger(size.valueAsNumber)) fontSize = size.valueAsNumber;
     size.value = String(fontSize);
     docs.editor.updateOptions(editorTypography(font.value, fontSize));
+    if (docs.active) docs.refreshView();
   }
   function save() {
     apply();
@@ -1320,10 +1885,15 @@ function bindEditorTypography() {
 function bindSettings() {
   bindColorTheme();
   bindEditorTypography();
+  byId("settings-dialog").addEventListener("close", () => {
+    if (docs.active) docs.refreshView();
+  });
   const options = [
     { field: "minimap-setting", enabled: true },
     { field: "wrap-setting", enabled: false },
+    { field: "format-save-setting", enabled: false },
   ];
+  input("format-save-setting").disabled = !desktop;
   for (const option of options) {
     try { input(option.field).checked = (localStorage.getItem(`irongo.${option.field}`) ?? String(option.enabled)) === "true"; }
     catch { input(option.field).checked = option.enabled; }
@@ -1349,20 +1919,18 @@ byId("welcome-new").addEventListener("click", newModule);
 byId("toggle-sidebar").addEventListener("click", toggleSidebar);
 byId("new-file").addEventListener("click", newFile);
 byId("format").addEventListener("click", formatActive);
-byId("save").addEventListener("click", saveActive);
+byId("save").addEventListener("click", () => { void saveActive(); });
 byId("compare-disk").addEventListener("click", compareWithDisk);
 byId("save-new-path").addEventListener("click", saveToNewPath);
 byId("close-references").addEventListener("click", () => {
   navigation?.cancel();
-  btn("references-tab").hidden = true;
-  feedback.show("output");
-  btn("output-tab").focus();
+  feedback.hide("references");
 });
 const runOrStop = () => execution.task ? stopTask() : runTask(runTargets.primaryAction());
 byId("run").addEventListener("click", runOrStop);
 byId("panel-stop").addEventListener("click", stopTask);
 byId("stop-task").addEventListener("click", stopTask);
-byId("settings").addEventListener("click", showSettings);
+byId("settings").addEventListener("click", () => showSettings(btn("settings")));
 byId("probe-tools").addEventListener("click", probeTools);
 monaco.editor.addCommand({ id: runTestCommand, run: (_accessor, id: number, path: string, name: string) => {
   if (project.native?.id === id && docs.active?.path === path && path.endsWith("_test.go")) {
@@ -1379,6 +1947,8 @@ docs.editor.onMouseDown(event => {
 });
 byId("debug-continue").addEventListener("click", () => { void execution.debug?.resume("continue"); });
 byId("debug-next").addEventListener("click", () => { void execution.debug?.resume("next"); });
+byId("debug-step-in").addEventListener("click", () => { void execution.debug?.resume("stepIn"); });
+byId("debug-step-out").addEventListener("click", () => { void execution.debug?.resume("stepOut"); });
 byId("debug-stop").addEventListener("click", () => { void execution.debug?.stop(); syncControls(); });
 input("search-text").addEventListener("input", scheduleSearch);
 byId("search-case").addEventListener("click", event => {
@@ -1434,10 +2004,20 @@ document.addEventListener("keydown", event => {
   if (apply) { event.preventDefault(); event.stopPropagation(); void apply(); }
 }, true);
 
-docs.editor.onDidChangeCursorPosition(() => { updateCursor(); invalidateNavigation(); });
+docs.editor.onDidChangeCursorPosition(() => { updateCursor(); invalidateNavigation(); queueEditorSession(); });
+docs.editor.onDidScrollChange(event => { if (event.scrollTopChanged) queueEditorSession(); });
+byId("welcome-recent").hidden = !desktop;
+byId("welcome-recent").addEventListener("click", () => { void showRecentProjects(); });
+byId("terminal-close").addEventListener("click", () => { void closeTerminal().catch(showError); });
 monaco.editor.onDidChangeMarkers(renderProblems);
 bindLayout();
 bindSettings();
+docs.editor.addAction({
+  id: "ironGo.goToDefinition", label: "Go to Definition (Including Dependencies)",
+  keybindings: [monaco.KeyCode.F12], keybindingContext: "editorTextFocus && editorLangId == go",
+  contextMenuGroupId: "navigation", contextMenuOrder: 1.05, precondition: "editorLangId == go",
+  run: goToDefinition,
+});
 if (desktop) {
   const quitDialog = byId<HTMLDialogElement>("quit-dialog");
   const discardQuit = byId<HTMLButtonElement>("quit-discard");
@@ -1472,21 +2052,32 @@ if (desktop) {
   };
   void getCurrentWindow().listen<number>("iron-go-exit-expired", event => {
     lastExpiredQuitTicket = Math.max(lastExpiredQuitTicket, event.payload);
+    sessionExpiry.get(event.payload)?.();
     cancelQuitDialog(event.payload);
   }).catch(showError);
   void getCurrentWindow().listen<number>("iron-go-exit-requested", event => {
     if (event.payload <= lastExpiredQuitTicket) return;
     if (import.meta.env.VITE_IRON_E2E === "1") testQuitRequests++;
     let release: (() => void) | undefined;
+    let thawDrafts: (() => void) | undefined;
     void decideExit({
       canDecide: () => !projectWorkflow.busy && transitionReady(),
       hasUnsavedChanges: () => docs.dirty,
       confirmDiscard: () => confirmQuit(event.payload),
       freeze: frozen => {
         if (frozen) release = projectWorkflow.reserve();
-        else release?.();
+        else { thawDrafts?.(); release?.(); }
       },
-      reply: approve => host.resolveExit(event.payload, approve),
+      reply: async approve => {
+        if (!approve) return host.resolveExit(event.payload, false);
+        thawDrafts = drafts.freeze();
+        const expired = new Promise<void>(resolve => { sessionExpiry.set(event.payload, resolve); });
+        try {
+          await Promise.race([flushEditorSession(event.payload), expired]);
+          if (event.payload <= lastExpiredQuitTicket) return false;
+          return await Promise.race([host.resolveExit(event.payload, true, drafts.plan(project.native)), expired.then(() => false)]);
+        } finally { sessionExpiry.delete(event.payload); }
+      },
     }).catch(showError);
   }).catch(showError);
 } else {
@@ -1502,6 +2093,12 @@ if (import.meta.env.VITE_IRON_E2E === "1") {
     quitRequests: () => testQuitRequests,
     quitExpiry: () => lastExpiredQuitTicket,
     workspaceId: () => project.native?.id,
+    holdEditorSession: hold => {
+      holdSessionDebounce = hold;
+      clearTimeout(sessionTimer);
+      if (!hold) queueEditorSession();
+    },
+    terminal,
   }));
 }
 

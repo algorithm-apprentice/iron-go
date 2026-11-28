@@ -40,6 +40,8 @@ export class ProjectWorkflow {
 export class ProjectSnapshots {
   private revision = 0;
 
+  invalidate() { this.revision++; }
+
   async refresh<P, S>(target: P, request: {
     current(): P;
     read(target: P): Promise<S>;
@@ -50,9 +52,12 @@ export class ProjectSnapshots {
     const current = () => revision === this.revision && request.current() === target;
     try {
       const snapshot = await request.read(target);
-      if (current()) request.apply(snapshot);
+      if (!current()) return false;
+      request.apply(snapshot);
+      return true;
     } catch (error) {
       if (current()) request.fail(error);
+      return false;
     }
   }
 }

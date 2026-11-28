@@ -11,6 +11,58 @@ pub struct Admission {
     short_tools: usize,
     unproved_exit: bool,
     pub cancel_next_picker: bool,
+    pub run_handoff: std::sync::Arc<crate::tasks::TestRunHandoff>,
+    pub hold_debug_disconnect: bool,
+    pub draft_quit: std::sync::Arc<TestDraftQuit>,
+}
+
+pub struct TestDraftQuit {
+    state: tokio::sync::watch::Sender<(bool, bool)>,
+    staged: std::sync::atomic::AtomicBool,
+}
+
+impl Default for TestDraftQuit {
+    fn default() -> Self {
+        Self {
+            state: tokio::sync::watch::channel((false, false)).0,
+            staged: false.into(),
+        }
+    }
+}
+
+impl TestDraftQuit {
+    pub async fn wait(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut state = self.state.subscribe();
+        self.staged.store(true, Ordering::Release);
+        let refuse = state
+            .wait_for(|(hold, _)| !*hold)
+            .await
+            .is_ok_and(|state| state.1);
+        self.staged.store(false, Ordering::Release);
+        refuse
+    }
+}
+
+#[tauri::command]
+pub fn test_draft_quit(
+    state: tauri::State<'_, Core>,
+    hold: Option<bool>,
+    refuse: Option<bool>,
+) -> bool {
+    let probe = state.0.lock().unwrap().acceptance.draft_quit.clone();
+    if let Some(hold) = hold {
+        probe.state.send_replace((hold, refuse.unwrap_or(false)));
+    }
+    probe.staged.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[tauri::command]
+pub fn test_hold_debug_disconnect(state: tauri::State<'_, Core>, hold: bool) -> CommandResult<()> {
+    let mut session = state.0.lock().unwrap();
+    session.acceptance.check()?;
+    session.acceptance.hold_debug_disconnect = hold;
+    Ok(())
 }
 
 #[tauri::command]
@@ -52,19 +104,25 @@ pub fn watch(app: &AppHandle) {
         let core = app.state::<Core>();
         let mut session = core.0.lock().unwrap();
         seal(&mut session);
-        let (session, _) = core
+        let (mut session, _) = core
             .2
             .wait_timeout_while(session, Duration::from_secs(10), |session| {
                 session.acceptance.short_tools != 0
+                    || session.program_debug.is_some()
+                    || session.terminal.is_some()
             })
             .unwrap();
-        let drained =
-            eof.is_ok() && session.acceptance.short_tools == 0 && !session.acceptance.unproved_exit;
+        let drained = eof.is_ok()
+            && session.acceptance.short_tools == 0
+            && session.program_debug.is_none()
+            && session.terminal.is_none()
+            && !session.acceptance.unproved_exit;
+        session.clean_run_directories();
         drop(session);
         if drained {
             println!("IRON_E2E_SUPERVISOR_STOP_COMPLETE");
         } else {
-            eprintln!("Acceptance supervisor did not verify short tool cleanup.");
+            eprintln!("Acceptance supervisor did not verify process cleanup.");
         }
         app.exit(if drained { 0 } else { 1 });
     });
@@ -108,15 +166,24 @@ impl Drop for ShortTool<'_> {
 fn sealed_session_cannot_admit_queued_work_or_new_tools() {
     let core = Core::default();
     let fixture = tempfile::tempdir().unwrap();
-    let project =
-        crate::install_workspace(&core, crate::Workspace::open(fixture.path()).unwrap()).unwrap();
+    let project = crate::install_workspace(
+        &core,
+        crate::Workspace::open(fixture.path()).unwrap(),
+        None,
+        None,
+    )
+    .unwrap();
     let old = ShortTool::admit(&core).unwrap();
     seal(&mut core.0.lock().unwrap());
     assert!(core.0.lock().unwrap().root(project.id).is_err());
     assert!(ShortTool::admit(&core).is_err());
-    assert!(
-        crate::install_workspace(&core, crate::Workspace::open(fixture.path()).unwrap()).is_err()
-    );
+    assert!(crate::install_workspace(
+        &core,
+        crate::Workspace::open(fixture.path()).unwrap(),
+        None,
+        None
+    )
+    .is_err());
     assert_eq!(core.0.lock().unwrap().acceptance.short_tools, 1);
     drop(old);
     assert_eq!(core.0.lock().unwrap().acceptance.short_tools, 0);

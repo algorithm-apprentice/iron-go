@@ -232,7 +232,237 @@ test("Escape cancels a loading disk comparison and mixed endings cannot authoriz
     assert.equal(await dialog.getByRole("button", { name: "Save Over Reviewed Disk Version" }).isDisabled(), true);
     await dialog.getByRole("button", { name: "Keep Editing" }).click();
     assert.equal(await page.evaluate(async () => (await window.mixedDiskReview) === undefined), true);
-    assert.equal(await page.locator("#disk-compare-view .monaco-diff-editor").count(), 0);
+    assert.equal(await page.locator("#disk-compare-view .monaco-editor").count(), 0);
+  });
+});
+
+test("rapid disk comparison reopen displays new snapshots without a diff worker", async () => {
+  await documentScenario("reopen-disk-comparison", async page => {
+    await page.evaluate(() => {
+      const viewport = document.querySelector("#disk-compare-view");
+      Object.assign(viewport.style, { width: "650px", height: "200px", display: "grid", gridTemplateColumns: "1fr 1fr" });
+      let workers = 0;
+      const startWorker = window.MonacoEnvironment.getWorker;
+      window.MonacoEnvironment.getWorker = (...args) => { workers++; return startWorker(...args); };
+      window.comparisonWorkers = () => workers;
+      const shared = Array.from({ length: 60 }, () => "unchanged").join("\n") + "\n";
+      window.openComparison = label => window.diskComparison({ path: "data.txt", language: "plaintext", dirty: true,
+        buffer: shared + `${label} editor`, current: () => true,
+        load: async () => ({ kind: "text", text: shared + `${label} disk`, version: label }) });
+      window.firstComparison = window.openComparison("first");
+    });
+    const disk = page.locator("#disk-compare-view .original .view-lines");
+    const buffer = page.locator("#disk-compare-view .modified .view-lines");
+    await disk.getByText(/first\s+disk/).waitFor();
+    await page.getByRole("button", { name: "Keep Editing" }).click();
+    const remaining = await page.evaluate(async () => {
+      await window.firstComparison;
+      const count = window.workflowFixture.monaco.editor.getModels().length;
+      window.secondComparison = window.openComparison("second");
+      return count;
+    });
+    assert.equal(remaining, 0);
+    await disk.getByText(/second\s+disk/).waitFor();
+    await buffer.getByText(/second\s+editor/).waitFor();
+    assert.equal(await page.evaluate(() => window.comparisonWorkers()), 0);
+    await page.getByRole("button", { name: "Keep Editing" }).click();
+    assert.equal(await page.evaluate(async () => {
+      await window.secondComparison;
+      return window.workflowFixture.monaco.editor.getModels().length;
+    }), 0);
+  });
+});
+
+test("feedback tabs use one keyboard stop and preserve outside focus when a pane disappears", async () => {
+  await documentScenario("feedback-tab-focus", async page => {
+    await page.evaluate(() => {
+      window.feedbackFixture = window.mountFeedback();
+      document.querySelector("#debug-tab").hidden = false;
+      window.feedbackFixture.show("debug");
+      const outside = document.createElement("button");
+      outside.id = "outside-feedback";
+      outside.textContent = "Outside feedback";
+      document.body.append(outside);
+    });
+    const tabStops = () => page.locator("[data-panel]:visible[tabindex='0']").evaluateAll(nodes => nodes.map(node => node.id));
+    assert.deepEqual(await tabStops(), ["debug-tab"]);
+    await page.locator("#debug-tab").focus();
+    await page.keyboard.press("ArrowRight");
+    assert.deepEqual(await tabStops(), ["problems-tab"]);
+    await page.keyboard.press("End");
+    assert.deepEqual(await tabStops(), ["debug-tab"]);
+    await page.evaluate(() => window.feedbackFixture.hide("debug"));
+    assert.deepEqual(await tabStops(), ["output-tab"]);
+    assert.equal(await page.locator("#output-tab").evaluate(tab => document.activeElement === tab), true);
+    await page.evaluate(() => {
+      document.querySelector("#debug-tab").hidden = false;
+      window.feedbackFixture.show("debug");
+      document.querySelector("#outside-feedback").focus();
+      window.feedbackFixture.hide("debug");
+    });
+    assert.deepEqual(await tabStops(), ["output-tab"]);
+    assert.equal(await page.locator("#outside-feedback").evaluate(tab => document.activeElement === tab), true);
+    await page.evaluate(() => {
+      document.querySelector("#debug-tab").hidden = false;
+      window.feedbackFixture.show("debug");
+      window.feedbackFixture.toggle(false);
+      window.feedbackFixture.hide("debug");
+    });
+    assert.equal(await page.locator("#panel").isHidden(), true);
+    assert.equal(await page.locator("#output-tab").getAttribute("aria-selected"), "true");
+  });
+});
+
+test("a stranded buffer requires an explicit reviewed write even if the replacement bytes match", async () => {
+  await documentScenario("stranded-path-review", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs } = window;
+      const writes = [];
+      docs.reset({ readVersioned: async () => ({ text: "same disk bytes", version: "old inode" }),
+        save: async (...args) => { writes.push(args); } });
+      const tab = await docs.open("source.txt");
+      docs.requirePathReview([tab]);
+      tab.model.setValue("unsaved text");
+      const error = await docs.save(tab).catch(error => error.message);
+      const old = { dirty: tab.dirty, changed: tab.diskChange, writes: writes.length };
+      await docs.save(tab, { reviewed: { kind: "text", text: "same disk bytes", version: "new inode" } });
+      const clean = await docs.open("directory/clean.txt");
+      const reservation = docs.reservePaths("directory", "moved");
+      const [moved] = docs.rebindPaths("directory", "moved", {}, reservation.affected);
+      reservation.release();
+      const wasClean = !clean.dirty && !moved.dirty;
+      moved.model.setValue("typed before reconciliation");
+      const movedError = await docs.save(moved).catch(error => error.message);
+      return { error, old, writes, wasClean, movedError };
+    });
+    assert.match(outcome.error, /Review the current disk version/);
+    assert.deepEqual(outcome.old, { dirty: true, changed: "changed", writes: 0 });
+    assert.deepEqual(outcome.writes, [["source.txt", "same disk bytes", "unsaved text", "new inode", undefined]]);
+    assert.equal(outcome.wasClean, true);
+    assert.match(outcome.movedError, /Review the current disk version/);
+  });
+});
+
+test("a delayed editor-session read cannot restore tabs or viewport into a replacement project", async () => {
+  await documentScenario("editor-session-restore-ownership", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs } = window;
+      const read = Promise.withResolvers();
+      let current = true;
+      docs.reset({ read: async () => read.promise });
+      const restored = docs.restoreSession({ active: "old.txt", tabs: [{ path: "old.txt", line: 42, column: 8, firstLine: 30 }] },
+        new Set(["old.txt"]), () => current);
+      current = false;
+      docs.reset({ read: async () => "replacement\nline two" });
+      await docs.open("new.txt", { target: { lineNumber: 2, column: 3 } });
+      read.resolve("old\n".repeat(60));
+      return { result: await restored, path: docs.active.path, tabs: [...docs.tabs.keys()], position: docs.editor.getPosition() };
+    });
+    assert.deepEqual(outcome, { result: { opened: false, skipped: 0 }, path: "new.txt", tabs: ["new.txt"], position: { lineNumber: 2, column: 3 } });
+  });
+});
+
+test("draft recording coalesces a blocked write and resumes queued work after a refused Quit", async () => {
+  await documentScenario("draft-write-coalescing", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs, workflowFixture: { DraftRecorder, host } } = window;
+      const indicator = document.createElement("span");
+      const recorder = new DraftRecorder(indicator);
+      const folder = { id: 1, path: "/project" };
+      const requests = [];
+      host.writeDraft = (_id, _path, _revision, payload) => {
+        const reply = Promise.withResolvers();
+        requests.push({ ...payload, reply });
+        return reply.promise;
+      };
+      docs.reset({ readVersioned: async () => ({ text: "baseline", version: "old" }) });
+      const tab = await docs.open("source.txt");
+      tab.model.setValue("old edit");
+      recorder.schedule(folder, tab, true);
+      tab.model.setValue("intermediate edit");
+      recorder.schedule(folder, tab, true);
+      tab.model.setValue("latest edit");
+      recorder.schedule(folder, tab, true);
+      const duringBlocked = requests.length;
+      requests[0].reply.resolve();
+      await new Promise(requestAnimationFrame);
+      const thaw = recorder.freeze();
+      requests[1].reply.reject(new Error("The native writer was staged for Quit."));
+      await new Promise(requestAnimationFrame);
+      const duringFreeze = requests.length;
+      thaw();
+      requests[2].reply.resolve();
+      await recorder.settled(tab);
+      return { duringBlocked, duringFreeze, texts: requests.map(request => request.text), marker: indicator.textContent };
+    });
+    assert.deepEqual(outcome, { duringBlocked: 1, duringFreeze: 2, texts: ["old edit", "latest edit", "latest edit"], marker: "Draft saved" });
+  });
+});
+
+test("ordinary and reviewed reload leave dirty text intact until draft retirement succeeds", async () => {
+  await documentScenario("draft-reload-barrier", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs, documentState } = window;
+      const results = [];
+      for (const reviewed of [false, true]) {
+        const before = { kind: "text", text: "old", version: "1" };
+        const after = { kind: "text", text: "new", version: "2" };
+        let current = before;
+        docs.reset({ readVersioned: async () => current, inspect: async () => current });
+        const tab = await docs.open("main.go");
+        current = after;
+        tab.model.setValue("local");
+        const staged = Promise.withResolvers();
+        const retire = Promise.withResolvers();
+        const reloading = docs.reload(tab, reviewed ? after : undefined, () => { staged.resolve(); return retire.promise; });
+        await staged.promise;
+        const waiting = documentState(tab);
+        retire.reject(new Error("Recovery storage locked."));
+        const error = await reloading.catch(error => error.message);
+        const failed = documentState(tab);
+        const retried = await docs.reload(tab, reviewed ? after : undefined, async () => {});
+        results.push({ waiting, error, failed, retried, reloaded: documentState(tab) });
+      }
+      return results;
+    });
+    const dirty = { text: "local", disk: "old", dirty: true };
+    assert.deepEqual(outcome, Array.from({ length: 2 }, () => ({ waiting: dirty, error: "Recovery storage locked.", failed: dirty,
+      retried: true, reloaded: { text: "new", disk: "new", dirty: false } })));
+  });
+});
+
+test("format-on-save writes only its captured bytes while typing continues across both waits", async () => {
+  await documentScenario("format-save-snapshot", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { documents: docs, documentState } = window;
+      const disk = "\ufeffpackage fixture\r\n";
+      const submitted = "\ufeffpackage fixture\r\nvar  n=1\r\n";
+      const atWrite = Promise.withResolvers();
+      const formatter = Promise.withResolvers();
+      const write = Promise.withResolvers();
+      let formatterInput;
+      docs.reset({ read: async () => disk, save: async (_path, expected, bytes) => {
+        atWrite.resolve({ expected, bytes });
+        await write.promise;
+      } });
+      const tab = await docs.open("source.go");
+      tab.model.setValue(submitted);
+      const saving = docs.save(tab, { format: async text => { formatterInput = text; return formatter.promise; } });
+      tab.model.setValue(submitted + "// during gofmt\r\n");
+      formatter.resolve("package fixture\n\nvar n = 1\n");
+      const output = await atWrite.promise;
+      const latest = submitted + "// during gofmt\r\n// during write\r\n";
+      tab.model.setValue(latest);
+      const other = await docs.open("other.txt");
+      write.resolve();
+      return { result: await saving, formatterInput, output, state: documentState(tab), active: docs.active === other };
+    });
+    const formatted = "\ufeffpackage fixture\r\n\r\nvar n = 1\r\n";
+    assert.deepEqual(outcome, {
+      result: true, formatterInput: "package fixture\r\nvar  n=1\r\n",
+      output: { expected: "\ufeffpackage fixture\r\n", bytes: formatted }, active: true,
+      state: { text: "\ufeffpackage fixture\r\nvar  n=1\r\n// during gofmt\r\n// during write\r\n", disk: formatted, dirty: true },
+    });
   });
 });
 
@@ -411,7 +641,7 @@ test("Debug terminal-before-admission waits for the eventual server cleanup", as
       const done = Promise.withResolvers();
       const trace = [];
       const session = new DebugSession({ id: 1, path: "/old" }, {}, {
-        isCurrent: () => true, admitted: () => trace.push("admitted"), finished: done.resolve,
+        isCurrent: () => true, admitted: () => trace.push("admitted"), closing: () => trace.push("closing"), finished: done.resolve,
       }, {
         debug: (_id, _pkg, events) => { started.resolve(events); return admission.promise; },
         stopDebug: id => { trace.push(id); cleaning.resolve(); return cleanup.promise; },
@@ -429,8 +659,8 @@ test("Debug terminal-before-admission waits for the eventual server cleanup", as
       cleanup.resolve();
       return { beforeAdmission, beforeCleanup, reason: await done.promise, trace, launched: await launch === undefined };
     });
-    assert.deepEqual(outcome, { beforeAdmission: { finished: false, stoppable: false, trace: [] }, beforeCleanup: false,
-      reason: "early exit", trace: [41], launched: true });
+    assert.deepEqual(outcome, { beforeAdmission: { finished: false, stoppable: false, trace: ["closing"] }, beforeCleanup: false,
+      reason: "early exit", trace: ["closing", 41], launched: true });
   });
 });
 
@@ -463,6 +693,190 @@ test("a delayed Debug breakpoint reply cannot update the new project's marks", a
       return verified;
     });
     assert.deepEqual(outcome, []);
+  });
+});
+
+test("a delayed resume failure does not retire a newer Delve stop", async () => {
+  await documentScenario("debug-resume-order", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { DebugSession } = window.workflowFixture;
+      const firstPause = Promise.withResolvers();
+      const secondPause = Promise.withResolvers();
+      const resumeRequest = Promise.withResolvers();
+      const disconnect = Promise.withResolvers();
+      const finished = Promise.withResolvers();
+      const finishes = [];
+      let emit;
+      let pauses = 0;
+      let inspecting = false;
+      const send = (event, body) => emit({ type: "message", message: { type: "event", event, body } });
+      const reply = (seq, success, body) => emit({ type: "message", message: { type: "response", request_seq: seq, success, body } });
+      const session = new DebugSession({ id: 1, path: "/project" }, { entries: () => [] }, {
+        isCurrent: () => true, admitted() {}, running() {},
+        inspection(state) { inspecting = !!state; },
+        paused() { (++pauses === 1 ? firstPause : secondPause).resolve(); },
+        finished(reason) { finishes.push(reason); finished.resolve(); },
+      }, {
+        debug: async (_id, _pkg, events) => { emit = events; return { server: 1, output: "/fixture/test" }; },
+        async sendDebug(_server, request) {
+          if (request.command === "next") { resumeRequest.resolve(request.seq); return; }
+          if (request.command === "disconnect") { disconnect.resolve(request.seq); return; }
+          if (request.command === "launch") send("initialized");
+          const body = request.command === "stackTrace" ? { stackFrames: [{ id: 1, name: "pause", line: 9 }] } : {};
+          reply(request.seq, true, body);
+        },
+        stopDebug: async () => {},
+      });
+      await session.start("main_test.go", "TestA");
+      send("stopped", { threadId: 1, reason: "breakpoint" });
+      await firstPause.promise;
+      const resume = session.resume("next");
+      const seq = await resumeRequest.promise;
+      send("stopped", { threadId: 1, reason: "step" });
+      await secondPause.promise;
+      reply(seq, false);
+      await resume;
+      await Promise.resolve();
+      const result = { paused: session.paused, canStop: session.canStop, finishes: [...finishes] };
+      const stopping = session.stop();
+      const disconnectSeq = await disconnect.promise;
+      send("stopped", { threadId: 1, reason: "step" });
+      result.stopping = { paused: session.paused, canStop: session.canStop, inspecting };
+      reply(disconnectSeq, true, {});
+      await stopping;
+      await finished.promise;
+      return result;
+    });
+    assert.deepEqual(outcome, { paused: true, canStop: true, finishes: [], stopping: { paused: false, canStop: false, inspecting: false } });
+  });
+});
+
+test("Debug frame switches supersede old scopes and the disclosure retains keyboard focus", async () => {
+  await documentScenario("debug-inspection-races", async page => {
+    await page.evaluate(() => {
+      const { DebugInspection, DebugInspectionView } = window.workflowFixture;
+      const stack = document.createElement("div");
+      const variables = document.createElement("div");
+      stack.id = "inspect-stack";
+      variables.id = "inspect-variables";
+      document.body.prepend(stack, variables);
+      const requests = [];
+      const reveal = [];
+      const view = new DebugInspectionView(stack, variables);
+      const inspect = new DebugInspection((command, args) => {
+        const reply = Promise.withResolvers();
+        requests.push({ command, args, reply });
+        return reply.promise;
+      }, state => view.render(state), (frame, _reason, current, focus) => reveal.push({ frame: frame?.id, current, focus }), () => true);
+      window.inspectFixture = { inspect, requests, reveal };
+      inspect.begin(1, "breakpoint");
+      requests[0].reply.resolve({ totalFrames: 50, stackFrames: [{ id: 1, name: "Top", line: 9 }, { id: 2, name: "Caller", line: 6 }] });
+    });
+    const stack = page.locator("#inspect-stack");
+    const variables = page.locator("#inspect-variables");
+    await stack.getByText("Showing the first 32 frames.").waitFor();
+    await stack.getByRole("button", { name: "Caller" }).click();
+    const initial = await page.evaluate(() => {
+      const { requests, reveal } = window.inspectFixture;
+      requests.find(request => request.command === "scopes" && request.args.frameId === 2).reply.resolve({ scopes: [
+        { name: "First", variablesReference: 7 }, { name: "Second", variablesReference: 7 },
+        { name: "Third", variablesReference: 8 }, { name: "Fourth", variablesReference: 9 },
+      ] });
+      return reveal.map(entry => ({ frame: entry.frame, current: entry.current(), focus: entry.focus }));
+    });
+    assert.deepEqual(initial, [{ frame: 1, current: false, focus: true }, { frame: 2, current: true, focus: false }]);
+    const first = variables.locator("summary", { hasText: "First" });
+    await first.focus();
+    await page.keyboard.press("Enter");
+    await variables.getByText("Loading variables…").waitFor();
+    await page.evaluate(() => {
+      const { requests } = window.inspectFixture;
+      requests.find(request => request.command === "scopes" && request.args.frameId === 1).reply.resolve({ scopes: [{ name: "Stale", variablesReference: 11 }] });
+      requests.find(request => request.command === "variables" && request.args.variablesReference === 7).reply.resolve({
+        variables: Array.from({ length: 101 }, (_, index) => ({ name: `Item ${index}`, value: "x".repeat(900), variablesReference: 0 })),
+      });
+    });
+    await variables.getByText("More variables are available; display limited.").waitFor();
+    assert.equal(await first.evaluate(el => document.activeElement === el), true);
+    assert.equal(await variables.getByText("Stale").count(), 0);
+    assert.equal(await variables.getByText(/^Item \d+:/).count(), 100);
+    assert.ok((await variables.getByText(/^Item 0:/).innerText()).endsWith("…"));
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Enter");
+    await variables.getByText(/^Item 0:/).waitFor();
+    await variables.locator("summary", { hasText: "Second" }).click();
+    await variables.getByText("Loading variables…").waitFor();
+    assert.equal(await page.evaluate(() => window.inspectFixture.requests.filter(request => request.command === "variables" && request.args.variablesReference === 7).length), 2);
+    await page.evaluate(() => window.inspectFixture.requests.at(-1).reply.reject(new Error("Scope temporarily unavailable.")));
+    await variables.getByText("Scope temporarily unavailable.").waitFor();
+    await variables.getByRole("button", { name: "Retry" }).click();
+    await variables.getByText("Loading variables…").waitFor();
+    await variables.locator("summary", { hasText: "Third" }).click();
+    await variables.locator("summary", { hasText: "Fourth" }).click();
+    await page.waitForFunction(() => [8, 9].every(reference => window.inspectFixture.requests.some(
+      request => request.command === "variables" && request.args.variablesReference === reference)));
+    await page.evaluate(() => {
+      const { inspect, requests } = window.inspectFixture;
+      // Three variables requests occupy three slots; a new stack occupies the fourth.
+      inspect.begin(2, "step");
+      inspect.begin(3, "step");
+      inspect.begin(4, "step");
+      if (requests.some(request => request.args.threadId > 2)) throw new Error("An obsolete stack started in a full pool.");
+      requests.find(request => request.args.threadId === 2).reply.resolve({ stackFrames: [{ id: 20, name: "Obsolete stack", line: 1 }] });
+    });
+    await page.waitForFunction(() => window.inspectFixture.requests.some(request => request.args.threadId === 4));
+    await page.evaluate(() => {
+      const { requests } = window.inspectFixture;
+      if (requests.some(request => request.args.threadId === 3)) throw new Error("A superseded waiting stack ran.");
+      requests.find(request => request.args.threadId === 4).reply.resolve({ stackFrames: [] });
+    });
+    await stack.getByText("No call stack was reported.").waitFor();
+    await page.evaluate(async () => {
+      const pending = window.inspectFixture.requests.filter(request => request.command === "variables").slice(-3);
+      for (const [index, request] of pending.entries()) {
+        if (index === 0) request.reply.reject(new Error("Obsolete variable error"));
+        else request.reply.resolve({ variables: [{ name: "Obsolete variable", value: "unexpected", variablesReference: 0 }] });
+      }
+      await new Promise(requestAnimationFrame);
+    });
+    assert.equal(await stack.innerText(), "No call stack was reported.");
+    assert.equal(await variables.innerText(), "");
+    assert.equal(await variables.getByText(/^Item 0:/).count(), 0);
+  });
+});
+
+test("Debug Go Program cannot launch a late adapter after Stop during build", async () => {
+  await documentScenario("debug-program-build-stop", async page => {
+    const outcome = await page.evaluate(async () => {
+      const { DebugSession } = window.workflowFixture;
+      const admitted = Promise.withResolvers();
+      const stopped = Promise.withResolvers();
+      const retired = Promise.withResolvers();
+      const finished = Promise.withResolvers();
+      const calls = [];
+      let emit;
+      let ended = false;
+      const session = new DebugSession({ id: 8, path: "/project" }, {}, {
+        isCurrent: () => true, running() {}, admitted: admitted.resolve,
+        finished(reason) { ended = true; finished.resolve(reason); },
+      }, {
+        debugProgram: async (_id, _package, _launch, events) => { emit = events; return 42; },
+        stopDebugProgram: id => { stopped.resolve(id); return retired.promise; },
+        sendDebug: async (_server, request) => { calls.push(request.command); },
+      });
+      const starting = session.startProgram("./cmd/app", { directory: ".", args: [], environment: {} });
+      await admitted.promise;
+      const stopping = session.stop();
+      const stopId = await stopped.promise;
+      emit({ type: "ready", output: "/private/inferior", path: "/bin" });
+      await starting;
+      const beforeCleanup = { ended, paused: session.paused, canStop: session.canStop, calls: [...calls] };
+      emit({ type: "closed", reason: "Debug session stopped" });
+      retired.resolve();
+      await stopping;
+      return { beforeCleanup, stopId, reason: await finished.promise };
+    });
+    assert.deepEqual(outcome, { beforeCleanup: { ended: false, paused: false, canStop: false, calls: [] }, stopId: 42, reason: "Debug session stopped" });
   });
 });
 

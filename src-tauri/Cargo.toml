@@ -17,6 +17,7 @@ libc = "0.2"
 notify = "8"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSFileManager", "NSPathUtilities", "NSString", "NSURL"] }
 regex = "1"
 rfd = { version = "0.17", default-features = false }
 serde = { version = "1", features = ["derive"] }

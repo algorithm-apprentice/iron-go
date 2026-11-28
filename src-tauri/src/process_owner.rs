@@ -1,12 +1,29 @@
 use std::{
+    fs::File,
     future::{poll_fn, Future},
     io,
+    os::fd::AsRawFd,
     process::ExitStatus,
     sync::{Arc, Mutex},
     task::Poll,
+    time::Duration,
 };
 
-use tokio::process::Child;
+use tokio::process::{Child, Command};
+
+pub(crate) fn bind_child_directory(command: &mut Command, directory: File) {
+    // The captured File stays open until exec. Only fchdir is called in the child.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(directory.as_raw_fd()) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
+    command.env_remove("PWD");
+}
 
 // Serialize the signal syscall with the poll that can reap the leader.
 pub struct ProcessGroup(Mutex<Option<i32>>);
@@ -43,6 +60,11 @@ impl ProcessGroup {
     pub(crate) fn unarmed() -> Arc<Self> {
         Arc::new(Self(Mutex::new(None)))
     }
+
+    #[cfg(test)]
+    pub(crate) fn armed(&self) -> bool {
+        self.0.lock().unwrap().is_some()
+    }
 }
 
 pub struct OwnedChild {
@@ -54,9 +76,15 @@ impl OwnedChild {
     // The caller must spawn this child as the leader of its own group.
     pub fn new(child: Child) -> Self {
         let pid = child.id().expect("new group child has a pid") as i32;
+        Self::in_group(child, pid)
+    }
+
+    pub(crate) fn in_group(child: Child, group: i32) -> Self {
+        // The freshly spawned child is a member of this group and remains
+        // unreaped while its owner can signal the group.
         Self {
             child,
-            group: Arc::new(ProcessGroup(Mutex::new(Some(pid)))),
+            group: Arc::new(ProcessGroup(Mutex::new(Some(group)))),
         }
     }
 
@@ -64,6 +92,37 @@ impl OwnedChild {
         let wait = self.child.wait();
         tokio::pin!(wait);
         poll_fn(|cx| self.group.poll_reap(|| wait.as_mut().poll(cx))).await
+    }
+
+    pub(crate) async fn wait_and_retire_group(&mut self) -> io::Result<ExitStatus> {
+        let pid = self.child.id().expect("owned process has not been reaped");
+        while !exited_without_reaping(pid)? {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        self.group.kill();
+        self.wait().await
+    }
+}
+
+pub(crate) fn exited_without_reaping(pid: u32) -> io::Result<bool> {
+    // The unreaped leader keeps the group ID reserved until we signal it.
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if result == 0 {
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 

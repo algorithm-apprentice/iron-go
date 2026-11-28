@@ -27,7 +27,13 @@ when it is needed to exercise editor behavior.
 5. Update the design with actual verification and any remaining gaps. Never
    require a user to click through a scenario an agent can exercise itself.
 6. Get independent code review of the exact diff and evidence before committing
-   or pushing. Resolve review blockers and re-review affected changes first.
+   or pushing. The implementer owns test execution and supplies commands,
+   results, and artifact paths. The reviewer inspects the diff, test coverage,
+   and existing evidence. The reviewer may run a focused test to reproduce a
+   finding or verify a specific fix, but must not rerun the full suite. If a
+   broader check is needed, ask the implementer. After a fix, rerun affected
+   checks and any required gate, reuse applicable evidence for unchanged
+   areas, and re-review affected changes before publishing.
 
 Keep runner code and fixture routing out of shipped builds. Do not use an
 existing user workspace, modify the sibling repository, or report a skipped

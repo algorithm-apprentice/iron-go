@@ -1,17 +1,20 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, stat, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { expectedGoSyntax, goSyntaxSample, renderedGoSyntax } from "../go-syntax-sample.mjs";
 import { runtimeClean } from "./plan.mjs";
 
 if (!process.send) throw new Error("Run native acceptance through workbench.mjs.");
-const { group, values, driver, artifacts, fixture, home, pid, quitHelper } = JSON.parse(process.argv[2]);
+const { group, reopen, values, driver, artifacts, fixture, home, pid, quitHelper, trashRoot, accessibilityHelper, peer } = JSON.parse(process.argv[2]);
 const report = { version: 1, group, cases: [] };
 const app = { child: { pid }, exited: new Promise(resolve => {
   process.on("message", message => { if (message?.type === "app-exit") resolve(message.result); });
 }) };
+const peerExited = peer && new Promise(resolve => {
+  process.on("message", message => { if (message?.type === "peer-exit") resolve(message.result); });
+});
 let sid;
 let finishing = false;
 process.on("disconnect", () => { if (!finishing) process.exit(1); });
@@ -27,8 +30,8 @@ async function eventually(label, read, predicate = Boolean, timeout = 15_000) {
   throw new Error(`${label}: condition did not become true. Last value: ${JSON.stringify(last)?.slice(0, 1000)}`);
 }
 
-async function w3c(endpoint, input, method = input ? "POST" : "GET") {
-  const reply = await fetch(`${driver}${endpoint}`, {
+async function w3c(endpoint, input, method = input ? "POST" : "GET", base = driver) {
+  const reply = await fetch(`${base}${endpoint}`, {
     method, signal: AbortSignal.timeout(6000),
     ...(input ? { headers: { "content-type": "application/json" }, body: JSON.stringify(input) } : {}),
   });
@@ -239,6 +242,19 @@ async function terminalCheckpoint(action) {
   report.terminal = { action, rendererObserved: "through last live checkpoint before requesting exit" };
 }
 
+async function observeBeforeCrash(pid) {
+  let receive;
+  const observed = new Promise(resolve => {
+    receive = message => { if (message?.type === "crash-observed" && message.pid === pid) resolve(message); };
+    process.on("message", receive);
+  });
+  try {
+    process.send({ type: "observe-before-crash", pid });
+    const result = await Promise.race([observed, delay(4000, { error: "Timed out observing the disposable app's descendants." }, { ref: false })]);
+    assert.equal(result.error, undefined);
+  } finally { process.off("message", receive); }
+}
+
 async function probeTools({ gopls = false, delve = false } = {}) {
   await js(`window.__groupToolProbe = undefined;
     void window.__ironTest.toolProbe().then(tools => window.__groupToolProbe = { tools }, error => window.__groupToolProbe = { error: String(error) });
@@ -315,7 +331,13 @@ try {
   await eventually("workbench test adapter", () => js("return !!window.__ironTest;"));
   await assertRuntime();
 
-  if (group === "external") await externalProjectSmoke();
+  if (group === "recovery") await recoverySuite();
+  else if (group === "recent") await recentSuite();
+  else if (group === "trash") await trashSuite();
+  else if (group === "terminal") await terminalSuite();
+  else if (group === "accessibility") await accessibilitySuite();
+  else if (reopen) await reopenGoSuite();
+  else if (group === "external") await externalProjectSmoke();
   else if (group === "quit") await nativeQuitSmoke();
   else if (group === "quit-save") await nativeSaveQuit();
   else if (group === "crash") await crashWorkerWithLiveChild();
@@ -343,6 +365,523 @@ try {
 function requestNativeQuit() {
   assert.ok(quitHelper, "A compiled native Quit helper is required");
   execFileSync(quitHelper, [String(app.child.pid)], { timeout: 10_000 });
+}
+
+async function accessibilitySuite() {
+  const native = request => JSON.parse(execFileSync(accessibilityHelper, [String(pid)], { input: JSON.stringify(request), encoding: "utf8", timeout: 6000 }));
+  const keys = (...keys) => native({ action: "keys", keys });
+  await record("native keyboard input preserves Unicode and workbench focus", async () => {
+    const source = path.join(fixture, "cmd/orbit/main.go");
+    const original = "package main\n\nfunc main() {}\n";
+    await writeFile(source, original);
+    await openOrbit();
+    await js("window.__ironTest.revealLine(1); return true;");
+    await click("#settings");
+    assert.equal(await js("return !!document.querySelector('#screen-reader-setting');"), false, "VoiceOver support is deferred");
+    assert.deepEqual(await js("return window.__ironTest.editorInputOptions();"), { accessibilitySupport: "off", editContext: false });
+    await click('[data-dialog-close="settings-dialog"]');
+    await eventually("Settings restores the initiating control", () => js("return document.activeElement?.id;"), value => value === "settings");
+    await js("return window.__ironTest.focusWindow().then(() => true);");
+    native({ action: "activate" });
+    await js("window.__ironTest.revealLine(4); return true;");
+    await js(`window.__axInputTrace = [];
+      for (const type of ['keydown', 'beforeinput', 'input']) document.addEventListener(type, event => {
+        if (document.querySelector('#editor').contains(event.target) && window.__axInputTrace.length < 100) {
+          window.__axInputTrace.push({ type, key: event.key, data: event.data, inputType: event.inputType });
+        }
+      }, true); return true;`);
+    keys(...Array.from("// Text あ😀!").map(text => ({ code: 0, text })));
+    try { await eventually("hardware-style Unicode input reaches Monaco", current, entry => entry?.text === original + "// Text あ😀!"); }
+    finally { await writeFile(path.join(artifacts, "accessibility-input.json"), JSON.stringify(await js("return window.__axInputTrace;"), null, 2)); }
+    keys({ code: 123 }, { code: 123, modifiers: ["shift"] }, { code: 51 });
+    const expected = original + "// Text あ!";
+    await eventually("native cursor navigation and selection remove the full emoji", current, entry => entry?.text === expected);
+    const ax = await eventually("WKWebView exposes named workbench controls to the native accessibility client", () => native({ action: "tree" }),
+      value => ["Open Project", "Save File"].every(label => value.nodes.some(node => node.AXRole === "AXButton" &&
+        [node.AXTitle, node.AXDescription].includes(label))));
+    const caret = await js("return window.__ironTest.gutterTrace().caret;");
+    keys({ code: 43, modifiers: ["command"] });
+    await eventually("Settings can be opened from the editor with a real keystroke", () => js("return document.querySelector('#settings-dialog').open;"));
+    await click('[data-dialog-close="settings-dialog"]');
+    await eventually("the same editor regains focus after Settings closes", () => js("return document.querySelector('#editor').contains(document.activeElement);"));
+    assert.deepEqual(await js("return window.__ironTest.gutterTrace().caret;"), caret);
+    assert.equal((await current()).text, expected);
+    assert.equal((await current()).dirty, true);
+    await writeFile(path.join(artifacts, "accessibility-tree.json"), JSON.stringify(ax, null, 2));
+    keys({ code: 1, modifiers: ["command"] });
+    await eventually("the native save writes the edited Unicode bytes", () => readFile(source, "utf8"), bytes => bytes === expected);
+    keys({ code: 0, text: "X" });
+    await eventually("a later native edit makes the confirmation applicable", current, entry => entry?.dirty);
+    await js("document.querySelector('#tabs [data-tab-path=\"cmd/orbit/main.go\"] .tab-close').focus(); return true;");
+    keys({ code: 36 });
+    await eventually("the dirty close confirmation is displayed", () => js("return document.querySelector('#file-decision-dialog').open;"));
+    const decision = await eventually("the native AX tree names the confirmation and its options", () => native({ action: "tree" }),
+      value => ["Close unsaved file?", "Save and Close", "Discard", "Cancel"].every(label => value.nodes.some(node => Object.values(node).includes(label))));
+    await writeFile(path.join(artifacts, "accessibility-confirmation.json"), JSON.stringify(decision, null, 2));
+    keys({ code: 53 });
+    await eventually("Escape restores focus to the initiating close control", () => js("return document.activeElement?.classList.contains('tab-close');"));
+    await js("window.__ironTest.revealLine(3); return true;");
+    keys({ code: 14, modifiers: ["shift", "command"] });
+    await eventually("the existing keyboard shortcut moves focus out of Monaco into Explorer", () => js("return document.querySelector('#explorer').contains(document.activeElement);"));
+    keys({ code: 119 }, { code: 36 });
+    await eventually("opening a focused file returns to the editor", () => js("return document.querySelector('#editor').contains(document.activeElement);"));
+  });
+}
+
+async function terminalSuite() {
+  const snapshot = () => js("return window.__ironTest.terminalSnapshot();");
+  const observation = () => js("return window.__ironTest.terminalObservation();");
+  const send = text => js("window.__ironTest.terminalInput(arguments[0]); return true;", text);
+  const close = async () => {
+    await click("#terminal-close");
+    await eventually("the active terminal has an explicit close decision", () => js("return document.querySelector('#terminal-close-dialog')?.open || document.querySelector('#terminal-tab').hidden;"));
+    if (await js("return document.querySelector('#terminal-close-dialog')?.open === true;")) await click("#terminal-close-confirm");
+    await eventually("the terminal slot is inactive", snapshot, state => !state?.active);
+  };
+  await record("a real macOS PTY shell accepts input, resizes, interrupts and closes", async () => {
+    await openOrbit();
+    await click("#quick-open");
+    await set("#palette-text", ">start shell");
+    await eventually("the workbench can start a real local shell", () => text("#palette-options"), value => /Start Shell/.test(value));
+    await click("#palette-options button");
+    await eventually("the terminal starts and is visible", () => js("return !!document.querySelector('#terminal-pane .xterm');"));
+    await send("printf 'shell-cwd:%s\\n' \"$PWD\"; printf 'shell-unicode:\\343\\201\\202\\n'\r");
+    await eventually("real shell output contains the workspace and Unicode", snapshot,
+      state => state?.text.includes(`shell-cwd:${fixture}`) && state.text.includes("shell-unicode:あ"));
+    const before = await snapshot();
+    await js("return window.__ironTest.resize(840, 620).then(() => true);");
+    const resized = await eventually("the terminal follows the actual native window resize", snapshot,
+      state => state?.cols > 0 && state.cols !== before.cols);
+    await send("printf 'tty-size:'; stty size\r");
+    await eventually("the macOS kernel reports the resized PTY", snapshot, state => state?.text.includes(`tty-size:${resized.rows} ${resized.cols}`));
+    await send("/bin/sh -c 'printf \"owned-foreground:%s\\n\" \"$$\"; exec /bin/sleep 120'\r");
+    const ready = await eventually("a separate foreground process is running", snapshot, state => /owned-foreground:\d+/.test(state?.text));
+    const foreground = Number(ready.text.match(/owned-foreground:(\d+)/)[1]);
+    await send("\x03");
+    await eventually("Ctrl-C interrupts the actual foreground process", () => {
+      try { process.kill(foreground, 0); return false; } catch (error) { if (error.code === "ESRCH") return true; throw error; }
+    });
+    await send("printf 'back-at-prompt\\n'\r");
+    await eventually("the shell survives its foreground job", snapshot, state => /(?:^|\n)back-at-prompt/.test(state?.text));
+    await eventually("the ordinary target is ready", () => js("return document.querySelector('#run-target').value === './cmd/orbit' && !document.querySelector('#run').disabled;"));
+    await click("#run");
+    await eventually("ordinary Go Run still uses Task Output while a shell is open", output, value => /orbit v0\.1\.0 is online[\s\S]*exit code 0/.test(value), 30_000);
+    assert.equal((await snapshot()).active, true);
+    await click("#terminal-tab");
+    await close();
+  });
+  await record("full terminal output credit does not block resize or foreground teardown", async () => {
+    await chooseCommand("start shell");
+    const old = await eventually("a fresh shell is admitted", snapshot, state => state?.active && state.id && state.text.includes("%"));
+    await js("window.__ironTest.holdTerminalAck(true); return true;");
+    try {
+      await send("/bin/sh -c 'printf \"burst-process:%s\\n\" \"$$\"; exec /bin/dd if=/dev/zero bs=65536 count=32'\r");
+      // The process marker can scroll out of xterm's bounded history once the
+      // credit fills. Read the actual native child from this shell tree.
+      const foreground = await eventually("the foreground output fixture is live", () => {
+        const rows = execFileSync("ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8" }).split("\n");
+        const shell = rows.flatMap(row => { const match = row.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/); return match ? [{ id: Number(match[1]), parent: Number(match[2]), command: match[3] }] : []; });
+        const owner = shell.find(row => row.parent === pid && row.command.includes("zsh"));
+        return owner && shell.find(row => row.parent === owner.id && row.command.includes("dd if=/dev/zero bs=65536 count=32"))?.id;
+      });
+      const full = await eventually("64 KiB of unacknowledged renderer output is held", snapshot, state => state?.heldBytes === 64 * 1024);
+      await js("return window.__ironTest.resize(970, 680).then(() => true);");
+      const resized = await eventually("resize still reaches xterm while native output is backpressured", snapshot, state => state?.cols > 0 && state.cols !== full.cols);
+      await eventually("the kernel PTY resizes without needing output credit", observation,
+        state => state?.credit === 0 && state.cols === resized.cols && state.rows === resized.rows);
+      await close();
+      await eventually("closing during backpressure reaps the actual foreground job", () => {
+        try { process.kill(foreground, 0); return false; } catch (error) { if (error.code === "ESRCH") return true; throw error; }
+      });
+      await chooseCommand("start shell");
+      const replacement = await eventually("a distinct terminal generation is admitted", snapshot, state => state?.active && state.id && state.id !== old.id && state.text.includes("%"));
+      assert.notEqual(replacement.id, old.id);
+      const newCredit = await eventually("the new prompt has its own pending receipt", observation, state => state?.credit < 64 * 1024);
+      await js("return window.__ironTest.attemptTerminalAck(arguments[0], 1).then(() => true);", old.id);
+      await delay(80);
+      assert.equal((await observation()).credit, newCredit.credit, "Rust must ignore stale receipts even if their sequence matches the new terminal");
+    } finally { await js("window.__ironTest.holdTerminalAck(false); return true;"); }
+    await send("printf 'replacement-shell\\n'\r");
+    await eventually("late old credits cannot disrupt the replacement", snapshot, state => /(?:^|\n)replacement-shell/.test(state?.text));
+    await close();
+  });
+  await record("a foreground survivor after leader exit keeps the terminal slot reserved", async () => {
+    await chooseCommand("start shell");
+    const owner = await eventually("the shell leader is observed", observation, state => state?.leader > 0);
+    await send("/bin/sh -c 'trap \"\" HUP; printf \"surviving-foreground:%s\\n\" \"$$\"; exec /bin/sleep 120'\r");
+    const ready = await eventually("the fixture reports its actual foreground PID", snapshot, state => /surviving-foreground:\d+/.test(state?.text));
+    const foreground = Number(ready.text.match(/surviving-foreground:(\d+)/)[1]);
+    const alive = processId => {
+      try { process.kill(processId, 0); return true; } catch (error) { if (error.code === "ESRCH") return false; throw error; }
+    };
+    try {
+      await eventually("Rust observes the shell's separate foreground", observation, state => state?.foreground.includes(foreground));
+      process.kill(owner.leader, "SIGKILL");
+      await eventually("the native shell leader exits while a different process survives", () => !alive(owner.leader) && alive(foreground));
+      await click("#terminal-close");
+      await eventually("the unresolved terminal still needs an explicit close decision", () => js("return document.querySelector('#terminal-close-dialog').open;"));
+      await click("#terminal-close-confirm");
+      await eventually("cleanup timeout is reported without releasing the terminal", () => text("#toast"), value => /Terminal cleanup could not be confirmed/.test(value));
+      assert.equal((await snapshot()).active, true);
+      await chooseCommand("start shell");
+      await eventually("a new shell is refused while the old foreground survives", () => text("#toast"), value => /Close the active terminal/.test(value));
+    } finally {
+      if (alive(foreground)) {
+        const command = execFileSync("ps", ["-p", String(foreground), "-o", "command="], { encoding: "utf8" });
+        assert.match(command, /sleep 120/);
+        process.kill(foreground, "SIGKILL");
+      }
+    }
+    await eventually("the slot retires once the observed foreground exits", snapshot, state => !state?.active);
+  });
+  await record("interactive Go uses configured cwd, args, environment and a real stdin", async () => {
+    const module = path.join(fixture, "interactive-module");
+    const runtime = path.join(fixture, "interactive-runtime");
+    await Promise.all([mkdir(module), mkdir(runtime)]);
+    await writeFile(path.join(fixture, "go.work"), "go 1.22\n\nuse (\n\t.\n\t./interactive-module\n)\n");
+    await writeFile(path.join(module, "go.mod"), "module example.test/interactive-module\n\ngo 1.22\n");
+    await writeFile(path.join(module, "main.go"), `package main
+import ("bufio"; "encoding/json"; "fmt"; "os"; "strings")
+func main() {
+  cwd, _ := os.Getwd()
+  data, _ := json.Marshal(map[string]any{"cwd":cwd,"args":os.Args[1:],"gowork":os.Getenv("GOWORK"),"env":os.Getenv("TERMINAL_FIXTURE")})
+  fmt.Printf("terminal-context %s\\n", data)
+  answer, _ := bufio.NewReader(os.Stdin).ReadString('\\n')
+  fmt.Printf("received-answer:%s\\n", strings.TrimSpace(answer))
+}
+`);
+    await openProjectControl("#open-folder");
+    await eventually("the nested executable is discovered", () => js("return Array.from(document.querySelector('#run-target').options, option => option.value);"), targets => targets.includes("./interactive-module"));
+    await click('[data-view="tasks"]');
+    await click("#run-configurations");
+    await set("#run-config-name", "Terminal fixture");
+    await set("#run-config-package", "./interactive-module");
+    await set("#run-config-directory", "interactive-runtime");
+    const args = ["", "two words"];
+    await set("#run-config-arguments", JSON.stringify(args));
+    await set("#run-config-session", "GOWORK=invalid-for-build\nTERMINAL_FIXTURE=visible only in program");
+    await click("#run-config-save");
+    await eventually("the configured target is selected", () => js("return document.querySelector('#run-target').selectedOptions[0]?.textContent;"), value => value?.includes("Terminal fixture"));
+    const launch = () => chooseCommand("run go program in terminal");
+    const release = () => js("return window.__ironTest.runHandoff(false).then(() => true);");
+    try {
+      const cancelled = await holdConfiguredBuild(launch);
+      await js(`window.__ordinaryTask = ''; void window.__ironTest.attemptConfiguredRun('./cmd/orbit', { directory: '.', args: [], environment: {} })
+        .then(() => window.__ordinaryTask = 'unexpected admission', error => window.__ordinaryTask = String(error)); return true;`);
+      await eventually("the native Go lane is reserved during terminal build", () => js("return window.__ordinaryTask;"), value => /already running/.test(value));
+      await close();
+      await eventually("cancellation removes the terminal build directory", async () => {
+        try { await stat(cancelled); return false; } catch (error) { return error.code === "ENOENT"; }
+      });
+    } finally { await release(); }
+    await launch();
+    const began = await eventually("the Go executable starts inside the PTY", snapshot, state => /terminal-context \{[^\n]+\}/.test(state?.text), 30_000);
+    assert.deepEqual(JSON.parse(began.text.match(/terminal-context (\{[^\n]+\})/)[1]),
+      { cwd: runtime, args, gowork: "invalid-for-build", env: "visible only in program" });
+    await send("actual terminal input あ\r");
+    await eventually("Go reads native interactive input", snapshot, state => state?.text.includes("received-answer:actual terminal input あ"));
+    await eventually("natural exit frees both terminal and Go reservations", snapshot, state => !state?.active);
+    assert.equal(await js("return !document.querySelector('#run').disabled;"), true);
+  });
+  await record("actual project switch and Quit retire a live terminal foreground", async () => {
+    const alive = processId => {
+      try { process.kill(processId, 0); return true; } catch (error) { if (error.code === "ESRCH") return false; throw error; }
+    };
+    const start = async () => {
+      await chooseCommand("start shell");
+      const owner = await eventually("a shell leader is alive", observation, state => state?.leader > 0);
+      await send("/bin/sh -c 'printf \"closing-foreground:%s\\n\" \"$$\"; exec /bin/sleep 120'\r");
+      const began = await eventually("a real foreground is active", snapshot, state => /closing-foreground:\d+/.test(state?.text));
+      const processId = Number(began.text.match(/closing-foreground:(\d+)/)[1]);
+      assert.ok(alive(owner.leader) && alive(processId));
+      return () => !alive(owner.leader) && !alive(processId);
+    };
+    const old = await start();
+    const workspace = await js("return window.__ironTest.workspaceId();");
+    const switchProject = async () => {
+      await openProjectControl("#open-folder");
+      await eventually("switch warns about the active terminal", () => text("#project-transition-description"), value => /terminal.*foreground/.test(value));
+      await click("#project-transition-continue");
+      await eventually("the workbench settles the project picker", () => js("return !document.querySelector('#open-folder').disabled;"));
+    };
+    await js("return window.__ironTest.cancelNextPicker().then(() => true);");
+    await switchProject();
+    assert.equal(await js("return window.__ironTest.workspaceId();"), workspace);
+    assert.equal(old(), false, "a cancelled picker must preserve the terminal");
+    await switchProject();
+    assert.notEqual(await js("return window.__ironTest.workspaceId();"), workspace);
+    assert.equal(old(), true, "cutover must wait for leader and foreground cleanup");
+
+    const shutdown = await start();
+    await terminalCheckpoint("Quit with PTY");
+    try { await js("void window.__ironTest.quitMenu(); return true;"); }
+    catch (error) { if (error.cause?.code !== "UND_ERR_SOCKET") throw error; }
+    const exit = await Promise.race([app.exited, delay(10_000, { timedOut: true }, { ref: false })]);
+    assert.equal(exit.code, 0);
+    assert.equal(shutdown(), true, "AppKit Quit waits for PTY and foreground retirement");
+  });
+}
+
+async function trashSuite() {
+  await record("actual macOS Trash preserves disk bytes on an isolated APFS volume", async () => {
+    assert.ok(trashRoot && trashRoot.startsWith(path.dirname(path.dirname(fixture)) + path.sep));
+    const relative = "trash-fixture.txt";
+    const file = path.join(fixture, relative);
+    const original = "The disposable disk bytes for Trash.\n";
+    await writeFile(file, original);
+    await openOrbit();
+    await click("#quick-open");
+    await set("#palette-text", relative);
+    await click("#palette-options button");
+    await eventually("the disposable file is open", current, entry => entry?.path === relative);
+    await replace("Unsaved text to discard only after confirming Trash.\n");
+    await chooseCommand("move to trash");
+    await eventually("dirty Trash requires a discard decision", () => text("#form-submit"), value => /Discard and Move to Trash/.test(value));
+    await click('[data-dialog-close="form-dialog"]');
+    assert.equal(await readFile(file, "utf8"), original);
+    assert.equal((await current()).dirty, true);
+    await chooseCommand("move to trash");
+    await eventually("Trash reopens the explicit discard decision", () => text("#form-submit"), value => /Discard and Move to Trash/.test(value));
+    await click("#form-submit");
+    await eventually("the app reports the actual Trash operation", () => text("#status"), value => /Moved trash-fixture\.txt to Trash/.test(value));
+    await assert.rejects(stat(file), { code: "ENOENT" });
+    assert.equal(await js("return !!document.querySelector('#tabs [data-path=\"trash-fixture.txt\"]');"), false);
+    const contained = (await readdir(trashRoot)).filter(name => name.startsWith("trash-fixture"));
+    assert.equal(contained.length, 1);
+    assert.equal(await readFile(path.join(trashRoot, contained[0]), "utf8"), original);
+  });
+}
+
+async function recentSuite() {
+  const paths = ["session-one.txt", "session-deleted.txt", "session-two.txt"];
+  const oracle = path.join(home, "editor-session-oracle.json");
+  const view = () => js("const session = window.__ironTest.editorSession(); return session.tabs.find(tab => tab.path === session.active);");
+  const activate = async relative => {
+    await click(`#tabs [data-path="${relative}"]`);
+    await eventually(`the ${relative} tab is active`, current, state => state?.path === relative);
+  };
+  if (!reopen) {
+    await record("ordinary Quit captures active and inactive editor positions", async () => {
+      const source = Array.from({ length: 180 }, (_, index) => `Line ${index + 1} of the disposable session fixture`).join("\n") + "\n";
+      await Promise.all(paths.map(relative => writeFile(path.join(fixture, relative), source)));
+      await openOrbit();
+      const expected = {};
+      for (const [index, relative] of paths.entries()) {
+        await click("#quick-open");
+        await set("#palette-text", relative);
+        await click("#palette-options button");
+        await eventually(`indexed ${relative} opens`, current, state => state?.path === relative);
+        const line = 55 + index * 25;
+        await js("window.__ironTest.revealLine(arguments[0]); window.__ironTest.position(arguments[0], arguments[1]); return true;", line, index + 3);
+        expected[relative] = await eventually("the editor viewport moves", view, state => state?.line === line && state.firstLine > 1);
+      }
+      const history = path.join(home, "Library/Application Support/dev.irongo.e2e/recent-v1/index.json");
+      const stored = async () => JSON.parse(await readFile(history, "utf8")).entries[0]?.editor;
+      const earlier = await eventually("the old viewport was durably recorded", stored, data => data?.tabs.find(tab => tab.path === paths[2])?.line === expected[paths[2]].line);
+      await js("window.__ironTest.holdEditorSession(true); window.__ironTest.revealLine(146); window.__ironTest.position(146, 8); return true;");
+      expected[paths[2]] = await eventually("a distinct final viewport is present before Quit", view, state => state?.line === 146 && state.firstLine !== earlier.tabs.find(tab => tab.path === paths[2]).firstLine);
+      assert.deepEqual(await stored(), earlier);
+      await writeFile(oracle, JSON.stringify(expected));
+      await terminalCheckpoint("Quit with editor session");
+      try { await js("void window.__ironTest.quitMenu(); return true;"); }
+      catch (error) { if (error.cause?.code !== "UND_ERR_SOCKET") throw error; }
+      const exit = await Promise.race([app.exited, delay(6000, { timedOut: true }, { ref: false })]);
+      assert.equal(exit.code, 0);
+      await rename(path.join(fixture, paths[1]), path.join(home, paths[1]));
+    });
+    return;
+  }
+  await record("Open Recent restores surviving editor tabs and viewports after relaunch", async () => {
+    assert.equal((await current()).path ?? null, null);
+    await eventually("Welcome offers Open Recent without automatically loading a project", () => js("return document.querySelector('#welcome-recent')?.checkVisibility() === true;"));
+    await click("#welcome-recent");
+    await eventually("the remembered fixture is available", () => text("#recent-list"), value => /orbit/.test(value));
+    await click("#recent-list .recent-open");
+    await eventually("the previously active surviving tab is restored", current, state => state?.path === paths[2]);
+    const tabs = await js("return Array.from(document.querySelectorAll('#tabs [data-tab-path]'), tab => tab.dataset.tabPath);");
+    assert.deepEqual(tabs, ["cmd/orbit/main.go", paths[0], paths[2]]);
+    const expected = JSON.parse(await readFile(oracle, "utf8"));
+    for (const relative of [paths[2], paths[0]]) {
+      await activate(relative);
+      await eventually(`the exact restored caret and first visible line of ${relative} agree`, view,
+        state => state?.line === expected[relative].line && state.column === expected[relative].column && state.firstLine === expected[relative].firstLine);
+    }
+    await eventually("the missing file is summarized", () => text("#toast"), value => /skipped.*1|1.*skipped/i.test(value));
+    await refreshThroughProjectActions();
+    assert.deepEqual(await view(), expected[paths[0]]);
+    assert.deepEqual(await js("return Array.from(document.querySelectorAll('#tabs [data-tab-path]'), tab => tab.dataset.tabPath);"), tabs);
+    await openProjectControl("#open-folder");
+    await eventually("deliberate same-root reopen starts with a fresh editor", current, entry => entry?.path === "cmd/orbit/main.go");
+    assert.deepEqual(await js("return Array.from(document.querySelectorAll('#tabs [data-tab-path]'), tab => tab.dataset.tabPath);"), ["cmd/orbit/main.go"]);
+  });
+}
+
+async function recoverySuite() {
+  const file = path.join(fixture, "cmd/orbit/main.go");
+  const original = await readFile(file, "utf8");
+  const local = original + "\n// Uncommitted crash recovery marker.\n";
+  if (!reopen) {
+    await record("a completed unsaved draft survives abrupt process termination", async () => {
+      await openOrbit();
+      await replace(local);
+      await eventually("the native writer has committed the draft", () => text("#draft-state"), value => /Draft saved/.test(value));
+      assert.equal(await readFile(file, "utf8"), original);
+      await terminalCheckpoint("crash with completed draft");
+      await observeBeforeCrash(app.child.pid);
+      process.kill(app.child.pid, "SIGKILL");
+      const exit = await Promise.race([app.exited, delay(6000, { timedOut: true }, { ref: false })]);
+      assert.equal(exit.signal, "SIGKILL", "the test crashed the app process, not its worker");
+      const substitute = `${file}.replacement`;
+      await writeFile(substitute, original);
+      await rename(substitute, file);
+    });
+    return;
+  }
+  if (reopen === "after-quit") {
+    await record("ordinary Discard and Quit retires only that writer's draft", async () => {
+      assert.equal((await current()).path ?? null, null);
+      await openOrbit();
+      await chooseCommand("recover drafts");
+      await eventually("only the original crashed writer's draft remains", () => text("#draft-list"), value => /Detached writer/.test(value));
+      assert.equal(await js("return document.querySelectorAll('#draft-list .draft-row').length;"), 1);
+      await click('[data-dialog-close="draft-dialog"]');
+      const moved = `${fixture}-moved`;
+      await rename(fixture, moved);
+      try {
+        await chooseCommand("close project");
+        await eventually("a moved project can still be closed", () => js("return !document.querySelector('#project-welcome').hidden;"));
+        await chooseCommand("manage recovery drafts");
+        await eventually("management lists the old location without opening it", () => text("#draft-list"), value => value.includes(fixture));
+        const remove = '#draft-list .draft-row button';
+        await click(remove);
+        await eventually("removal requires a separate confirmation", () => text(remove), value => value === "Confirm Removal");
+        await click(remove);
+        await eventually("explicit removal retires the detached snapshot", () => text("#draft-dialog-note"), value => /No detached drafts/.test(value));
+      } finally { await rename(moved, fixture); }
+      assert.equal(await readFile(file, "utf8"), original);
+    });
+    return;
+  }
+  await record("recovery after a same-byte replacement retains the original disk expectation", async () => {
+    assert.equal((await current()).path ?? null, null);
+    assert.equal(await js("return !document.querySelector('#project-welcome').hidden;"), true);
+    await openOrbit();
+    await chooseCommand("recover drafts");
+    await eventually("the detached draft is offered for explicit recovery", () => text("#draft-list"), value => /cmd\/orbit\/main\.go/.test(value));
+    await click("#draft-list button");
+    await eventually("the recovered content is a dirty editor buffer", current, entry => entry?.text === local && entry.dirty);
+    assert.equal(await readFile(file, "utf8"), original);
+    await click("#save");
+    await eventually("normal Save refuses a replaced baseline even when the bytes match", () => text("#toast"), value => /disk version changed/i.test(value));
+    assert.equal(await readFile(file, "utf8"), original);
+    assert.equal((await current()).dirty, true);
+  });
+  await record("a reviewed reload held during retirement preserves the draft if disk changes again", async () => {
+    await eventually("the recovered draft copy is published", () => text("#draft-state"), value => /Draft saved/.test(value));
+    await click("#compare-disk");
+    await eventually("the reviewed reload action is ready", () => js("return document.querySelector('#disk-compare-dialog').open && !document.querySelector('#disk-compare-reload').disabled;"));
+    await js("return window.__ironTest.holdSave(true, 'cmd/orbit/main.go').then(() => true);");
+    try {
+      await click("#disk-compare-reload");
+      await eventually("the native reviewed retirement is held", () => js("return window.__ironTest.holdSave();"));
+      await writeFile(file, original + "\n// Changed during recovery retirement.\n");
+    } finally { await js("return window.__ironTest.holdSave(false).then(() => true);"); }
+    await eventually("the reviewed reload reports the changed disk version", () => text("#toast"), value => /Compare again before reloading/.test(value));
+    assert.equal((await current()).text, local);
+    assert.equal((await current()).dirty, true);
+    await chooseCommand("recover drafts");
+    await eventually("the active copy's recovery entry remains published", () => text("#draft-list"), value => /Open writer/.test(value));
+    await click('[data-dialog-close="draft-dialog"]');
+    await writeFile(file, original);
+  });
+  await record("two live workbenches cannot remove an active writer or its newer detached draft", async () => {
+    assert.ok(peer && peerExited);
+    const request = (endpoint, payload) => w3c(endpoint, payload, undefined, peer.driver);
+    await eventually("the second native workbench is ready", () => request("/status"), value => value?.ready);
+    const { sessionId } = await request("/session", { capabilities: { alwaysMatch: {} } });
+    const fromPeer = (script, ...args) => request(`/session/${sessionId}/execute/sync`, { script, args });
+    await eventually("the second workbench has its own native adapter", () => fromPeer("return !!window.__ironTest;"));
+    const records = () => js("return window.__ironTest.draftRecords();");
+    const previous = new Set((await records()).map(entry => entry.writer));
+    await fromPeer("document.querySelector('#welcome-open').click(); return true;");
+    await eventually("the second writer opens the same project explicitly", () => fromPeer("return window.__ironTest.snapshot();"), entry => entry?.path === "cmd/orbit/main.go");
+    await fromPeer("window.__ironTest.replace(arguments[0]); return true;", original + "\n// Independent writer first draft.\n");
+    const captured = await eventually("the first app observes a live independent writer", async () => (await records()).find(entry => !previous.has(entry.writer)),
+      entry => entry?.path === "cmd/orbit/main.go" && !entry.detached);
+    const tryRemove = entry => js("return window.__ironTest.removeDraftRecord(arguments[0]).then(() => '', error => String(error));", entry);
+    assert.match(await tryRemove(captured), /writer is still open/);
+    await fromPeer("return window.__ironTest.holdDraftProfile(true).then(() => true);");
+    try {
+      await js("void window.__ironTest.quitMenu(); return true;");
+      await eventually("Quit presents its decision while the second app holds the profile", () => js("return document.querySelector('#quit-dialog').open && !document.querySelector('#quit-discard').disabled;"));
+      await click("#quit-discard");
+      await eventually("Quit releases the workbench without receiving the profile lock", () => text("#toast"), value => /Recovery storage is busy/.test(value), 3500);
+      await eventually("editing thaws before the profile holder releases its lock", () => js("return !document.querySelector('#open-folder').disabled;"));
+      assert.equal((await current()).text, local);
+    } finally { await fromPeer("return window.__ironTest.holdDraftProfile(false).then(() => true);"); }
+    assert.ok((await records()).some(entry => entry.writer === captured.writer));
+    await fromPeer("window.__ironTest.replace(arguments[0]); return true;", original + "\n// Independent writer newer draft.\n");
+    const newer = await eventually("the live writer publishes its next revision", async () => (await records()).find(entry => entry.writer === captured.writer),
+      entry => entry?.revision > captured.revision && !entry.detached);
+    const errors = await fromPeer("return window.__ironTestRuntimeErrors();");
+    runtimeClean(errors);
+    await writeFile(path.join(peer.artifacts, "last-live.json"), JSON.stringify({ runtimeErrors: errors }));
+    await observeBeforeCrash(peer.pid);
+    process.kill(peer.pid, "SIGKILL");
+    const exit = await Promise.race([peerExited, delay(6000, { timedOut: true }, { ref: false })]);
+    assert.equal(exit.signal, "SIGKILL");
+    await writeFile(path.join(peer.artifacts, "report.json"), JSON.stringify({
+      version: 1, group: "recovery", cases: [{ name: "Independent left-behind writer", result: "pass" }],
+      terminal: { action: "crash with completed draft", rendererObserved: "through last live checkpoint before requesting exit" },
+    }));
+    await eventually("the writer is detached after the actual second app exits", async () => (await records()).find(entry => entry.writer === captured.writer), entry => entry?.detached);
+    assert.match(await tryRemove(captured), /record changed/);
+    assert.equal(await tryRemove(newer), "");
+    assert.deepEqual(new Set((await records()).map(entry => entry.writer)), previous);
+    assert.equal(await readFile(file, "utf8"), original);
+  });
+  await record("refused and expired Quit leave the staged recovery data available", async () => {
+    await eventually("a native draft exists before testing Quit", () => text("#draft-state"), value => /Draft saved/.test(value));
+    for (const refuse of [true, false]) {
+      const before = await js("return window.__ironTest.quitExpiry();");
+      await js("return window.__ironTest.draftQuit(true).then(() => true);");
+      try {
+        await js("void window.__ironTest.quitMenu(); return true;");
+        await eventually("Quit presents its ordinary discard choice", () => js("return document.querySelector('#quit-dialog').open && !document.querySelector('#quit-discard').disabled;"));
+        await click("#quit-discard");
+        await eventually("a draft index is staged before the final Quit decision", () => js("return window.__ironTest.draftQuit();"));
+        if (!refuse) await eventually("the real Quit ticket expires while staged", () => js("return window.__ironTest.quitExpiry();"), value => value > before);
+      } finally { await js("return window.__ironTest.draftQuit(false, arguments[0]).then(() => true);", refuse); }
+      await eventually("the workbench thaws after the unsuccessful Quit", () => js("return !document.querySelector('#open-folder').disabled;"));
+      assert.equal((await current()).text, local);
+      assert.equal((await current()).dirty, true);
+      await chooseCommand("recover drafts");
+      await eventually("both published drafts survived the unsuccessful Quit", () => js("return document.querySelectorAll('#draft-list .draft-row').length;"), count => count === 2);
+      await click('[data-dialog-close="draft-dialog"]');
+    }
+  });
+  await record("cancelled project switch retains the draft and ordinary Quit commits its retirement", async () => {
+    await eventually("the recovered copy has a separate completed draft", () => text("#draft-state"), value => /Draft saved/.test(value));
+    const rootId = await js("return window.__ironTest.workspaceId();");
+    await js("return window.__ironTest.cancelNextPicker().then(() => true);");
+    await openProjectControl("#open-folder");
+    await eventually("the project confirms discard before the picker", () => text("#project-transition-continue"), value => /Discard and Continue/.test(value));
+    await click("#project-transition-continue");
+    await eventually("the cancelled picker leaves an editable workbench", () => js("return !document.querySelector('#open-folder').disabled;"));
+    assert.equal(await js("return window.__ironTest.workspaceId();"), rootId);
+    assert.equal((await current()).text, local);
+    await chooseCommand("recover drafts");
+    await eventually("both the crashed snapshot and its active copy remain", () => js("return document.querySelectorAll('#draft-list .draft-row').length;"), count => count === 2);
+    await click('[data-dialog-close="draft-dialog"]');
+    await js("void window.__ironTest.quitMenu(); return true;");
+    await eventually("ordinary Quit requests a decision for the recovered buffer", () => js("return document.querySelector('#quit-dialog').open && !document.querySelector('#quit-discard').disabled;"));
+    await terminalCheckpoint("discard recovery and Quit");
+    try { await click("#quit-discard"); }
+    catch (error) { if (error.cause?.code !== "UND_ERR_SOCKET") throw error; }
+    const exit = await Promise.race([app.exited, delay(6000, { timedOut: true }, { ref: false })]);
+    assert.equal(exit.code, 0);
+    assert.equal(await readFile(file, "utf8"), original);
+  });
 }
 
 async function nativeSaveQuit() {
@@ -812,6 +1351,101 @@ async function fileSuite() {
     lockInode = lock.ino;
   });
 
+  await record("explicit format-on-save preserves exact disk encoding and remains undoable", async () => {
+    const relative = "format_save.go";
+    const disk = path.join(fixture, relative);
+    const initial = "package formatfixture\r\nfunc Value() int{return 1}\r\n";
+    const ordinary = initial.replace("return 1", "return 2");
+    const submitted = initial.replace("return 1", "return  3");
+    const formatted = "package formatfixture\r\n\r\nfunc Value() int { return 3 }\r\n";
+    const bom = "\ufeff";
+    await writeFile(disk, bom + initial);
+    await eventually("format fixture appears", () => js("return !!document.querySelector('#explorer [data-path=\"format_save.go\"]');"));
+    await click('#explorer [data-path="format_save.go"]');
+    await eventually("format fixture is active", current, state => state?.path === relative);
+    await replace(ordinary);
+    await click("#save");
+    await eventually("formatting is off by default", () => readFile(disk, "utf8"), bytes => bytes === bom + ordinary);
+    await eventually("ordinary save is clean", current, state => !state.dirty);
+    const toggle = async () => {
+      await click("#settings");
+      await click("#format-save-setting");
+      await click('[data-dialog-close="settings-dialog"]');
+    };
+    await toggle();
+    try {
+      await replace(submitted);
+      await click("#save");
+      await eventually("gofmt writes the original BOM and CRLF convention", () => readFile(disk, "utf8"), bytes => bytes === bom + formatted);
+      await eventually("the live model matches the committed snapshot", current, state => state?.text === bom + formatted && !state.dirty);
+      await js("window.__ironTest.action('undo', 1, 1); return true;");
+      await eventually("Undo restores only the original buffer bytes", current, state => state?.text === bom + submitted && state.dirty);
+      assert.equal(await readFile(disk, "utf8"), bom + formatted);
+      await js("window.__ironTest.action('redo', 1, 1); return true;");
+      await eventually("Redo returns to the saved formatting", current, state => state?.text === bom + formatted && !state.dirty);
+      const invalid = formatted + "func {\r\n";
+      await replace(invalid);
+      await js(`document.querySelector('#save').click(); document.querySelector('#tabs [data-path="cmd/orbit/main.go"]').click(); return true;`);
+      await eventually("invalid Go reports its source after switching tabs", () => text("#toast"), value => /format_save\.go.*Save Without Formatting/s.test(value));
+      assert.equal(await readFile(disk, "utf8"), bom + formatted);
+      assert.equal((await current()).path, "cmd/orbit/main.go");
+      await click('#tabs [data-path="format_save.go"]');
+      assert.equal((await current()).text, bom + invalid);
+      await chooseCommand("save without formatting");
+      await eventually("the explicit bypass writes the exact original bytes", () => readFile(disk, "utf8"), bytes => bytes === bom + invalid);
+      await eventually("the bypass finishes", current, state => !state.dirty);
+      const sibling = path.join(fixture, "format_sibling.go");
+      const third = path.join(fixture, "format_third.go");
+      const siblingSource = "package formatfixture\nfunc Sibling() int{return 1}\n";
+      const siblingFormatted = "package formatfixture\n\nfunc Sibling() int { return 2 }\n";
+      const thirdSource = "package formatfixture\nfunc Third() int{return 1}\n";
+      await writeFile(sibling, siblingSource);
+      await writeFile(third, thirdSource);
+      const siblingRow = '#explorer [data-path="format_sibling.go"]';
+      await eventually("the second Go file appears", () => js("return !!document.querySelector(arguments[0]);", siblingRow));
+      await click(siblingRow);
+      await eventually("the second Go file is active", current, state => state?.path === "format_sibling.go");
+      await replace(siblingSource.replace("return 1", "return  2"));
+      const thirdRow = '#explorer [data-path="format_third.go"]';
+      await eventually("the third Go file appears", () => js("return !!document.querySelector(arguments[0]);", thirdRow));
+      await click(thirdRow);
+      await eventually("the third Go file is active", current, state => state?.path === "format_third.go");
+      await replace(thirdSource.replace("return 1", "return  2"));
+      await click('#tabs [data-path="format_save.go"]');
+      await eventually("the original Go file is active again", current, state => state?.path === relative);
+      await replace(submitted);
+      await js(`window.__formatBatchHoldReady = false;
+        void window.__ironTest.holdSave(true, 'format_sibling.go').then(() => window.__formatBatchHoldReady = true); return true;`);
+      await eventually("the second file hold is armed", () => js("return window.__formatBatchHoldReady;"));
+      const later = formatted + "// newer edit during Save All\r\n";
+      try {
+        await chooseCommand("save all");
+        await eventually("Save All gets past its own formatting and admits the second file", () => js(`
+          if (!window.__formatBatchAtBarrier) void window.__ironTest.holdSave().then(waiting => window.__formatBatchAtBarrier = waiting);
+          return !!window.__formatBatchAtBarrier;
+        `));
+        assert.equal(await readFile(disk, "utf8"), bom + formatted);
+        assert.equal((await current()).path, relative);
+        await replace(later);
+      } finally { await js("void window.__ironTest.holdSave(false); return true;"); }
+      await eventually("the batch reports the two committed paths", output, value => /Saved: format_save\.go, format_sibling\.go/.test(value));
+      assert.equal(await readFile(sibling, "utf8"), siblingFormatted);
+      assert.equal(await readFile(third, "utf8"), thirdSource);
+      assert.equal((await current()).text, bom + later);
+      assert.equal((await current()).dirty, true);
+      await replace(formatted);
+      await click('#tabs [data-path="format_sibling.go"]');
+      await eventually("the formerly inactive tab received its own formatted snapshot", current,
+        state => state?.path === "format_sibling.go" && state.text === siblingFormatted && !state.dirty);
+      await rename(sibling, path.join(fixture, "format-save-sibling.txt"));
+      await click('#tabs [data-path="format_third.go"]');
+      await eventually("the untouched third target is active", current, state => state?.path === "format_third.go");
+      await replace(thirdSource);
+      await rename(third, path.join(fixture, "format-save-third.txt"));
+    } finally { await toggle(); }
+    await rename(disk, path.join(fixture, "format-save-sample.txt"));
+    await click('#tabs [data-path="cmd/orbit/main.go"]');
+  });
   await record("protects externally edited files from overwrite", async () => {
     const saved = await readFile(source, "utf8");
     const external = saved + "\n// External change\n";
@@ -1227,6 +1861,73 @@ async function fileSuite() {
     await eventually("ordinary Save advances the new file", () => readFile(recovered, "utf8"), value => value === newer);
     await eventually("the rebound tab is clean", current, state => !state.dirty);
   });
+  await record("moves a directory with clean and dirty descendants without losing work", async () => {
+    const source = "move-fixture";
+    const destination = "moved-fixture";
+    const baseline = "package movefixture\n\nvar value = 1\n";
+    const local = baseline.replace("= 1", "= 2");
+    await mkdir(path.join(fixture, source));
+    await writeFile(path.join(fixture, source, "dirty.go"), baseline);
+    await writeFile(path.join(fixture, source, "clean.go"), "package movefixture\n");
+    for (const leaf of ["clean.go", "dirty.go"]) {
+      await click("#quick-open");
+      await set("#palette-text", `${source}/${leaf}`);
+      await eventually("the indexed descendant is available", () => text("#palette-options"), value => value.includes(leaf));
+      await click("#palette-options button");
+      await eventually("the descendant tab is active", current, entry => entry?.path === `${source}/${leaf}`);
+    }
+    await replace(local);
+    await eventually("the dirty file's draft is published before move", () => text("#draft-state"), value => /Draft saved/.test(value));
+    await clickGlyphBreakpoint(3);
+    await click('[data-view="explorer"]');
+    const row = `#explorer [data-path="${source}"]`;
+    await eventually("the Explorer can own the source selection", () => js("return !!document.querySelector(arguments[0]);", row));
+    await click(row);
+    await click("#quick-open");
+    await set("#palette-text", ">move file or folder");
+    await eventually("the move command is available for the selected directory", () => text("#palette-options"), value => /Move File or Folder/.test(value));
+    await click("#palette-options button");
+    await eventually("Move names the selected source", () => text("#form-description"), value => value.includes(source));
+    await set('#form-fields input[name="destination"]', destination);
+    await click("#form-submit");
+    await eventually("the dirty descendant is rebound and remains active", current, entry => entry?.path === `${destination}/dirty.go` && entry.text === local && entry.dirty);
+    assert.equal(await readFile(path.join(fixture, destination, "dirty.go"), "utf8"), baseline);
+    await assert.rejects(stat(path.join(fixture, source)), { code: "ENOENT" });
+    assert.equal(await js("return !!document.querySelector('#tabs [data-path=\"moved-fixture/clean.go\"]');"), true);
+    assert.equal(await js("return !!document.querySelector('#editor .debug-breakpoint');"), true);
+    await chooseCommand("recover drafts");
+    await eventually("the owned draft has its new workspace-relative path", () => text("#draft-list"), value => value.includes(`${destination}/dirty.go`));
+    assert.doesNotMatch(await text("#draft-list"), /(^|\s)move-fixture\/dirty\.go/);
+    await click('[data-dialog-close="draft-dialog"]');
+    await chooseCommand("new folder");
+    await eventually("the new folder form is ready", () => text("#form-submit"), value => value === "New Folder");
+    await set('#form-fields input[name="destination"]', `${destination}/Nested`);
+    await click("#form-submit");
+    await eventually("the nested folder exists", () => stat(path.join(fixture, destination, "Nested")), info => info.isDirectory());
+    await eventually("the folder form closes", () => js("return !document.querySelector('#form-dialog').open;"));
+    await click(`#explorer [data-path="${destination}"]`);
+    await chooseCommand("rename file or folder");
+    await eventually("the case rename form is ready", () => text("#form-description"), value => value.includes(destination));
+    await set('#form-fields input[name="destination"]', "MOVED-fixture");
+    await click("#form-submit");
+    await eventually("case-only directory rename rebinds the dirty descendant", current, entry => entry?.path === "MOVED-fixture/dirty.go" && entry.text === local && entry.dirty);
+    const actual = await readdir(fixture);
+    assert.ok(actual.includes("MOVED-fixture") && !actual.includes(destination));
+    await mkdir(path.join(fixture, "occupied-move"));
+    await eventually("the case rename form closes", () => js("return !document.querySelector('#form-dialog').open;"));
+    await chooseCommand("move file or folder");
+    await eventually("the move form names the exact case-renamed source", () => text("#form-description"), value => value.includes("MOVED-fixture"));
+    await set('#form-fields input[name="destination"]', "occupied-move");
+    await click("#form-submit");
+    await eventually("an existing destination is not replaced", () => js(`const error = document.querySelector('#form-error');
+      return !error.hidden && !document.querySelector('#form-submit').disabled ? error.textContent : '';`), value => /without replacing|exists/i.test(value));
+    assert.equal(await readFile(path.join(fixture, "MOVED-fixture/dirty.go"), "utf8"), baseline);
+    assert.deepEqual(await readdir(path.join(fixture, "occupied-move")), []);
+    assert.equal((await current()).dirty, true);
+    await click('[data-dialog-close="form-dialog"]');
+    await eventually("the failed move releases the file decision", () => js("return !document.querySelector('#new-file').disabled;"));
+    await replace(baseline);
+  });
   await record("native watcher detects a moved ancestor and rejects writes into a replacement root", async () => {
     const parent = path.dirname(fixture);
     const retired = `${parent}-retired`;
@@ -1248,6 +1949,17 @@ async function fileSuite() {
       await rename(retired, parent);
     }
   });
+}
+
+async function holdConfiguredBuild(launch = () => click("#run")) {
+  await js(`window.__handoffArmed = false; window.__handoffDirectory = null;
+    void window.__ironTest.runHandoff(true).then(() => window.__handoffArmed = true); return true;`);
+  await eventually("the native handoff barrier is armed", () => js("return window.__handoffArmed;"));
+  await launch();
+  return eventually("the configured build succeeds and waits before executable admission", () => js(`
+    void window.__ironTest.runHandoff().then(directory => window.__handoffDirectory = directory);
+    return window.__handoffDirectory;
+  `), Boolean, 30_000);
 }
 
 async function goSuite() {
@@ -1296,7 +2008,8 @@ async function goSuite() {
     for (const name of ["gopls publishes/clears real errors and completes a Go symbol", "gopls hover and definition work through Monaco",
       "gopls symbol and reference navigation uses unsaved UTF-16 locations", "Organize Imports updates only the Go buffer as one undoable edit",
       "Rename previews real cross-file changes and rejects a stale workspace",
-      "runs exactly one Go test from its editor action", "whole-line selection highlights the selected number, not its endpoint"]) {
+      "opens Go standard library and offline dependency source in an isolated read-only viewer", "runs exactly one Go test from its editor action",
+      "whole-line selection highlights the selected number, not its endpoint"]) {
       console.log(`  SKIP ${name} (gopls not installed)`);
       report.cases.push({ name, result: "skip", reason: "gopls not installed" });
     }
@@ -1422,6 +2135,7 @@ async function goSuite() {
         await replace(later);
         await click("#save");
         await eventually("ordinary Save remains available while the code action is waiting", () => readFile(file, "utf8"), bytes => bytes === later);
+        await eventually("the completed Save has published its status", () => text("#status"), value => value === "Saved organize.go");
       } finally { await js("window.__ironTest.releaseGoReferences(); return true;"); }
       await eventually("the superseded import response is rejected", () => text("#status"), value => /buffer changed/.test(value));
       await eventually("the superseded import response leaves the new buffer alone", current, state => state?.text === later && !state.dirty);
@@ -1515,6 +2229,69 @@ async function goSuite() {
       await action("editor.action.revealDefinition");
       const result = await eventually("definition opened in workspace", current, state => state?.path === "internal/status/report.go", 20_000);
       assert.match(result.text, /func NewReport\(/);
+      await click('#tabs [data-path="cmd/orbit/main.go"]');
+      await action("ironGo.goToDefinition");
+      await eventually("workbench definition opens the same editable source", current, state => state?.path === "internal/status/report.go");
+      assert.equal(await js("return window.__ironTest.gutterTrace().selection.empty;"), true);
+    });
+    await record("opens Go standard library and offline dependency source in an isolated read-only viewer", async () => {
+      await click('#tabs [data-path="cmd/orbit/main.go"]');
+      const state = await eventually("main Go file is active", current, entry => entry?.path === "cmd/orbit/main.go");
+      const lines = state.text.split("\n");
+      const row = lines.findIndex(line => line.includes("fmt.Println"));
+      assert.ok(row >= 0);
+      const invokeDefinition = (id, line, column) => js(`
+        window.__sourceActionDone = false;
+        void Promise.resolve(window.__ironTest.action(arguments[0], arguments[1], arguments[2]))
+          .then(() => window.__sourceActionDone = true); return true;
+      `, id, line, column);
+      const column = lines[row].indexOf("Println") + 2;
+      await invokeDefinition("editor.action.peekDefinition", row + 1, column);
+      await eventually("external Peek has no preview", () => text("#editor .monaco-editor-overlaymessage"), value => /no definition found/i.test(value));
+      assert.equal(await js("return document.querySelector('#go-source-dialog').open;"), false);
+      await invokeDefinition("ironGo.goToDefinition", row + 1, column);
+      await eventually("Go to Definition opens the read-only source viewer", () => js("return document.querySelector('#go-source-dialog')?.open === true;"));
+      const actualPath = await text("#go-source-path");
+      assert.match(actualPath, /\/src\/fmt\/print\.go$/);
+      await eventually("the viewer displays the standard-library declaration", () => text("#go-source-editor .view-lines"), value => /func\s+Println/.test(value));
+      assert.deepEqual(await js("return window.__ironTest.goSourceView();"), { text: await readFile(actualPath, "utf8"), selected: "Println" });
+      assert.equal(await js("return document.querySelector('#go-source-editor textarea')?.readOnly;"), true);
+      assert.equal((await current()).path, "cmd/orbit/main.go");
+      assert.equal(await js("return [...document.querySelectorAll('#tabs [data-path]')].some(tab => tab.dataset.path.endsWith('/fmt/print.go'));"), false);
+      await click("#go-source-close");
+      await eventually("the originating editor regains focus", () => js("return document.querySelector('#editor').contains(document.activeElement);"));
+      await eventually("the source action completes", () => js("return window.__sourceActionDone;"));
+
+      const withDependency = state.text.replace('"fmt"', '"fmt"\n\t"example.test/sourcefixture"').replace("fmt.Println(", "fmt.Println(sourcefixture.FromCache(), ");
+      await replace(withDependency);
+      const dependencyLines = withDependency.split("\n");
+      const dependencyRow = dependencyLines.findIndex(line => line.includes("sourcefixture.FromCache"));
+      assert.ok(dependencyRow >= 0);
+      await js("window.__ironTest.holdGoRequest('textDocument/definition', 'file:///outside-go-source-fixture/source.go'); return true;");
+      try {
+        await invokeDefinition("ironGo.goToDefinition", dependencyRow + 1, dependencyLines[dependencyRow].indexOf("FromCache") + 2);
+        await eventually("the definition reply includes an unavailable first target", () => js("return window.__ironTest.goReferenceProbe().deferred;"));
+      } finally { await js("window.__ironTest.releaseGoReferences(); return true;"); }
+      await eventually("the offline dependency opens", () => text("#go-source-path"), value => value.endsWith("/example.test/sourcefixture@v1.0.0/source.go"));
+      assert.deepEqual(await js("return window.__ironTest.goSourceView();"), {
+        text: 'package sourcefixture\n\nfunc FromCache() string { return "local proxy fixture" }\n', selected: "FromCache",
+      });
+      await click("#go-source-close");
+      await eventually("the dependency action completes", () => js("return window.__sourceActionDone;"));
+      await replace(state.text);
+
+      const originalId = await js("return window.__ironTest.workspaceId();");
+      await js("window.__ironTest.holdGoSourceRead(); return true;");
+      try {
+        await invokeDefinition("ironGo.goToDefinition", row + 1, column);
+        await eventually("the native source read has returned and its result is held", () => js("return window.__ironTest.goSourceReadHeld();"));
+        await openProjectControl("#open-folder");
+        if (await js("return document.querySelector('#project-transition-dialog').open;")) await click("#project-transition-continue");
+        await eventually("the project has been reopened with a new identity", () => js("return window.__ironTest.workspaceId();"), id => id && id !== originalId);
+      } finally { await js("window.__ironTest.releaseGoSourceRead(); return true;"); }
+      await eventually("the delayed action settles", () => js("return window.__sourceActionDone;"));
+      assert.equal(await js("return document.querySelector('#go-source-dialog').open;"), false);
+      await eventually("gopls reconnects to the reopened workspace", current, entry => entry?.gopls === "ready");
     });
     await record("runs exactly one Go test from its editor action", async () => {
       const file = path.join(fixture, "internal/status/report_test.go");
@@ -1561,6 +2338,305 @@ async function goSuite() {
   } else {
     report.cases.push({ name: "keyboard command runs only the test at a dirty renamed declaration", result: "skip", reason: "gopls not installed" });
   }
+  await record("structured Go tests keep terminal results after output clipping and navigate failures", async () => {
+    const relative = "cmd/orbit/structured_test.go";
+    const file = path.join(fixture, relative);
+    const dependency = path.join(fixture, "internal", "structuredbroken");
+    const source = `package main
+import ("strings"; "testing")
+func TestStructuredLarge(t *testing.T) {
+  t.Log("bounded human output begins")
+  for i := 0; i < 620; i++ { t.Log(strings.Repeat("x", 1024)) }
+}
+func TestStructuredPass(t *testing.T) {}
+func TestStructuredSkip(t *testing.T) { t.Skip("skip fixture") }
+func TestStructuredNested(t *testing.T) {
+  t.Run("child.+", func(t *testing.T) { t.Fatal("failing child") })
+  t.Run("childXY", func(t *testing.T) { t.Log("similarly named sibling") })
+}
+`;
+    await writeFile(file, source);
+    await click("#quick-open");
+    await set("#palette-text", "structured_test.go");
+    await eventually("the new test source appears in Quick Open", () => text("#palette-options"), value => value.includes("structured_test.go"));
+    await click("#palette-options button");
+    await eventually("the structured fixture opens", current, state => state?.path === relative);
+    await click('[data-view="tasks"]');
+    await js("document.querySelector('#package-scope').value = 'current'; return true;");
+    await click('[data-task="test"]');
+    await eventually("visible output is clipped without dropping the result stream", output, value => /bounded human output begins[\s\S]*Visible output limit reached[\s\S]*exit code 1/.test(value), 30_000);
+    await click("#test-results-tab");
+    const result = () => text("#test-results-list");
+    assert.match(await result(), /TestStructuredPassPassed/);
+    assert.match(await result(), /TestStructuredSkipSkipped/);
+    assert.match(await result(), /TestStructuredNested\/child\.\+Failed/);
+    assert.doesNotMatch(await text("#test-results-summary"), /incomplete/i);
+    await js(`const child = [...document.querySelectorAll('#test-results-list button')].find(row => row.textContent === 'TestStructuredNested/child.+');
+      if (!child) throw new Error('The failed source location is not linked'); child.click(); return true;`);
+    const line = source.split("\n").findIndex(value => value.includes("failing child")) + 1;
+    await eventually("the test result jumps to the exact failure line", () => text("#cursor"), value => value.startsWith(`Ln ${line},`));
+
+    const rerun = () => js(`const row = [...document.querySelectorAll('#test-results-list .test-result-row')]
+      .find(row => row.textContent.startsWith('TestStructuredNested/child.+'));
+      const button = row?.querySelector('.test-result-rerun');
+      if (!button) throw new Error('The failed subtest has no rerun action'); button.click(); return true;`);
+    await rerun();
+    const reran = await eventually("a real rerun executes the punctuation-bearing name", output,
+      value => /-count=1[\s\S]*=== RUN\s+TestStructuredNested\/child\.\+[\s\S]*exit code 1/.test(value), 30_000);
+    assert.doesNotMatch(reran, /childXY|similarly named sibling/);
+    await click("#test-results-tab");
+    const manifest = path.join(fixture, "go.mod");
+    const previousModule = await readFile(manifest, "utf8");
+    try {
+      await js(`window.__rerunArmed = false; window.__rerunAtHandoff = null;
+        void window.__ironTest.runHandoff(true).then(() => window.__rerunArmed = true); return true;`);
+      await eventually("rerun handoff is armed", () => js("return window.__rerunArmed;"));
+      await rerun();
+      await eventually("preflight passed but no test was started yet", () => js(`
+        void window.__ironTest.runHandoff().then(root => window.__rerunAtHandoff = root);
+        return window.__rerunAtHandoff;`), root => root === fixture);
+      await writeFile(manifest, previousModule.replace("module example.com/orbit", "module example.com/moved-orbit"));
+      await js("void window.__ironTest.runHandoff(false); return true;");
+      const rejected = await eventually("a still-existing directory with a different import path is rejected", output,
+        value => /package identity changed[\s\S]*ended without an exit code/i.test(value), 30_000);
+      assert.doesNotMatch(rejected, /=== RUN/);
+    } finally {
+      await js("void window.__ironTest.runHandoff(false); return true;");
+      await writeFile(manifest, previousModule);
+    }
+
+    await writeFile(file, source.replace("func TestStructuredPass(t *testing.T) {}", "func TestStructuredPass(t *testing.T) { _ = undefinedFixtureSymbol }"));
+    await click('[data-task="test"]');
+    await eventually("test build variant diagnostics are correlated", result, value => /Blocked by build:.*\[.*\.test\][\s\S]*Build:.*\[.*\.test\]/.test(value), 30_000);
+    await eventually("variant build exits", output, value => /exit code 1/.test(value));
+
+    await mkdir(dependency);
+    await writeFile(path.join(dependency, "broken.go"), "package structuredbroken\nvar _ = missing\n");
+    await writeFile(file, `package main\nimport _ "example.com/orbit/internal/structuredbroken"\n`);
+    await click('[data-task="test"]');
+    await eventually("dependency build failures remain attributed to the dependency", result,
+      value => value.includes("Build: example.com/orbit/internal/structuredbroken"), 30_000);
+    await eventually("dependency build exits", output, value => /exit code 1/.test(value));
+
+    await writeFile(file, 'package main\nimport ("testing"; "time")\nfunc TestStructuredWaiting(t *testing.T) { time.Sleep(time.Minute) }\n');
+    await click('[data-task="test"]');
+    await eventually("the waiting test has a running result", result, value => /TestStructuredWaitingRunning/.test(value), 30_000);
+    await click("#stop-task");
+    await eventually("cancelled tests become incomplete", result, value => /TestStructuredWaitingIncomplete/.test(value));
+    await rename(file, path.join(fixture, "structured-suite.txt"));
+    await rename(path.join(dependency, "broken.go"), path.join(dependency, "broken.txt"));
+  });
+  await record("a selected Go configuration keeps build and program contexts separate", async () => {
+    const module = path.join(fixture, "configured-module");
+    await mkdir(module);
+    await mkdir(path.join(fixture, "runtime"));
+    await writeFile(path.join(module, "go.mod"), "module example.com/configured\n\ngo 1.22\n");
+    await writeFile(path.join(fixture, "go.work"), "go 1.22\n\nuse (\n\t.\n\t./configured-module\n)\n");
+    await writeFile(path.join(module, "main.go"), `package main
+import ("encoding/json"; "fmt"; "os"; "os/exec")
+func main() {
+  cwd, _ := os.Getwd()
+  if err := os.WriteFile("launched.marker", []byte("started"), 0600); err != nil { panic(err) }
+  child := exec.Command("/bin/sleep", "60")
+  if err := child.Start(); err != nil { panic(err) }
+  data, _ := json.Marshal(map[string]any{"cwd":cwd,"args":os.Args[1:],"gowork":os.Getenv("GOWORK"),"env":os.Getenv("PROFILE_VALUE"),"session":os.Getenv("PROFILE_SESSION"),"pid":os.Getpid(),"child":child.Process.Pid})
+  fmt.Printf("configured-start %s\\n", data)
+  if os.Getenv("PROFILE_EXIT_EARLY") == "1" { _ = child.Process.Release(); return }
+  _ = child.Wait()
+}
+`);
+    await click('[data-view="tasks"]');
+    await click("#run-configurations");
+    await set("#run-config-name", "Configured fixture");
+    await set("#run-config-package", "./configured-module");
+    await set("#run-config-directory", "runtime");
+    const args = ["", "two words", "-flag"];
+    await set("#run-config-arguments", '["\\ud800"]');
+    await click("#run-config-save");
+    await eventually("unpaired Unicode is rejected before saving", () => text("#run-config-error"), value => /valid Unicode/i.test(value));
+    await set("#run-config-arguments", JSON.stringify(args));
+    await set("#run-config-environment", "GOWORK=invalid-for-build\nPROFILE_VALUE=with = sign ");
+    await set("#run-config-session", "PROFILE_SESSION=session-only-sentinel");
+    await click("#run-config-save");
+    await eventually("the named configuration is selected", () => js("return document.querySelector('#run-target').selectedOptions[0]?.textContent;"), value => value?.includes("Configured fixture"));
+    const preferences = await js(`return Object.keys(localStorage).filter(key => key.startsWith('irongo.runConfigurations')).map(key => localStorage.getItem(key));`);
+    assert.match(preferences.join(""), /Configured fixture/);
+    assert.doesNotMatch(preferences.join(""), /session-only-sentinel/);
+    assert.notEqual((await current()).path, "configured-module/main.go");
+    await click("#run");
+    const actual = await eventually("the configured executable receives its own context", output, value => /configured-start \{[^\n]+\}/.test(value), 30_000);
+    const data = JSON.parse(actual.match(/configured-start (\{[^\n]+\})/)[1]);
+    assert.deepEqual(data.args, args);
+    assert.equal(data.cwd, path.join(fixture, "runtime"));
+    assert.equal(data.gowork, "invalid-for-build");
+    assert.equal(data.env, "with = sign ");
+    assert.equal(data.session, "session-only-sentinel");
+    assert.doesNotMatch(actual.split("configured-start")[0], /invalid-for-build|session-only-sentinel|two words/);
+    await click("#run");
+    await eventually("the configured Stop completes", output, value => /task stopped/i.test(value));
+    for (const pid of [data.pid, data.child]) {
+      await eventually("the configured process group is gone", () => {
+        try { process.kill(pid, 0); return false; } catch (error) { return error.code === "ESRCH"; }
+      });
+    }
+    const marker = path.join(fixture, "runtime", "launched.marker");
+    await rename(marker, path.join(fixture, "first-launch.marker"));
+
+    const sessionOverrides = async value => {
+      await click('[data-view="tasks"]');
+      await click("#run-configurations");
+      await set("#run-config-session", value);
+      await click("#run-config-save");
+      await eventually("the run configuration editor closes", () => js("return !document.querySelector('#run-config-dialog').open;"));
+    };
+    await sessionOverrides("PROFILE_SESSION=session-only-sentinel\nPROFILE_EXIT_EARLY=1");
+    await click("#run");
+    const leaderExited = await eventually("the configured leader exits before its same-group child", output,
+      value => /configured-start \{[^\n]+\}[\s\S]*exit code 0/.test(value), 30_000);
+    const retired = JSON.parse(leaderExited.match(/configured-start (\{[^\n]+\})/)[1]);
+    for (const processId of [retired.pid, retired.child]) assert.throws(() => process.kill(processId, 0), { code: "ESRCH" });
+    await rename(marker, path.join(fixture, "leader-first.marker"));
+    await sessionOverrides("PROFILE_SESSION=session-only-sentinel");
+
+    await js(`window.__invalidRun = null;
+      void window.__ironTest.attemptConfiguredRun('./configured-module', { directory: 'runtime', args: ['bad\\0argument'], environment: {} })
+        .then(() => window.__invalidRun = 'unexpected admission', error => window.__invalidRun = String(error));
+      return true;`);
+    await eventually("Rust rejects an invalid host argument before admission", () => js("return window.__invalidRun;"), value => /supported argument or environment limits/i.test(value ?? ""));
+    await assert.rejects(stat(marker), { code: "ENOENT" });
+
+    const cleanup = directory => eventually("the executable directory is retired", async () => {
+      try { await stat(directory); return false; } catch (error) { return error.code === "ENOENT"; }
+    });
+    const releaseHandoff = () => js("void window.__ironTest.runHandoff(false); return true;");
+    try {
+      const stopped = await holdConfiguredBuild();
+      await click("#run");
+      const cancelled = await eventually("Stop finishes the held task", output, value => /task stopped/i.test(value));
+      assert.equal((cancelled.match(/Task stopped/gi) ?? []).length, 1);
+      assert.doesNotMatch(cancelled, /configured-start/);
+      await cleanup(stopped);
+      await assert.rejects(stat(marker), { code: "ENOENT" });
+
+      const replaced = await holdConfiguredBuild();
+      const runtime = path.join(fixture, "runtime");
+      const backup = path.join(fixture, "runtime-backup");
+      await rename(runtime, backup);
+      await symlink(backup, runtime);
+      try {
+        await releaseHandoff();
+        const invalid = await eventually("a replaced directory cannot admit the executable", output,
+          value => /Open configured working directory[\s\S]*ended without an exit code/.test(value));
+        assert.doesNotMatch(invalid, /configured-start/);
+        assert.equal((invalid.match(/ended without an exit code/g) ?? []).length, 1);
+        await cleanup(replaced);
+        await click("#run");
+        await eventually("a preexisting symlink is rejected before build admission", () => text("#toast"), value => /Open configured working directory/.test(value));
+        assert.equal((await output()).match(/Build configured Go package/g)?.length, 1);
+      } finally {
+        await rename(runtime, path.join(fixture, "runtime-link"));
+        await rename(backup, runtime);
+      }
+
+      const retired = await holdConfiguredBuild();
+      await openProjectControl("#open-folder");
+      await eventually("project transition asks before stopping a held Run", () => js("return document.querySelector('#project-transition-dialog').open;"));
+      await click("#project-transition-continue");
+      await eventually("the reloaded project restores the selected configuration", () => js(`
+        const picker = document.querySelector('#run-target');
+        return !document.querySelector('#open-folder').disabled && picker.selectedOptions[0]?.textContent.includes('Configured fixture');
+      `));
+      await cleanup(retired);
+      assert.doesNotMatch(await output(), /configured-start|Task stopped|Build configured Go package/);
+      await assert.rejects(stat(marker), { code: "ENOENT" });
+    } finally { await releaseHandoff(); }
+
+    const changePackage = async packageName => {
+      await click('[data-view="tasks"]');
+      await click("#run-configurations");
+      await set("#run-config-package", packageName);
+      await click("#run-config-save");
+      await eventually("the run configuration changes package", () => js("return document.querySelector('#run-target').title;"), value => value.endsWith(packageName));
+    };
+    const library = path.join(module, "library");
+    await mkdir(library);
+    await writeFile(path.join(library, "library.go"), "package library\n\nfunc Value() int { return 1 }\n");
+    await changePackage("./configured-module/library");
+    await click("#run");
+    const archive = await eventually("a built library never launches as an executable", output,
+      value => /did not build a macOS executable[\s\S]*ended without an exit code/.test(value));
+    assert.equal((archive.match(/ended without an exit code/g) ?? []).length, 1);
+    assert.doesNotMatch(archive, /configured-start/);
+
+    await changePackage("./configured-module");
+    const program = path.join(module, "main.go");
+    const valid = await readFile(program, "utf8");
+    await writeFile(program, valid + "\nthis does not compile\n");
+    try {
+      await click("#run");
+      const failed = await eventually("a build error emits one terminal result", output, value => /exit code 1\b/.test(value));
+      assert.equal((failed.match(/exit code 1\b/g) ?? []).length, 1);
+      assert.doesNotMatch(failed, /configured-start/);
+    } finally { await writeFile(program, valid); }
+  });
+}
+
+async function reopenGoSuite() {
+  await record("a new native app restores the selected Go configuration without session secrets", async () => {
+    await js(`const key = Object.keys(localStorage).find(key => key.startsWith('irongo.runConfigurations'));
+      const record = JSON.parse(localStorage.getItem(key));
+      record.profiles.push({ ...record.profiles[0], id: 'corrupted', name: 'Malformed environment', environment: { 'A=B': 'invalid' } });
+      record.profiles.push({ ...record.profiles[0], id: 'missing-argv', name: 'Missing arguments', args: undefined });
+      localStorage.setItem(key, JSON.stringify(record)); return true;`);
+    await openProjectControl("#welcome-open");
+    await eventually("the new app restores the selected configuration", () => js(`
+      const picker = document.querySelector('#run-target');
+      return !document.querySelector('#run').disabled && picker.selectedOptions[0]?.textContent.includes('Configured fixture');
+    `));
+    assert.doesNotMatch(await output(), /configured-start|Build configured Go package/);
+    assert.equal(await js("return [...document.querySelector('#run-target').options].some(option => /configuration:(corrupted|missing-argv)/.test(option.value));"), false);
+    const saved = await js(`return Object.keys(localStorage).filter(key => key.startsWith('irongo.runConfigurations')).map(key => localStorage.getItem(key));`);
+    assert.match(saved.join(""), /Configured fixture/);
+    assert.doesNotMatch(saved.join(""), /session-only-sentinel|PROFILE_SESSION/);
+    await click('[data-view="tasks"]');
+    await click("#run-configurations");
+    await set("#run-config-name", "This cannot be saved");
+    await js(`window.__originalRunPreferenceSet = Storage.prototype.setItem;
+      Storage.prototype.setItem = function(key, value) {
+        if (key.startsWith('irongo.runConfigurations')) throw new Error('test storage failure');
+        return window.__originalRunPreferenceSet.call(this, key, value);
+      }; return true;`);
+    try {
+      await click("#run-config-save");
+      await eventually("a failed preference write stays visible in the dialog", () => text("#run-config-error"), value => /Previous settings were kept/i.test(value));
+      assert.equal(await js("return document.querySelector('#run-config-dialog').open;"), true);
+      assert.match(await js("return document.querySelector('#run-target').selectedOptions[0].textContent;"), /Configured fixture/);
+    } finally { await js("Storage.prototype.setItem = window.__originalRunPreferenceSet; return true;"); }
+    await click('[data-dialog-close="run-config-dialog"]');
+    await click("#run");
+    const actual = await eventually("the restored configuration launches from its saved settings", output,
+      value => /configured-start \{[^\n]+\}/.test(value), 30_000);
+    const data = JSON.parse(actual.match(/configured-start (\{[^\n]+\})/)[1]);
+    assert.deepEqual(data.args, ["", "two words", "-flag"]);
+    assert.equal(data.cwd, path.join(fixture, "runtime"));
+    assert.equal(data.gowork, "invalid-for-build");
+    assert.equal(data.env, "with = sign ");
+    assert.equal(data.session, "");
+    await click("#run");
+    await eventually("the restored configuration stops normally", output, value => /task stopped/i.test(value));
+    await chooseCommand("new project");
+    await set("#form-name", "different-run-project");
+    await set("#form-module", "example.com/different-run-project");
+    await click("#form-submit");
+    await eventually("a different project is open", current, state => state?.root?.endsWith("/different-run-project"));
+    assert.equal(await js("return [...document.querySelector('#run-target').options].some(option => option.value.startsWith('configuration:'))"), false);
+    await openProjectControl("#open-folder");
+    await eventually("the saved workspace is active again", () => js(`
+      return !document.querySelector('#run').disabled && document.querySelector('#run-target').selectedOptions[0]?.textContent.includes('Configured fixture');
+    `));
+    const pending = await holdConfiguredBuild();
+    await writeFile(path.join(artifacts, "pending-run-directory.txt"), pending);
+  });
 }
 
 async function openTestFile() {
@@ -1578,11 +2654,11 @@ async function goScopeCases() {
     const scope = value => js("const select = document.querySelector('#package-scope'); select.value = arguments[0]; select.dispatchEvent(new Event('change')); return true;", value);
     await scope("current");
     await click('[data-task="test"]');
-    await eventually("current-package test", output, value => /go test -v \.\/internal\/status[\s\S]*PASS: TestSummary[\s\S]*exit code 0/.test(value), 30_000);
+    await eventually("current-package test", output, value => /go test -json -fullpath \.\/internal\/status[\s\S]*PASS: TestSummary[\s\S]*exit code 0/.test(value), 30_000);
     await scope("custom");
     await set("#task-scope", "./cmd/orbit");
     await click('[data-task="test"]');
-    await eventually("custom scope test", output, value => /go test -v \.\/cmd\/orbit[\s\S]*exit code 0/.test(value), 30_000);
+    await eventually("custom scope test", output, value => /go test -json -fullpath \.\/cmd\/orbit[\s\S]*exit code 0/.test(value), 30_000);
   });
 }
 
@@ -1603,45 +2679,324 @@ async function debugSuite() {
         await eventually("debug test finished", () => text("#status"), value => /Debug session finished/i.test(value), 15_000);
       });
       await record("Delve Stop and project switch retire a paused session and admit a fresh one", async () => {
+        const reportTest = path.join(fixture, "internal/status/report_test.go");
+        const marker = path.join(home, "test-inferior.pid");
+        await js("window.__ironTest.revealLine(9); document.dispatchEvent(new KeyboardEvent('keydown', {key:'F9', bubbles:true,cancelable:true})); return true;");
+        await eventually("the first scenario's breakpoint is cleared", () => js("return !document.querySelector('#editor .debug-breakpoint');"));
+        await writeFile(reportTest, (await readFile(reportTest, "utf8"))
+          .replace('"testing"', '"testing"; "os"; "strconv"')
+          .replace("func TestSummary(t *testing.T) {", `func TestSummary(t *testing.T) {\n\tif err := os.WriteFile(${JSON.stringify(marker)}, []byte(strconv.Itoa(os.Getpid())), 0600); err != nil { t.Fatal(err) }`));
+        await eventually("the active test model contains the disposable PID probe", current, entry => entry?.text.includes("os.Getpid()"));
+        await placeBreakpoint(10);
         const paused = async () => {
+          await writeFile(marker, "");
           await clickCodeLens("Debug TestSummary");
-          await eventually("Delve paused", () => text("#status"), value => /Breakpoint hit.*report_test\.go:9/.test(value), 60_000);
-          return await eventually("owned Delve child", () => {
+          await eventually("Delve paused after recording the inferior PID", () => text("#status"), value => /Breakpoint hit.*report_test\.go:10/.test(value), 60_000);
+          const inferior = await eventually("real test executable reports its PID", async () => Number(await readFile(marker, "utf8")), pid => Number.isInteger(pid) && pid > 0);
+          process.kill(inferior, 0);
+          const adapter = await eventually("owned Delve child", () => {
             const processes = execFileSync("ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" });
             for (const row of processes.split("\n")) {
               const entry = row.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
               if (entry && Number(entry[2]) === app.child.pid && path.basename(entry[3]) === "dlv") return Number(entry[1]);
             }
           });
+          return { adapter, inferior };
         };
         const gone = (label, pid) => eventually(label, () => {
           try { process.kill(pid, 0); return false; } catch (error) { if (error.code === "ESRCH") return true; throw error; }
         });
 
-        const stopped = await paused();
-        await click("#debug-stop");
-        await eventually("Debug Stop clears controls", () => js("return document.querySelector('#debug-controls').hidden && !document.querySelector('#run').disabled;"));
-        await gone("Debug Stop reaps Delve", stopped);
+        const holdScopes = () => js("window.__ironTest.holdDebugScopes(); return true;");
+        const scopesAreHeld = () => eventually("the real scopes response is held", () => js("return window.__ironTest.debugScopesHeld();"));
+        const releaseScopes = () => js("window.__ironTest.releaseDebugScopes(); return true;");
+        await holdScopes();
+        try {
+          const stopped = await paused();
+          await scopesAreHeld();
+          await click("#debug-stop");
+          await eventually("Debug Stop clears controls and inspection", () => js("return document.querySelector('#debug-controls').hidden && document.querySelector('#debug-tab').hidden && !document.querySelector('#run').disabled;"));
+          await gone("Debug Stop reaps Delve", stopped.adapter);
+          await gone("Debug Stop reaps the actual test executable", stopped.inferior);
+        } finally { await releaseScopes(); }
 
-        const switched = await paused();
-        await openProjectControl("#open-folder");
-        await eventually("switch confirms active debug session", () => js("return document.querySelector('#project-transition-dialog').open;"));
-        assert.match(await text("#project-transition-description"), /debug session will be stopped/i);
-        await click("#project-transition-continue");
-        await eventually("replacement workspace resets debug and the active tab", current, state => state?.path === "cmd/orbit/main.go");
-        await eventually("switch clears debug controls and starts gopls", async () => ({ native: await current(), hidden: await js("return document.querySelector('#debug-controls').hidden;") }), state => state.native?.gopls === "ready" && state.hidden);
-        await gone("workspace switch reaps Delve", switched);
+        await holdScopes();
+        try {
+          const switched = await paused();
+          await scopesAreHeld();
+          await openProjectControl("#open-folder");
+          await eventually("switch confirms active debug session", () => js("return document.querySelector('#project-transition-dialog').open;"));
+          assert.match(await text("#project-transition-description"), /debug session will be stopped/i);
+          await click("#project-transition-continue");
+          await eventually("replacement workspace resets debug and the active tab", current, state => state?.path === "cmd/orbit/main.go");
+          await eventually("switch clears debug controls and starts gopls", async () => ({ native: await current(), hidden: await js("return document.querySelector('#debug-controls').hidden && document.querySelector('#debug-tab').hidden;") }), state => state.native?.gopls === "ready" && state.hidden);
+          await gone("workspace switch reaps Delve", switched.adapter);
+          await gone("workspace switch reaps the actual test executable", switched.inferior);
+        } finally { await releaseScopes(); }
 
         await click("#quick-open");
         await set("#palette-text", "report_test.go");
         await click("#palette-options button");
         await eventually("new session test file", current, state => state?.path === "internal/status/report_test.go");
-        await placeBreakpoint(9);
+        await placeBreakpoint(10);
         const replacement = await paused();
         await click("#debug-stop");
         await eventually("replacement Debug Stop clears controls", () => js("return document.querySelector('#debug-controls').hidden && !document.querySelector('#run').disabled;"));
-        await gone("replacement Delve is reaped", replacement);
+        await gone("replacement Delve is reaped", replacement.adapter);
+        await gone("replacement test executable is reaped", replacement.inferior);
+       });
+  await record("inspects a real paused stack and local variables and steps into and out of a call", async () => {
+    const relative = "internal/status/inspect_test.go";
+    const source = `package status
+
+import "testing"
+
+type inspectionData struct { Label string }
+
+func TestInspection(t *testing.T) {
+	if inspectLocals() != 42 { t.Fatal("unexpected result") }
+}
+
+func inspectLocals() int {
+	number := 41
+	probe := inspectionData{Label: "orbit"}
+	result := inspectionCall(number, probe)
+	return result
+}
+
+func inspectionCall(number int, probe inspectionData) int {
+	return number + len(probe.Label) - 4
+}
+`;
+    await writeFile(path.join(fixture, relative), source);
+    await eventually("the inspection fixture is indexed", () => js("return !!document.querySelector('#explorer [data-path=\"internal/status/inspect_test.go\"]');"));
+    await click('#explorer [data-path="internal/status/inspect_test.go"]');
+    await eventually("the inspection fixture is active", current, entry => entry?.path === relative);
+    await clickGlyphBreakpoint(14);
+    await clickCodeLens("Debug TestInspection");
+    await eventually("the debuggee stops before the nested call", () => text("#status"), value => /Breakpoint hit.*inspect_test\.go:14/.test(value), 60_000);
+    await eventually("the selected frame and its caller are visible", () => text("#debug-stack"), value => /inspectLocals[\s\S]*TestInspection/.test(value));
+    const frame = name => js(`const button = [...document.querySelectorAll('#debug-stack button')]
+      .find(button => button.textContent.includes(arguments[0])); if (!button) return false; button.focus(); button.click(); return true;`, name);
+    const selected = () => text('#debug-stack [aria-pressed="true"]');
+    const highlight = line => eventually(`line ${line} is highlighted`, () => js(`
+      const decorated = window.__ironTest.debugExecutionLines();
+      return decorated.length === 1 && decorated[0] === arguments[0] && window.__ironTest.gutterTrace().caret?.lineNumber === arguments[0];`, line));
+    await highlight(14);
+    assert.match(await selected(), /inspectLocals/);
+    assert.equal(await frame("testing.tRunner"), true);
+    await eventually("unavailable external frame stays selected", () => text("#status"), value => /source unavailable/.test(value));
+    assert.match(await selected(), /testing\.tRunner/);
+    assert.equal(await frame("TestInspection"), true);
+    await eventually("the caller frame is selected and revealed", () => text("#status"), value => /inspect_test\.go:8/.test(value));
+    await highlight(8);
+    assert.equal(await js("return document.activeElement === document.querySelector('#debug-stack [aria-pressed=true]');"), true);
+    assert.equal(await frame("inspectLocals"), true);
+    await eventually("the original selected frame returns", () => text("#status"), value => /inspect_test\.go:14/.test(value));
+    const expand = name => js(`const disclosure = [...document.querySelectorAll('#debug-variables summary')]
+      .find(summary => summary.textContent.includes(arguments[0])); if (!disclosure) return false;
+      if (!disclosure.parentElement.open) disclosure.click(); return true;`, name);
+    await eventually("the selected frame has a Locals scope", () => expand("Locals"));
+    await eventually("the scalar local is shown", () => text("#debug-variables"), value => /number[\s\S]*41/.test(value));
+    await eventually("the struct can be expanded", () => expand("probe"));
+    await eventually("the struct field is shown", () => text("#debug-variables"), value => /Label[\s\S]*orbit/.test(value));
+    await click("#debug-step-in");
+    const steppedIn = await eventually("Step Into enters the nested call", () => text("#status"), value => /inspect_test\.go:(18|19)/.test(value), 15_000);
+    await highlight(Number(steppedIn.split(":").at(-1)));
+    assert.match(await selected(), /inspectionCall/);
+    await click("#debug-step-out");
+    const steppedOut = await eventually("Step Out returns to the caller", () => text("#status"), value => /inspect_test\.go:(14|15)/.test(value), 15_000);
+    await highlight(Number(steppedOut.split(":").at(-1)));
+    assert.match(await selected(), /inspectLocals/);
+    await click("#debug-continue");
+    await eventually("the debug test finishes and clears inspection", async () => [await text("#status"), await text("#debug-stack")],
+      ([status, stack]) => /Debug session finished/i.test(status) && !stack.trim(), 15_000);
+  });
+  await record("Debug Go Program uses the selected preset without changing its build context", async () => {
+    const program = path.join(fixture, "debug-program");
+    const runtime = path.join(fixture, "debug-runtime");
+    await Promise.all([mkdir(program), mkdir(runtime)]);
+    await writeFile(path.join(fixture, "go.work"), "go 1.22\n\nuse (\n\t.\n\t./debug-program\n)\n");
+    await writeFile(path.join(program, "go.mod"), "module example.test/debug-program\n\ngo 1.22\n");
+    await writeFile(path.join(program, "main.go"), `package main
+
+import ("encoding/json"; "fmt"; "os"; "os/exec"; "time")
+
+func main() {
+	cwd, _ := os.Getwd()
+	if err := os.WriteFile("program.marker", []byte(cwd), 0600); err != nil { panic(err) }
+	context := map[string]any{"cwd": cwd, "args": append([]string{}, os.Args[1:]...), "gowork": os.Getenv("GOWORK"), "preset": os.Getenv("DEBUG_PRESET"), "pid": os.Getpid()}
+	if os.Getenv("DEBUG_PRESET") == "child" {
+		child := exec.Command("/bin/sleep", "60")
+		if err := child.Start(); err != nil { panic(err) }
+		context["child"] = child.Process.Pid
+		_ = child.Process.Release()
+	}
+	encoded, _ := json.Marshal(context)
+	fmt.Printf("program-context %s\\n", encoded)
+	if os.Getenv("DEBUG_PRESET") == "hold" { time.Sleep(time.Minute) }
+}
+`);
+    await openProjectControl("#open-folder");
+    await eventually("the nested executable is discovered", () => js("return Array.from(document.querySelector('#run-target').options, option => option.value);"), targets => targets.includes("./debug-program"));
+    await click('[data-view="tasks"]');
+    await click("#run-configurations");
+    await set("#run-config-name", "Debug context fixture");
+    await set("#run-config-package", "./debug-program");
+    await set("#run-config-directory", "debug-runtime");
+    const args = ["", "two words", "-literal"];
+    await set("#run-config-arguments", JSON.stringify(args));
+    await set("#run-config-session", "GOWORK=invalid-for-build\nDEBUG_PRESET=session-only");
+    await click("#run-config-save");
+    await eventually("the same preset is selected for Run and Debug", () => js("return document.querySelector('#run-target').selectedOptions[0]?.textContent;"), value => value?.includes("Debug context fixture"));
+    assert.notEqual((await current()).path, "debug-program/main.go");
+    const marker = path.join(runtime, "program.marker");
+    const programContext = async () => JSON.parse((await eventually("the real Go program reports its context", output,
+      value => /program-context \{[^\n]+\}/.test(value), 60_000)).match(/program-context (\{[^\n]+\})/)[1]);
+    await click("#run");
+    const { pid: runPid, ...runContext } = await programContext();
+    assert.ok(runPid > 0);
+    assert.deepEqual(runContext, { cwd: runtime, args, gowork: "invalid-for-build", preset: "session-only" });
+    await eventually("Run releases its execution slot", () => text("#status"), value => /exit code 0/.test(value));
+    await rename(marker, path.join(home, "run.marker"));
+    await click("#quick-open");
+    await set("#palette-text", "debug-program/main.go");
+    await click("#palette-options button");
+    await eventually("the executable source is active", current, entry => entry?.path === "debug-program/main.go");
+    await placeBreakpoint(7);
+    await click('#tabs [data-path="cmd/orbit/main.go"]');
+    await eventually("a different source remains active before launch", current, entry => entry?.path === "cmd/orbit/main.go");
+    await click("#quick-open");
+    await set("#palette-text", ">debug go program");
+    await eventually("the executable Debug Go Program command exists", () => text("#palette-options"), value => /Debug Go Program/.test(value));
+    await js("document.querySelector('#palette').close(); return true;");
+    const launchDebug = () => chooseCommand("debug go program");
+    const releaseHandoff = () => js("void window.__ironTest.runHandoff(false); return true;");
+    const removed = directory => eventually("the private debug directory is gone", async () => {
+      try { await stat(directory); return false; } catch (error) { if (error.code === "ENOENT") return true; throw error; }
+    });
+    const gone = (label, pid) => eventually(label, () => {
+      try { process.kill(pid, 0); return false; } catch (error) { if (error.code === "ESRCH") return true; throw error; }
+    });
+    const held = await holdConfiguredBuild(launchDebug);
+    await releaseHandoff();
+    await eventually("the selected package hits its real breakpoint", () => text("#status"), value => /Breakpoint hit.*main\.go:7/.test(value), 30_000);
+    assert.equal((await current()).path, "debug-program/main.go");
+    await eventually("the executable frame is selected", () => text('#debug-stack [aria-pressed="true"]'), value => /main\.main/.test(value));
+    await eventually("the program frame's locals are available", () => js(`const locals = [...document.querySelectorAll('#debug-variables summary')]
+      .find(node => node.textContent === 'Locals'); if (!locals) return false; if (!locals.parentElement.open) locals.click(); return true;`));
+    await eventually("the stopped executable exposes its actual cwd", () => text("#debug-variables"), value => value.includes(`cwd: "${runtime}"`));
+    await click("#debug-continue");
+    const { pid: debugPid, ...debugContext } = await programContext();
+    assert.ok(debugPid > 0 && debugPid !== runPid);
+    assert.deepEqual(debugContext, runContext);
+    assert.equal(await readFile(marker, "utf8"), runtime);
+    await eventually("Debug releases its execution slot", () => text("#status"), value => /Debug session finished/i.test(value));
+    await removed(held);
+    await gone("the normally finished debuggee is gone", debugPid);
+    await rename(marker, path.join(home, "debug.marker"));
+
+    const sourcePath = path.join(program, "main.go");
+    const validSource = await readFile(sourcePath, "utf8");
+    await writeFile(sourcePath, validSource + "\nGo build must fail here\n");
+    try {
+      await launchDebug();
+      await eventually("a compile failure returns the Go lane", () => text("#status"), value => /Debug failed.*Go build/.test(value));
+      assert.match(await output(), /syntax error|non-declaration statement/);
+      await assert.rejects(stat(marker), { code: "ENOENT" });
+    } finally { await writeFile(sourcePath, validSource); }
+
+    try {
+      const cancelled = await holdConfiguredBuild(launchDebug);
+      await click("#debug-stop");
+      await eventually("Stop cancels the build handoff", () => text("#status"), value => /Debug session stopped/.test(value));
+      await removed(cancelled);
+      await assert.rejects(stat(marker), { code: "ENOENT" });
+
+      const stale = await holdConfiguredBuild(launchDebug);
+      const backup = `${runtime}-original`;
+      await rename(runtime, backup);
+      await mkdir(runtime);
+      try {
+        await releaseHandoff();
+        await eventually("an inode replacement refuses launch", () => text("#status"), value => /working directory was replaced/.test(value));
+        await removed(stale);
+        await assert.rejects(stat(marker), { code: "ENOENT" });
+      } finally {
+        await rename(runtime, `${runtime}-replacement`);
+        await rename(backup, runtime);
+      }
+
+      const abandoned = await holdConfiguredBuild(launchDebug);
+      await openProjectControl("#open-folder");
+      await eventually("switch confirms the held Debug launch", () => js("return document.querySelector('#project-transition-dialog').open;"));
+      await click("#project-transition-continue");
+      await removed(abandoned);
+      await eventually("fresh workspace and target are ready", () => js("return !document.querySelector('#run-target').disabled && !document.querySelector('#run').disabled;"));
+      assert.doesNotMatch(await output(), /program-context|Build debuggable|Debug session stopped/);
+      await assert.rejects(stat(marker), { code: "ENOENT" });
+    } finally { await releaseHandoff(); }
+
+    await js(`const picker = document.querySelector('#run-target'); picker.value = './debug-program';
+      picker.dispatchEvent(new Event('change')); return true;`);
+    await launchDebug();
+    const { pid: defaultPid, ...defaultContext } = await programContext();
+    assert.deepEqual(defaultContext, { cwd: fixture, args: [], gowork: "auto", preset: "" });
+    await eventually("default Debug releases the lane", () => text("#status"), value => /Debug session finished/i.test(value));
+    await gone("the default debuggee exits", defaultPid);
+
+    const setSessionPreset = async environment => {
+      await click('[data-view="tasks"]');
+      await click("#run-configurations");
+      await eventually("saved preset is present", () => js(`const select = document.querySelector('#run-config-list');
+        const option = [...select.options].find(option => option.textContent === 'Debug context fixture');
+        if (!option) return false; select.value = option.value; select.dispatchEvent(new Event('change')); return true;`));
+      await set("#run-config-session", environment);
+      await click("#run-config-save");
+    };
+    await setSessionPreset("DEBUG_PRESET=child");
+    const exiting = await holdConfiguredBuild(launchDebug);
+    await releaseHandoff();
+    const withChild = await programContext();
+    assert.ok(withChild.child > 0);
+    await eventually("normal exit releases the execution lane even with a same-group child", () => text("#status"), value => /Debug session finished/.test(value));
+    await removed(exiting);
+    await gone("the same-group child exits before reuse", withChild.child);
+    await setSessionPreset("DEBUG_PRESET=hold");
+    const liveDebugger = async () => {
+      const directory = await holdConfiguredBuild(launchDebug);
+      await releaseHandoff();
+      const context = await programContext();
+      assert.equal(context.preset, "hold");
+      const processes = await eventually("the adapter and backend are live", () => {
+        const rows = execFileSync("ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8" }).split("\n")
+          .flatMap(row => { const match = row.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/); return match ? [{ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }] : []; });
+        const adapter = rows.find(row => row.parent === app.child.pid && row.command.includes(directory) && row.command.includes(" dap "));
+        const backend = adapter && rows.find(row => row.parent === adapter.pid && row.command.includes("debugserver"));
+        return backend ? [adapter.pid, backend.pid, context.pid] : undefined;
       });
+      return { directory, processes };
+    };
+    const holdDisconnect = hold => js("return window.__ironTest.holdDebugDisconnect(arguments[0]).then(() => true);", hold);
+    const assertRetired = async (label, { directory, processes }) => {
+      await removed(directory);
+      for (const pid of processes) await gone(`${label} retires process ${pid}`, pid);
+    };
+    await holdDisconnect(true);
+    const forced = await liveDebugger();
+    await click("#debug-stop");
+    await eventually("forced teardown releases the execution lane", () => text("#status"), value => /Debug session stopped/.test(value));
+    await assertRetired("Forced Stop", forced);
+    await holdDisconnect(false);
+
+    const quitting = await liveDebugger();
+    await terminalCheckpoint("Quit with executable debugger");
+    try { await js("void window.__ironTest.quitMenu(); return true;"); }
+    catch (error) { if (error.cause?.code !== "UND_ERR_SOCKET") throw error; }
+    const exit = await Promise.race([app.exited, delay(10_000, { timedOut: true }, { ref: false })]);
+    assert.equal(exit.code, 0, "Ordinary Quit waits for executable debugger retirement");
+    await assertRetired("Quit", quitting);
+  });
 }
 
 async function lifecycleTransitions() {

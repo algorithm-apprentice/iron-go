@@ -13,6 +13,10 @@ on `PATH` or in `~/go/bin`. Select a compatible gopls version (for example,
 `v0.20.0` with Go 1.25) if you can't use the latest Go toolchain.
 Install Delve (`brew install delve` or `go install github.com/go-delve/delve/cmd/dlv@v1.27.2`)
 to run the debug acceptance. macOS must allow debugging a local Go child process.
+The explicitly selected Accessibility group sends PID-targeted native
+keystrokes to a disposable app. Enable Accessibility permission for the
+calling terminal or test host. The default CI gate does not request this
+interactive permission.
 
 | Command | What it proves |
 | --- | --- |
@@ -21,6 +25,23 @@ to run the debug acceptance. macOS must allow debugging a local Go child process
 | `npm run test:native` | Real WKWebView, IPC, local files, and Go tools. Runs the LSP case if gopls is installed. |
 | `npm run test:feedback` | All three layers; requires gopls and real Delve debug acceptance. |
 | `npm run test:picker` | Checks native title-bar placement at the default and minimum widths, then opens and cancels the real macOS project picker. Requires a built `.app` and Accessibility permission for the calling terminal. |
+
+`npm run test:feedback` overlaps checks, headless Chromium, and native
+acceptance. It reports per-stage and total wall time and retains diagnostics
+from every stage. The native acceptance build uses Vite for its frontend;
+`npm run check` provides the TypeScript gate. The production build still
+typechecks its frontend. On interruption, native acceptance tears down its
+owned processes while Chromium and checks complete their normal cleanup.
+See [feedback test efficiency](design/feedback-test-efficiency.md) for the
+timing and coverage rationale.
+
+For an in-progress change, run the affected case or native group first, then
+the full feedback command before publishing:
+
+```sh
+node --test --test-name-pattern='editor typography' tests/ui/workbench.test.mjs
+npm run test:native -- --group files
+```
 
 `npm run test:native -- --quit-only` drives AppKit/system Quit, the real
 Quit menu item and native Close in a separate disposable app. It verifies
@@ -36,15 +57,30 @@ selection is needed. It requires a working macOS app session. For repeat
 runs with an unchanged test build, use `npm run test:native -- --skip-build`.
 
 One native build serves isolated `lifecycle`, `files`, `go`, `debug`, `quit`,
-and `quit-save` groups. `quit-save` covers partial saves, expiry during an
+`quit-save`, `recovery`, `recent`, `trash`, `terminal`, and `accessibility`
+groups. `quit-save` covers partial saves, expiry during an
 admitted write, and a successful native Save and Quit. Each selected group
 gets its own app, worker, workspace and home. Select groups with repeatable
 `--group` (for example `--group files`);
-the default includes all except `debug`, which `--require-delve` adds.
+the default excludes `accessibility` and `debug`. `--require-delve` adds
+Debug; `--group accessibility` selects the native hardware and AX checks.
 Explicit Debug requires gopls and Delve. Go's language-service cases skip
 only when its capability probe confirms gopls is absent and it was not
 required. Group selection is exclusive with `--quit-only` and external
 snapshot mode. After a group's failure, later independent groups still run.
+
+Recovery and Recent relaunch with the same disposable profile. Recovery
+terminates the actual app process after a completed draft and can exercise
+two app processes sharing the same fixture profile. Trash mounts a temporary
+APFS disk image and verifies macOS resolves Trash inside that image before
+moving content. Terminal tests real PTY input, resize, credits, and cleanup.
+
+The Accessibility group records native Unicode input and the actual
+WKWebView accessibility tree. Run it explicitly:
+
+```sh
+npm run test:native -- --group accessibility
+```
 
 For a teardown diagnostic, `npm run test:native -- --skip-build --probe-runner-crash`
 intentionally kills a group worker with a disposable Go child running.
@@ -80,6 +116,14 @@ the last live snapshot before requesting exit, then check process/disk results.
 Start with the
 first failed assertion, not a blind retry. Save fixture changes as tests
 when they explain a regression.
+
+For code review, the implementer supplies the test commands, outcomes, and
+artifact paths for the reviewed changes. Reviewers start with the diff, the
+assertions, and the recorded results. They may run a focused test to reproduce
+a finding or verify a specific fix, but must not rerun the full suite. The
+implementer runs broader checks when needed. After a fix, rerun affected
+checks and any required gate rather than repeating passing checks whose
+evidence still applies.
 
 For geometry changes, test both the interactive target and the thing inside
 it. A correctly sized button can contain a misaligned SVG; a correctly

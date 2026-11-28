@@ -7,6 +7,14 @@ export function decodeLocalFileUri(uri: string) {
   catch { return; }
 }
 
+export function goDefinitionPath(uri: unknown) {
+  if (typeof uri !== "string") return;
+  const path = decodeLocalFileUri(uri);
+  if (!path || /[\u0000-\u001f\u007f-\u009f\\]/u.test(path)) return;
+  if (path.slice(1).split("/").some(component => !component || component === "." || component === "..")) return;
+  return path;
+}
+
 export function organizeImportEdits(actions: (CodeAction | Command)[], uri: string, version: number): TextEdit[] | undefined {
   if (!Array.isArray(actions)) throw new Error("gopls returned malformed import actions.");
   const action = actions.find((candidate): candidate is CodeAction => !!candidate && typeof candidate === "object" && "kind" in candidate &&
