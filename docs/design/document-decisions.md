@@ -1,6 +1,6 @@
 # Save and discard decisions
 
-Status: Implemented follow-up under the [daily Go workbench plan](daily-go-workbench.md).
+Status: Implemented follow-up under the [daily Go workbench plan](../archive/daily-go-workbench.md).
 
 ## Scope and user-visible behavior
 

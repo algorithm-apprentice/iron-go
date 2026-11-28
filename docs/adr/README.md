@@ -2,6 +2,8 @@
 
 Following Iron C++: numbered ADRs record lasting decisions; linked designs
 record detailed behavior, alternatives, implementation order, and acceptance.
+See the [design index](../design/README.md) or return to the
+[documentation index](../README.md).
 
 | Record | Decision | Status |
 | --- | --- | --- |

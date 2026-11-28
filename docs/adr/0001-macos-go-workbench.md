@@ -4,7 +4,7 @@ Date: 2026-11-26.
 
 Status: Accepted. Verification is tracked in the linked design.
 
-Design: [First macOS Workbench](../design/macos-workbench.md).
+Design: [First macOS Workbench](../archive/macos-workbench.md).
 
 ## Context
 

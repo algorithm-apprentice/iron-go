@@ -36,9 +36,8 @@ and the highlighted gutter number. Compare row coordinates separately from
 selection behavior. The probe runs on a disposable project and does not add
 logging or change settings in the installed application.
 
-```sh
-npm run test:native -- --project /path/to/raft --test-file raft_test.go --gutter-line 28
-```
+See [real project snapshots](../TESTING.md#real-project-snapshots-and-cleanup-diagnostics)
+for the gutter probe command and flags.
 
 The probe reproduced the reported click: row delta `0`, mouse target
 `GUTTER_LINE_NUMBERS` at line 28, selection `28:1` through `29:1`, caret at

@@ -1,7 +1,7 @@
 # ADR 0011: Share the native Go tool transport
 
 Status: Independently approved design. Verification is tracked in
-[remediation batch 4](../design/review-remediation-plan.md#4-share-native-process-plumbing-not-protocols).
+[remediation batch 4](../archive/review-remediation-plan.md#4-share-native-process-plumbing-not-protocols).
 
 Use one native worker for bounded framing, child/group ownership and session
 retirement. gopls remains on stdio; Delve still connects to a socket in an

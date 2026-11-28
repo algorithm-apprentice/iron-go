@@ -1,6 +1,6 @@
 # Debug the selected executable package
 
-Status: Implemented second slice of [debug inspection and executable launch](daily-go-workbench.md#4-debug-inspection-and-executable-launch).
+Status: Implemented second slice of [debug inspection and executable launch](../archive/daily-go-workbench.md#4-debug-inspection-and-executable-launch).
 
 ## Scope and invariants
 

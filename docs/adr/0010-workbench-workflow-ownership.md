@@ -1,7 +1,7 @@
 # ADR 0010: Assign one owner to each workbench workflow
 
 Status: Independently approved design. Implementation verification is tracked
-in [remediation batch 3](../design/review-remediation-plan.md#3-simplify-the-workbench-with-behavior-pinned).
+in [remediation batch 3](../archive/review-remediation-plan.md#3-simplify-the-workbench-with-behavior-pinned).
 
 The renderer gives project changes and Quit one exclusive reservation. Cancel
 keeps the previous project and its processes; native success is the cutover

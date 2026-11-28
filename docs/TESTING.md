@@ -1,151 +1,135 @@
-# Testing Iron Go on macOS
+# Test Iron Go on macOS
 
-Run once after cloning:
+## Set up
+
+Install the [build dependencies](BUILDING.md#install-build-dependencies) and
+[Go tools](BUILDING.md#go-tools) for the layer you plan to run. For Chromium
+tests, install the Playwright browser once:
 
 ```sh
-npm ci
 npx playwright install chromium
 ```
 
-Install Go, Rust, and Xcode Command Line Tools. For native LSP acceptance,
-install `gopls` using `go install golang.org/x/tools/gopls@latest` and put it
-on `PATH` or in `~/go/bin`. Select a compatible gopls version (for example,
-`v0.20.0` with Go 1.25) if you can't use the latest Go toolchain.
-Install Delve (`brew install delve` or `go install github.com/go-delve/delve/cmd/dlv@v1.27.2`)
-to run the debug acceptance. macOS must allow debugging a local Go child process.
-The explicitly selected Accessibility group sends PID-targeted native
-keystrokes to a disposable app. Enable Accessibility permission for the
-calling terminal or test host. The default CI gate does not request this
-interactive permission.
+Native tests need a working macOS app session. Debug acceptance also needs
+permission to debug a local Go child process. The optional Accessibility and
+picker tests need permission to send native input from the terminal or test
+host; the default CI gate does not request this permission.
 
-| Command | What it proves |
+## Choose a test layer
+
+| Command | What it verifies |
 | --- | --- |
-| `npm run check` | TS types, focused TS tests, Rust formatting and services, real fixture tests. |
+| `npm test` | Focused TypeScript and test-runner behavior using Node. |
+| `npm run test:rust` | Rust workspace, process, and service behavior. |
+| `npm run check` | TypeScript types and focused tests, Rust formatting and tests, and tests for the Go fixture. |
 | `npm run test:ui` | Workbench behavior in headless Chromium with isolated browser storage. |
-| `npm run test:native` | Real WKWebView, IPC, local files, and Go tools. Runs the LSP case if gopls is installed. |
-| `npm run test:feedback` | All three layers; requires gopls and real Delve debug acceptance. |
-| `npm run test:picker` | Checks native title-bar placement at the default and minimum widths, then opens and cancels the real macOS project picker. Requires a built `.app` and Accessibility permission for the calling terminal. |
+| `npm run test:native` | Real WKWebView, AppKit, Tauri IPC, filesystem, and Go tools. |
+| `npm run test:feedback` | Checks, Chromium, and native acceptance with required gopls and Delve. |
 
-`npm run test:feedback` overlaps checks, headless Chromium, and native
-acceptance. It reports per-stage and total wall time and retains diagnostics
-from every stage. The native acceptance build uses Vite for its frontend;
-`npm run check` provides the TypeScript gate. The production build still
-typechecks its frontend. On interruption, native acceptance tears down its
-owned processes while Chromium and checks complete their normal cleanup.
-See [feedback test efficiency](design/feedback-test-efficiency.md) for the
-timing and coverage rationale.
-
-For an in-progress change, run the affected case or native group first, then
-the full feedback command before publishing:
+Start with the cheapest relevant case. Follow the [contribution rules](../AGENTS.md)
+for the required gates and review evidence before publishing. Examples:
 
 ```sh
 node --test --test-name-pattern='editor typography' tests/ui/workbench.test.mjs
 npm run test:native -- --group files
 ```
 
-`npm run test:native -- --quit-only` drives AppKit/system Quit, the real
-Quit menu item and native Close in a separate disposable app. It verifies
-presentation of the dirty confirmation with a minimized window, dirty-buffer
-and child-process preservation on cancellation, retries after an unanswered
-dialog, and refusal while a native save is pending. Approved Discard stops the
-child without writing the unsaved buffer. The full feedback command runs it
-after the standard native suite, reusing the acceptance binary, not a released app.
+The full feedback command runs checks, Chromium, and native acceptance in
+parallel and records all results and timings. On interruption, the native runner
+verifies its process cleanup while the other stages finish normally.
+`npm run check` owns the static TypeScript gate in this loop; the native test
+build alone checks runtime behavior. The [feedback design](design/feedback-test-efficiency.md)
+explains the scheduling and test build choices.
 
-The native suite builds `iron-go-acceptance` and opens a temporary
-copy of `tests/fixtures/orbit`. No existing IDE instance or manual folder
-selection is needed. It requires a working macOS app session. For repeat
-runs with an unchanged test build, use `npm run test:native -- --skip-build`.
+### Native groups
 
-One native build serves isolated `lifecycle`, `files`, `go`, `debug`, `quit`,
-`quit-save`, `recovery`, `recent`, `trash`, `terminal`, and `accessibility`
-groups. `quit-save` covers partial saves, expiry during an
-admitted write, and a successful native Save and Quit. Each selected group
-gets its own app, worker, workspace and home. Select groups with repeatable
-`--group` (for example `--group files`);
-the default excludes `accessibility` and `debug`. `--require-delve` adds
-Debug; `--group accessibility` selects the native hardware and AX checks.
-Explicit Debug requires gopls and Delve. Go's language-service cases skip
-only when its capability probe confirms gopls is absent and it was not
-required. Group selection is exclusive with `--quit-only` and external
-snapshot mode. After a group's failure, later independent groups still run.
+One native build of `iron-go-acceptance` serves all selected groups. Each group
+owns a disposable app, worker, workspace copied from [Orbit](../tests/fixtures/orbit/README.md),
+and home directory. For an unchanged test build, add `--skip-build`. The runner
+continues to later independent groups after a group failure.
 
-Recovery and Recent relaunch with the same disposable profile. Recovery
-terminates the actual app process after a completed draft and can exercise
-two app processes sharing the same fixture profile. Trash mounts a temporary
-APFS disk image and verifies macOS resolves Trash inside that image before
-moving content. Terminal tests real PTY input, resize, credits, and cleanup.
+| `--group` | Scope |
+| --- | --- |
+| `lifecycle`, `files` | Welcome, project transitions, editing, geometry, disk conflict handling, and workspace changes. |
+| `go`, `debug` | Go tasks, gopls, navigation, and Debug with real Delve. The Go group also relaunches to check restored run configurations. |
+| `quit`, `quit-save` | Real AppKit/system Quit and native Close, preservation on cancellation, ticket expiry, partial saves, and Save and Quit. |
+| `recovery`, `recent` | Relaunch with the same profile to verify draft recovery and restored editor sessions. Recovery exercises abrupt process termination and concurrent writers. |
+| `trash`, `terminal` | macOS Trash on an isolated APFS image, and real PTY input, resize, credits, and cleanup. |
+| `accessibility` | Permission-dependent native keyboard input, focus, and the WKWebView accessibility tree. |
 
-The Accessibility group records native Unicode input and the actual
-WKWebView accessibility tree. Run it explicitly:
+- Repeat `--group` to select more than one group. The default excludes `debug`
+  and `accessibility`. Add `--require-delve` to the default run to include Debug.
+  Explicit Debug requires both gopls and Delve.
+- The Go group's language-service cases skip only when the capability probe
+  confirms gopls is absent and it was optional. Use `--require-gopls` to require
+  it. A skip does not demonstrate coverage. The [report completeness ADR](adr/0036-native-acceptance-report-completeness.md)
+  describes how the initial and relaunch results are checked.
+- Use `npm run test:native -- --quit-only` to run just `quit`. This group
+  exercises a minimized window, unanswered-dialog retry, cancellation while
+  preserving dirty text and child processes, refusal during a save, and
+  approved discard without writing the buffer. The full feedback gate includes
+  Quit and Quit Save as part of the native run.
+- Run `npm run test:native -- --group accessibility` explicitly for real native
+  keystrokes and AX inspection. This does not run VoiceOver.
+
+### Real project snapshots and cleanup diagnostics
+
+To exercise a Git project with a root `go.mod` without using or modifying its
+working tree:
 
 ```sh
-npm run test:native -- --group accessibility
+npm run test:native -- --project /path/to/checkout
 ```
+
+The runner archives committed `HEAD` into a temporary directory, runs the
+module's tests, and reuses the host Go toolchain caches. It can download the
+project's Go SDK or dependencies; use `GOTOOLCHAIN` to choose another compatible
+SDK when needed. Add `--test-file raft_test.go` to exercise language services;
+this requires working gopls. With `--test-file`, add
+`--debug-test TestLeaderElection` to hit a real breakpoint (requires Delve), or
+`--gutter-line 28` to diagnose the editor's gutter geometry and line selection.
+Do not combine `--project`, explicit groups, `--quit-only`, or the crash probe.
 
 For a teardown diagnostic, `npm run test:native -- --skip-build --probe-runner-crash`
-intentionally kills a group worker with a disposable Go child running.
-The command is expected to exit nonzero. Read `crash/cleanup.json` and the
-root `report.json` to verify the app and observed Go child disappeared and
-the later `files` group ran. An unverified cleanup is a failure and preserves
-the disposable paths printed in the report. Never point the runner at an
-installed app or use a live checkout as its fixture.
+intentionally kills a group worker with a disposable Go child running. Expect
+a nonzero exit. In the native run directory, inspect `crash/cleanup.json` and
+`report.json` to verify that the app and observed Go child disappeared and the
+later `files` group ran. Unverified cleanup fails the run and preserves the
+disposable paths named in the report. Never point the runner at an installed app
+or use a live checkout as its fixture.
 
-To check a real Git project without using or modifying its working tree:
+### Picker and display diagnostics
 
-```sh
-npm run test:native -- --project /path/to/checkout --test-file raft_test.go
-```
+After [building a normal `.app`](BUILDING.md#build-local-bundles), run
+`npm run test:picker`. Its disposable process checks window geometry at the
+default and minimum widths, then opens and cancels the real macOS folder picker.
 
-The optional `--test-file` checks gopls actions for the requested test file.
-With Delve installed, add `--debug-test TestLeaderElection` to hit a real
-breakpoint in that named test before continuing.
-This mode opens the committed `HEAD` snapshot in a temporary directory,
-runs the module's actual tests, and reuses the host Go toolchain caches. It
-can download the Go SDK or dependencies specified by the selected project.
-It also honors an explicit `GOTOOLCHAIN` for testing against a matching SDK
-while the project's suggested version is unavailable.
+- Add `-- --retina-probe` to put the disposable editor on a Retina display and
+  report the picker screen and capture dimensions. Bitmap measurement requires
+  Screen Recording permission; it captures only the picker and keeps no image.
+- Add `--display-round-trip` to the Retina probe to move to a 1× display and
+  back and compare the title-edge sharpness. Treat the scores as diagnostic:
+  an initial and a restored 2× bitmap can have different underlying detail.
 
-On headless UI failure, inspect `test-results/ui/<case>/browser.log`,
-`workbench.png`, and open `trace.zip` with `npx playwright show-trace`.
-Native runs print a `test-results/native/<run>/` path containing the per-case
-`report.json` and the build/app logs; on native failure the runner also
-attempts to capture a screenshot and a workbench snapshot under the group
-directory. Successful live cases assert that the WebView has reported no
-uncaught exceptions or unhandled rejections since startup. Quit cases record
-the last live snapshot before requesting exit, then check process/disk results.
-Start with the
-first failed assertion, not a blind retry. Save fixture changes as tests
-when they explain a regression.
+## Investigate a failure
 
-For code review, the implementer supplies the test commands, outcomes, and
-artifact paths for the reviewed changes. Reviewers start with the diff, the
-assertions, and the recorded results. They may run a focused test to reproduce
-a finding or verify a specific fix, but must not rerun the full suite. The
-implementer runs broader checks when needed. After a fix, rerun affected
-checks and any required gate rather than repeating passing checks whose
-evidence still applies.
+| Layer | Where to look |
+| --- | --- |
+| Chromium | `test-results/ui/<case>/browser.log`, `workbench.png`, and `trace.zip`. Open the trace with `npx playwright show-trace <path-to-trace.zip>`. |
+| Native | `test-results/native/<run>/report.json`, build/app logs, and per-group artifacts. On failure the runner attempts to capture a screenshot and workbench snapshot. Quit cases capture the last live snapshot before checking process exit and disk state. |
 
-For geometry changes, test both the interactive target and the thing inside
-it. A correctly sized button can contain a misaligned SVG; a correctly
-aligned Monaco row can still have an oversized gutter. Include native
-WKWebView assertions for styling decisions that may differ from Chromium
-(for example a flex-sized grid button or a native select). Use compact
-real rendering fixtures and pass larger boundary values to the layout
-calculation rather than generating large files solely to exercise a formula.
+Start with the first failed assertion rather than retrying blindly. Successful
+live native cases check for uncaught WebView errors and unhandled rejections.
+When a fixture change explains a regression, keep it with the test.
 
-GitHub Actions runs the full feedback loop for pushes to `main` and pull
-requests on a macOS runner and attaches available diagnostics to the run.
-A separate Go 1.27.x workflow runs the Go and Debug groups weekly and on
-manual dispatch; it is not part of PR feedback.
-The optional picker smoke runs locally after `npm run tauri build -- --bundles app`;
-its disposable process is independent of any currently open Iron Go window.
-For a mixed-DPI setup, use `npm run test:picker -- --retina-probe` to put the
-disposable editor on a Retina display and report the picker screen and capture
-dimensions. Bitmap measurement requires Screen Recording permission; it
-captures only the disposable app's picker and does not retain the image.
-Add `--display-round-trip` to move that test picker to a 1× display and
-back, reporting bitmap dimensions and a title-edge sharpness sample at
-each step. This is diagnostic, not a portable pixel threshold: an initial
-and a restored 2× bitmap can have different underlying text detail.
+For geometry changes, test the interactive target and the thing inside it:
+a correctly sized button can contain a misaligned SVG. Include native WKWebView
+assertions for rendering that can differ from Chromium. Use compact rendering
+fixtures and pass larger boundary values to layout calculations directly.
 
-See [ADR 0002](adr/0002-test-feedback-loop.md) and [the acceptance design](design/test-feedback-loop.md).
+## CI
+
+[The macOS feedback workflow](../.github/workflows/feedback.yml) runs the full
+feedback loop and builds a normal bundle for pushes to `main` and pull requests.
+It uploads diagnostics when available. The [Go 1.27.x smoke workflow](../.github/workflows/go-127-smoke.yml)
+runs the Go and Debug groups weekly or on manual dispatch, outside the PR gate.

@@ -1,7 +1,7 @@
 # ADR 0009: Make saves conditional on the observed file
 
 Status: Independently approved design. Implementation verification is tracked in
-[remediation batch 2](../design/review-remediation-plan.md#2-define-and-harden-savereload-transactions).
+[remediation batch 2](../archive/review-remediation-plan.md#2-define-and-harden-savereload-transactions).
 
 Keep same-directory atomic replacement from [ADR 0001](0001-macos-go-workbench.md).
 Stage, validate and replace under one stable OS advisory lock in the app-local

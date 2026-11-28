@@ -1,6 +1,6 @@
 # Interactive terminal and Go Run
 
-Status: Implemented slice of [the daily workbench](daily-go-workbench.md#6-interactive-terminal).
+Status: Implemented slice of [the daily workbench](../archive/daily-go-workbench.md#6-interactive-terminal).
 
 ## Scope and invariants
 

@@ -1,6 +1,6 @@
 # Named Go run configurations
 
-Status: Implemented first slice of [Run configurations and test results](daily-go-workbench.md#3-run-configurations-and-test-results).
+Status: Implemented first slice of [Run configurations and test results](../archive/daily-go-workbench.md#3-run-configurations-and-test-results).
 
 ## Scope and user workflow
 

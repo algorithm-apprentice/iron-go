@@ -1,6 +1,6 @@
 # Recover unsaved project drafts after a crash
 
-Status: Implemented slice of [project continuity](daily-go-workbench.md#5-project-continuity-and-file-management).
+Status: Implemented slice of [project continuity](../archive/daily-go-workbench.md#5-project-continuity-and-file-management).
 
 ## Scope and invariants
 

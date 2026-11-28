@@ -1,6 +1,6 @@
 # Format Go files during explicit saves
 
-Status: Implemented follow-up under [Go navigation and refactoring](daily-go-workbench.md#2-go-navigation-and-refactoring).
+Status: Implemented follow-up under [Go navigation and refactoring](../archive/daily-go-workbench.md#2-go-navigation-and-refactoring).
 
 ## Scope and invariants
 

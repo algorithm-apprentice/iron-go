@@ -2,7 +2,7 @@
 
 Date: 2026-11-26.
 
-Status: Implemented and verified on Apple Silicon macOS.
+Historical baseline: implemented and verified on Apple Silicon macOS.
 
 Decision: [ADR 0001](../adr/0001-macos-go-workbench.md).
 
@@ -38,7 +38,7 @@ bar holds Quick Open and layout controls; global Open Folder stays available
 there. The editor group has tabs and breadcrumbs, with Run, Format, and Save
 in its top-right action area. Explorer, Search and Go Tasks live in the left
 activity bar; Problems and Output share the lower panel. Use the selectable
-[VS Code color palettes](vscode-color-themes.md) while retaining Iron Go branding
+[VS Code color palettes](../design/vscode-color-themes.md) while retaining Iron Go branding
 and macOS controls. Sidebar and bottom
 panel can be resized and toggled. Primary macOS shortcuts: `⌘O` open project, `⌘P` quick open,
 `⇧⌘P` commands, `⌘S` save, `⇧⌘F` workspace search, `⇧⌥F` format,
@@ -94,7 +94,7 @@ Markdown. A preview project implements the same file interface without IPC.
 
 Continue by feature in this order: write/extend tests, then editor tabs and
 workspace, then task bindings, then language service. See the
-[feedback design](test-feedback-loop.md) for the automated gate.
+[feedback design](../design/test-feedback-loop.md) for the automated gate.
 
 ## 5. Verification
 

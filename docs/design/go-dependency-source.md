@@ -1,6 +1,6 @@
 # Read-only Go toolchain and dependency source
 
-Status: Implemented slice of [Go navigation and refactoring](daily-go-workbench.md#2-go-navigation-and-refactoring).
+Status: Implemented slice of [Go navigation and refactoring](../archive/daily-go-workbench.md#2-go-navigation-and-refactoring).
 
 ## Scope and invariants
 

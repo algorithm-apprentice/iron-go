@@ -1,7 +1,7 @@
 # Code review remediation plan
 
-Status: Design approved by independent review. Implement in order; each code
-batch requires its own review before publication.
+Historical record of the independently reviewed remediation batches. See
+[the contribution rules](../../AGENTS.md) for the current review process.
 
 Baseline: `33c0ddc` on `main`. The review ran `npm run check`, 7 browser
 scenarios and 16 native scenarios successfully. A separate disposable native
@@ -48,8 +48,8 @@ and do not report the prototype workaround as shipped.
 
 ## 1. Protect ordinary application exit
 
-**Finding:** [the frontend](../../src/main.ts#L844) only intercepts the
-window's close request; [the native run handler](../../src-tauri/src/main.rs#L166)
+**Finding:** [the frontend](https://github.com/algorithm-apprentice/iron-go/blob/33c0ddcb71f5f485c3fcaa375f73a700f215c6af/src/main.ts#L844) only intercepts the
+window's close request; [the native run handler](https://github.com/algorithm-apprentice/iron-go/blob/33c0ddcb71f5f485c3fcaa375f73a700f215c6af/src-tauri/src/main.rs#L173)
 cleans up after exit. In the review's cleanly isolated E2E process, native
 macOS Quit exited with a dirty model and never consulted confirmation.
 
@@ -122,7 +122,7 @@ does not change. Check actual expiration dismisses the dialog. Use focused
 tests for stale approvals. Minimize the main window through AppKit before
 invoking the native Quit menu action, verify AppKit reports it restored and
 visible while the dirty dialog is open, and then Cancel. The
-[hosted acceptance revision](hosted-native-quit.md) covers external system
+[hosted acceptance revision](../design/hosted-native-quit.md) covers external system
 Quit on visible windows. Do not use a synthetic `AppHandle::exit`
 or the test bridge's force-destroy shortcut as the native quit oracle.
 
@@ -156,7 +156,7 @@ reviewed in code but not separately exercised by native automation.
 
 ## 2. Define and harden save/reload transactions
 
-**Finding:** [`persist_text`](../../src-tauri/src/workspace.rs#L101) checks
+**Finding:** [`persist_text`](https://github.com/algorithm-apprentice/iron-go/blob/33c0ddcb71f5f485c3fcaa375f73a700f215c6af/src-tauri/src/workspace.rs#L101) checks
 the baseline before staging and replacing. The test today checks edits that
 are already on disk before a save; it does not place an edit between the
 comparison and commit. The frontend also needs controlled ordering tests
@@ -315,7 +315,7 @@ Independent code re-review approved this batch.
 ## 3. Simplify the workbench with behavior pinned
 
 Extract the project transition workflow and the shared save-before-launch
-step from [`src/main.ts`](../../src/main.ts), using the tests from batches 1–2.
+step from [`src/main.ts`](https://github.com/algorithm-apprentice/iron-go/blob/33c0ddcb71f5f485c3fcaa375f73a700f215c6af/src/main.ts), using the tests from batches 1–2.
 Rust still owns workspace IDs and subprocess admission; TypeScript still
 owns models, dirty state, and user decisions. Do not split out unrelated
 settings or theme code merely to reduce a line count.
@@ -450,8 +450,8 @@ Independent review approved the final code diff.
 ## 4. Share native process plumbing, not protocols
 
 Extract only the duplicated framed-JSON I/O, cancellation, child wait, and
-ownership cleanup in [`lsp.rs`](../../src-tauri/src/lsp.rs#L119) and
-[`debug.rs`](../../src-tauri/src/debug.rs#L82). Keep gopls stdio and Delve's
+ownership cleanup in [`lsp.rs`](https://github.com/algorithm-apprentice/iron-go/blob/33c0ddcb71f5f485c3fcaa375f73a700f215c6af/src-tauri/src/lsp.rs#L119) and
+[`debug.rs`](https://github.com/algorithm-apprentice/iron-go/blob/33c0ddcb71f5f485c3fcaa375f73a700f215c6af/src-tauri/src/debug.rs#L82). Keep gopls stdio and Delve's
 private Unix socket as separate adapters. LSP initialization and DAP
 request/event meanings stay independent. Do not generalize normal Go task
 output or package discovery into this transport.
@@ -552,7 +552,7 @@ passed on the revised code, and independent code re-review approved it.
 
 ## 5. Improve test independence and diagnostics
 
-Keep one E2E build but split the long [native runner](../../tests/native/workbench.mjs#L178)
+Keep one E2E build but split the long [native runner](https://github.com/algorithm-apprentice/iron-go/blob/33c0ddcb71f5f485c3fcaa375f73a700f215c6af/tests/native/workbench.mjs#L178)
 into support code and selectable workflow groups: lifecycle, files/editor,
 Go/language services, and debugging. Give destructive or stateful groups
 fresh workspace copies or fresh sessions, so one failure does not hide

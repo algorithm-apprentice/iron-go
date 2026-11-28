@@ -1,6 +1,6 @@
 # Daily Go workbench: feature completion plan
 
-Status: The personal-use features are implemented. The integrated feedback run
+Historical roadmap: the personal-use features are implemented. The integrated feedback run
 passed (`test-results/native/1795846668738-68435`), and the explicitly selected
 native keyboard/AX run passed (`test-results/native/1795846886360-71711`).
 VoiceOver support and public distribution are deferred.
@@ -16,7 +16,7 @@ Baseline: Iron Go opens `go.mod` and `go.work` projects, saves with conflict
 checks, searches saved files, runs/builds/tests packages, and uses `gopls` for
 completion, hover, local definitions, and diagnostics. Delve can stop and step
 over in a named test. Existing capabilities, including preview limitations,
-are described in the [README](../../README.md).
+are described in the [usage guide](../USAGE.md).
 
 ## Delivery order
 
@@ -56,10 +56,10 @@ below. Signing and notarization are a distribution gate, not a feature batch.
 
 ## 1. File decisions and external changes
 
-Implementation starts with [external file reconciliation](external-file-reconciliation.md).
-The next file workflows are [reviewed disk conflicts](reviewed-disk-conflicts.md)
-[save and discard decisions](document-decisions.md), and
-[saving a retained buffer to a new path](save-to-new-path.md).
+Implementation starts with [external file reconciliation](../design/external-file-reconciliation.md).
+The next file workflows are [reviewed disk conflicts](../design/reviewed-disk-conflicts.md),
+[save and discard decisions](../design/document-decisions.md), and
+[saving a retained buffer to a new path](../design/save-to-new-path.md).
 
 ### Behavior
 
@@ -125,8 +125,8 @@ self-generated save events, and late events after switching projects.
 
 ## 2. Go navigation and refactoring
 
-Implementation starts with [Go symbol navigation](go-symbol-navigation.md).
-The next step is [reviewing Go refactors](go-refactor-preview.md), starting
+Implementation starts with [Go symbol navigation](../design/go-symbol-navigation.md).
+The next step is [reviewing Go refactors](../design/go-refactor-preview.md), starting
 with the single-buffer Organize Imports action.
 
 - Add **Find References** and **Go to Symbol in File**. Use `gopls`, with
@@ -162,8 +162,8 @@ With `gopls` missing, Go to Line, ordinary editing, and `gofmt` still work.
 
 ## 3. Run configurations and test results
 
-See [named Go run configurations](go-run-configurations.md) and
-[structured Go test results](go-test-results.md).
+See [named Go run configurations](../design/go-run-configurations.md) and
+[structured Go test results](../design/go-test-results.md).
 
 - Keep automatic package selection and the scope picker. Add named setups
   stored locally per project: target, an ordered argument list (including
@@ -195,7 +195,7 @@ next.
 
 ## 4. Debug inspection and executable launch
 
-See [paused inspection](debug-inspection.md) and [executable debugging](debug-go-program.md).
+See [paused inspection](../design/debug-inspection.md) and [executable debugging](../design/debug-go-program.md).
 
 - Extend the current named-test session with a call stack, selected frame,
   expandable scopes and local variables, and **Step Into** / **Step Out**.
@@ -219,8 +219,8 @@ new session and the debuggee must exit.
 
 ## 5. Project continuity and file management
 
-See [recent projects](recent-projects.md), [crash drafts](crash-drafts.md), and
-[workspace file operations](workspace-file-operations.md).
+See [recent projects](../design/recent-projects.md), [crash drafts](../design/crash-drafts.md), and
+[workspace file operations](../design/workspace-file-operations.md).
 
 - Add **Open Recent** on Welcome and in the palette, with Remove from Recent
   and Clear History. Keep the [project-first welcome](../adr/0006-project-first-welcome.md):
@@ -268,7 +268,7 @@ breakpoint and draft state, and that nothing writes outside the project root.
 
 ## 6. Interactive terminal
 
-See [interactive terminal](interactive-terminal.md).
+See [interactive terminal](../design/interactive-terminal.md).
 
 Provide a separate **Terminal** pane for an explicitly started local shell
 or an interactive Go Run. Prototype the existing terminal-emulator and native
@@ -288,7 +288,7 @@ or child handle remains and no stale output appears in a new terminal.
 
 ## Accessibility and distribution
 
-See [keyboard access](workbench-accessibility.md).
+See [keyboard access](../design/workbench-accessibility.md).
 
 Public distribution is deferred during the personal-use roadmap. Keep the
 release checklist for a future decision; signing, notarization, and Gatekeeper

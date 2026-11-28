@@ -3,19 +3,14 @@
 Keep the existing GO artwork, metal frame and macOS canvas padding. Replace
 the rough cutout and bright fringe with one centered, anti-aliased rounded
 mask inset slightly into the opaque frame. Avoid rescaling the artwork or
-regenerating it with a different composition. Derive the welcome, favicon,
-and native icon resources from the same 1024 px master.
+regenerating it with a different composition. Use the
+[standard icon generation steps](../BUILDING.md#app-icon).
 
-Verify the old edge has an irregular fringe; verify the new silhouette at
-1024 px and the shipped small sizes on light and dark backgrounds. Check that
-corners stay transparent, the center stays opaque, and the mounted DMG
-contains the updated arm64 app and Applications link. Use a disposable mount
-point. The local package can be ad-hoc signed; distribution is out of scope.
-
-Confirm that the mask lies entirely inside the original opaque frame and
-compare its four corners and straight edges on light and dark backgrounds.
-Inspect the 64 px and 128 px derivatives and small native sizes. Verify that
-the mounted app's `CFBundleIconFile` names the regenerated ICNS resource.
+Confirm that the mask lies inside the original opaque frame, the corners stay
+transparent, and the center stays opaque. Compare the old fringe and the new
+edges on light and dark backgrounds, at 1024 px and all shipped small sizes.
+Follow the [bundle checks](../BUILDING.md#release-checklist) on a disposable,
+read-only DMG mount and verify that `CFBundleIconFile` names the updated ICNS.
 
 ## Verification
 

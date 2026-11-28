@@ -2,7 +2,7 @@
 
 Status: Revised after code review and independently approved for implementation.
 
-Design and acceptance: [Code review remediation, batch 1](../design/review-remediation-plan.md#1-protect-ordinary-application-exit).
+Design and acceptance: [Code review remediation, batch 1](../archive/review-remediation-plan.md#1-protect-ordinary-application-exit).
 
 macOS menu and system Quit use AppKit `terminate:`. On the pinned Tauri/Tao
 runtime, the resulting `RunEvent::Exit` is too late to protect unsaved edits.

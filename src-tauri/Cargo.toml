@@ -29,5 +29,5 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-
 
 [profile.release]
 # Cargo's inferred stripping produced proc-macros that macOS 27 dyld rejected.
-# See docs/GOTCHAS.md; verify the release bundle before removing this setting.
+# See docs/BUILDING.md; verify the release bundle before removing this setting.
 strip = "none"

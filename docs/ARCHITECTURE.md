@@ -1,50 +1,41 @@
-# Iron Go Architecture
+# Iron Go architecture
 
-Iron Go follows the macOS structure documented in `../iron-cpp/docs/ARCHITECTURE.md`.
-It is a standalone application: the sibling repository is not required for
-builds or tests. See [the ADR index](adr/README.md) for decisions.
+Iron Go is a standalone macOS app built with Tauri and Monaco. Iron C++ is an
+architecture reference; it is not required to build or test Iron Go. See the
+[decision records](adr/README.md) for the reasoning and the
+[design index](design/README.md) for feature invariants and test evidence.
 
-```text
-Iron Go.app (macOS)
-├── Tauri/Rust host (src-tauri/src)
-│   ├── main.rs           → workspace identity, dialogs, command registration
-│   ├── workspace.rs      → tree, paths, UTF-8 files, atomic saves, project search
-│   ├── workspace_disk.rs → bound directory identity, disk inspection, watch revisions
-│   ├── tools.rs          → tool discovery, gofmt, process group ownership
-│   ├── packages.rs       → cancellable Go module and run target discovery
-│   ├── tasks.rs          → go run/build/test, bounded output and cancellation
-│   ├── debug.rs          → Delve process, private DAP socket and teardown
-│   ├── debug_program.rs  → executable build-to-Delve handoff and process ownership
-│   ├── terminal.rs       → native PTYs, foreground retirement, output credits
-│   ├── drafts.rs        → private crash snapshots, leases and retirement
-│   ├── recent.rs        → recent root identities and bounded editor sessions
-│   ├── workspace_files.rs → exclusive file moves and macOS Trash
-│   ├── go_source.rs      → bounded offline toolchain and dependency reads
-│   └── lsp.rs            → gopls stdio ⇄ Tauri IPC channels
-└── TypeScript/Monaco workbench (src)
-    ├── main.ts           → workbench assembly and user actions
-    ├── workspace.ts      → native bridge and preview project adapter
-    ├── project-model.ts  → pure tree, path, file navigation and search
-    ├── run-targets.ts    → executable picker, test scope and advanced overrides
-    ├── editor.ts         → theme, syntax, files and Monaco model lifetimes
-    ├── feedback.ts       → bounded task output and feedback pane
-    ├── debugger.ts       → gutter breakpoints and named-test DAP session
-    ├── terminal-pane.ts  → xterm.js input, display and current-generation credits
-    └── lsp.ts            → vscode-jsonrpc connection and Monaco providers
-```
+## Ownership and boundaries
 
-`go.mod`/`go.work` belong to Go; Iron Go does not rewrite an existing module
-on open. Tauri commands and channels are the only production IPC. Untrusted
-workspace names, source text, search results and output are text nodes.
+- **The Rust host** owns the current workspace identity, file operations and
+  watchers, native menus and dialogs, and local child processes. Each process
+  and its channels have a single owner and retire on project switch or close.
+- **The TypeScript workbench** owns Monaco models and visible state, command
+  eligibility, project transition decisions, and navigation history. Async
+  results must still match their originating project, model, or session before
+  they apply. Rust projects command eligibility into the native menu.
+- **Tauri commands, channels, and events** form the production IPC boundary. Workspace
+  operations carry the active identity. The browser preview implements the
+  project interface over imported files without native IPC.
+- **The Go toolchain** owns `go.mod` and `go.work`. Opening a project does not
+  rewrite them. Missing tools disable only the features that need them.
+- **Workspace names, source text, search results, and output** are rendered as
+  text nodes. Language-server documentation is handled separately as untrusted
+  Markdown.
 
-The native host admits only the current workspace identity. Frontend
-operations capture the current project or model and ignore stale results.
-Processes and their channels have a single owner and are dropped on switch
-or close. Tool absence degrades capabilities separately from file editing.
+## Code map
 
-The acceptance fixture is `tests/fixtures/orbit`; automation only edits a copy.
-It is not bundled into the application.
-See [testing instructions](TESTING.md) for the feedback loop.
+Rust files are under [`src-tauri/src`](../src-tauri/src/); TypeScript files are
+under [`src`](../src/).
 
-See the proposed [daily Go workbench plan](design/daily-go-workbench.md) for
-the remaining workflows and their acceptance criteria.
+| Area | Rust host | TypeScript workbench |
+| --- | --- | --- |
+| App and project lifecycle | `main.rs`, `quit.rs`, `workbench_menu.rs`: session, Quit tickets, AppKit menus, command registration. | `main.ts`, `project-workflow.ts`, `quit-flow.ts`: workbench assembly, commands, reservations. |
+| Workspace and editor | `workspace.rs`, `workspace_disk.rs`, `workspace_files.rs`: guarded paths, saves, file identity, watchers and moves. | `workspace.ts`, `project-model.ts`, `editor.ts`, `navigation-history.ts`: project bridge, tree/search, Monaco models, Back/Forward. |
+| Continuity | `recent.rs`, `drafts.rs`: recent roots, editor sessions, crash snapshots, leases and retirement. | `draft-recorder.ts` and workbench/session wiring in `main.ts` and `editor.ts`. |
+| Build, run and test | `tools.rs`, `packages.rs`, `tasks.rs`: tool discovery, gofmt, run targets, Go process ownership and bounded output. | `execution.ts`, `run-targets.ts`, `run-configurations.ts`, `go-test-stream.ts`, `feedback.ts`: launch admission, scopes, configurations and results. |
+| Language services | `lsp.rs`, `go_source.rs`, `tool_transport.rs`: gopls stdio transport and read-only dependency source. | `lsp.ts`, `go-semantic-tokens.ts`, `go-source-view.ts`, `go-rename.ts`, `go-import-edits.ts`: Monaco providers and Go edit/navigation workflows. |
+| Debug and terminal | `debug.rs`, `debug_program.rs`, `terminal.rs`: Delve DAP, executable handoff, PTY lifecycle and credits. | `debugger.ts`, `debug-inspection.ts`, `terminal-pane.ts`: breakpoints, paused state and xterm.js interaction. |
+
+See the [testing guide](TESTING.md) for the separate acceptance build and
+disposable fixture boundaries.

@@ -1,7 +1,7 @@
 # External file reconciliation
 
 Status: First implementation slice of the
-[daily Go workbench plan](daily-go-workbench.md).
+[daily Go workbench plan](../archive/daily-go-workbench.md).
 
 ## Scope
 

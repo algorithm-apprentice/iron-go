@@ -1,6 +1,6 @@
 # Save a retained buffer to a new path
 
-Status: Implemented follow-up under the [daily Go workbench plan](daily-go-workbench.md).
+Status: Implemented follow-up under the [daily Go workbench plan](../archive/daily-go-workbench.md).
 
 ## Behavior
 

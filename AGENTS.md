@@ -20,10 +20,13 @@ when it is needed to exercise editor behavior.
 3. Implement the smallest change that passes. Reuse established libraries and
    native tools before adding infrastructure. Keep workspace and process
    ownership in Rust and workbench state in TypeScript.
-4. Run `npm run check` and the relevant acceptance suite. Native/WebView/IPC
-   changes require `npm run test:native`; a browser run alone does not prove
-   them. `npm run test:feedback` runs the full loop. See
+4. For code or test-runner changes, run `npm run check` and the relevant
+   acceptance suite. Native/WebView/IPC changes require `npm run test:native`;
+   a browser run alone does not prove them. Run `npm run test:feedback` as the
+   full gate before publishing code or test-runner changes. See the
    [testing instructions](docs/TESTING.md) for failure artifacts and setup.
+   For documentation-only changes, validate links and check instructions
+   against the current commands and behavior.
 5. Update the design with actual verification and any remaining gaps. Never
    require a user to click through a scenario an agent can exercise itself.
 6. Get independent code review of the exact diff and evidence before committing

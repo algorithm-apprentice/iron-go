@@ -1,6 +1,6 @@
 # Go symbol navigation
 
-Status: Implemented first navigation slice of the [daily Go workbench plan](daily-go-workbench.md).
+Status: Implemented first navigation slice of the [daily Go workbench plan](../archive/daily-go-workbench.md).
 
 ## Scope and invariants
 

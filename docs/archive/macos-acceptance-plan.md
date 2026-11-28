@@ -1,6 +1,7 @@
 # macOS user-workflow acceptance plan
 
-Status: Active. A checked build is not a claim that every possible bug is gone.
+Historical record of the first acceptance round. See the [testing guide](../TESTING.md)
+for the current gates and commands.
 
 ## Method and environments
 
@@ -42,7 +43,7 @@ relevant full gate after a fix. A skipped tool/OS case is not a pass.
    On mixed displays add `-- --retina-probe --display-round-trip`. Separately
    verify the mounted disk image and any conditional macOS fix in a native run.
 
-## Current gaps to close
+## Gaps recorded in the first round
 
 - The reported active-row mismatch has not reproduced in the initial
   scroll/CodeLens measurement on the Raft snapshot. Capture the precise
