@@ -19,6 +19,27 @@ struct Projection {
     items: BTreeMap<String, MenuItem<tauri::Wry>>,
 }
 
+impl Projection {
+    fn begin_document(&mut self) {
+        self.generation += 1;
+        self.revision = 0;
+    }
+
+    fn accept_update(&mut self, generation: u64, revision: u64) -> bool {
+        if self.generation != generation || revision <= self.revision {
+            return false;
+        }
+        self.revision = revision;
+        true
+    }
+
+    fn current_command<'a>(&self, item_id: &'a str) -> Option<&'a str> {
+        let (generation, command) = item_id.strip_prefix("irongo:")?.split_once(':')?;
+        (self.revision != 0 && generation.parse::<u64>().ok() == Some(self.generation))
+            .then_some(command)
+    }
+}
+
 pub(crate) fn build(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let state = app.state::<MenuState>();
     let generation = state.0.lock().unwrap().generation;
@@ -147,8 +168,7 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 pub(crate) fn reset(app: &AppHandle) {
     let state = app.state::<MenuState>();
     let mut projection = state.0.lock().unwrap();
-    projection.generation += 1;
-    projection.revision = 0;
+    projection.begin_document();
     for item in projection.items.values() {
         let _ = item.set_enabled(false);
     }
@@ -163,18 +183,10 @@ pub(crate) fn reset(app: &AppHandle) {
 pub(crate) fn dispatch(app: &AppHandle, event: tauri::menu::MenuEvent) {
     let state = app.state::<MenuState>();
     let projection = state.0.lock().unwrap();
-    let Some((generation, id)) = event
-        .id()
-        .as_ref()
-        .strip_prefix("irongo:")
-        .and_then(|event| event.split_once(':'))
-    else {
+    let Some(id) = projection.current_command(event.id().as_ref()) else {
         return;
     };
-    if generation.parse::<u64>().ok() == Some(projection.generation)
-        && projection.revision != 0
-        && projection.items.contains_key(id)
-    {
+    if projection.items.contains_key(id) {
         let _ = app.emit_to("main", "iron-go-menu", (projection.generation, id));
     }
 }
@@ -195,13 +207,50 @@ pub async fn update_workbench_menu(
     app.run_on_main_thread(move || {
         let state = window_app.state::<MenuState>();
         let mut projection = state.0.lock().unwrap();
-        if projection.generation != generation || revision <= projection.revision {
+        if !projection.accept_update(generation, revision) {
             return;
         }
-        projection.revision = revision;
         for (id, item) in &projection.items {
             let _ = item.set_enabled(enabled.contains(id));
         }
     })
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_current_document_can_advance_the_menu_revision() {
+        let mut projection = Projection::default();
+        projection.begin_document();
+        assert!(projection.accept_update(1, 3));
+        assert!(!projection.accept_update(1, 2));
+        assert!(!projection.accept_update(1, 3));
+        assert!(!projection.accept_update(2, 100));
+        assert!(projection.accept_update(1, 4));
+        projection.begin_document();
+        assert!(!projection.accept_update(1, 100));
+        assert!(!projection.accept_update(2, 0));
+        assert!(projection.accept_update(2, 1));
+    }
+
+    #[test]
+    fn a_queued_click_cannot_cross_the_document_boundary() {
+        let mut projection = Projection::default();
+        projection.begin_document();
+        let old_click = "irongo:1:save";
+        assert_eq!(projection.current_command(old_click), None);
+        assert!(projection.accept_update(1, 1));
+        assert_eq!(projection.current_command(old_click), Some("save"));
+        projection.begin_document();
+        let new_click = "irongo:2:save";
+        assert_eq!(projection.current_command(new_click), None);
+        assert!(projection.accept_update(2, 1));
+        assert_eq!(projection.current_command(old_click), None);
+        assert_eq!(projection.current_command(new_click), Some("save"));
+        assert_eq!(projection.current_command("quit"), None);
+        assert_eq!(projection.current_command("irongo:invalid:save"), None);
+    }
 }

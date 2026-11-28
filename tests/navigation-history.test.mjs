@@ -77,3 +77,19 @@ test("an obsolete activation does not advance the replay cursor", async () => {
   assert.deepEqual(history.candidate(-1), point("a.go"));
   assert.equal(history.candidate(1), undefined);
 });
+
+test("moving paths and removing the active entry preserve surviving code locations", () => {
+  const history = new NavigationHistory();
+  history.record(point("a.go", 3, 60), point("old/b.go", 5, 120));
+  history.record(point("old/b.go", 5, 120), point("c.go", 7, 180));
+  history.arrive(history.candidate(-1));
+  history.updatePaths(path => path.replace(/^old\//, "new/"));
+  assert.deepEqual(history.entries[1], point("new/b.go", 5, 120));
+  assert.deepEqual(history.candidate(-1), point("a.go", 3, 60));
+  history.updatePaths(path => path === "new/b.go" ? undefined : path);
+  assert.deepEqual(history.entries, [point("a.go", 3, 60), point("c.go", 7, 180)]);
+  assert.deepEqual(history.candidate(1), point("c.go", 7, 180));
+  history.reset();
+  assert.equal(history.candidate(-1), undefined);
+  assert.equal(history.candidate(1), undefined);
+});

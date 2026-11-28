@@ -174,6 +174,12 @@ impl Session {
         self.terminal.as_ref().is_some_and(|owner| owner.go)
     }
 
+    fn ack_terminal(&self, terminal: u64, sequence: u64) {
+        if let Ok(owner) = check_owner(self, terminal) {
+            let _ = owner.ack.try_send(sequence);
+        }
+    }
+
     pub(crate) fn request_terminal_stop(
         &mut self,
         id: Option<u64>,
@@ -239,6 +245,71 @@ fn check_owner(session: &Session, terminal: u64) -> CommandResult<&Owner> {
         .ok_or_else(|| "This terminal is no longer active.".into())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_requests_do_not_stop_or_credit_the_replacement_terminal() {
+        let (owner, mut streams) = Owner::new(2, false, Size { cols: 80, rows: 24 });
+        let mut session = Session {
+            terminal: Some(owner),
+            ..Session::default()
+        };
+
+        assert!(session.request_terminal_stop(Some(1)).is_none());
+        session.ack_terminal(1, 12);
+        assert!(!*streams.stop.borrow());
+        assert!(matches!(
+            streams.ack.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        session.ack_terminal(2, 13);
+        assert_eq!(streams.ack.try_recv().unwrap(), 13);
+        let done = session.request_terminal_stop(Some(2)).unwrap();
+        assert!(*streams.stop.borrow());
+        assert!(!*done.borrow());
+        assert_eq!(check_owner(&session, 2).unwrap().id, 2);
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_an_explicit_cleanup_confirmation() {
+        let (owner, streams) = Owner::new(2, false, Size { cols: 80, rows: 24 });
+        let core = Core::default();
+        core.0.lock().unwrap().terminal = Some(owner);
+        let mut wait = std::pin::pin!(wait_stop(&core, Some(2)));
+        tokio::select! {
+            biased;
+            result = &mut wait => panic!("Stop completed before cleanup: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        assert!(*streams.stop.borrow());
+        let owner = core.0.lock().unwrap().terminal.take().unwrap();
+        owner.done.send_replace(true);
+        assert!(wait.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_cleanup_sender_is_not_confirmation() {
+        let (owner, streams) = Owner::new(2, false, Size { cols: 80, rows: 24 });
+        let core = Core::default();
+        core.0.lock().unwrap().terminal = Some(owner);
+        let mut wait = std::pin::pin!(wait_stop(&core, Some(2)));
+        tokio::select! {
+            biased;
+            result = &mut wait => panic!("Stop completed before cleanup: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        assert!(*streams.stop.borrow());
+        drop(core.0.lock().unwrap().terminal.take());
+        assert_eq!(
+            wait.await.unwrap_err(),
+            "The native terminal closed without proving process cleanup."
+        );
+    }
+}
+
 #[tauri::command]
 pub fn terminal_input(state: State<'_, Core>, terminal: u64, text: String) -> CommandResult<()> {
     if text.len() > INPUT {
@@ -252,9 +323,7 @@ pub fn terminal_input(state: State<'_, Core>, terminal: u64, text: String) -> Co
 
 #[tauri::command]
 pub fn terminal_ack(state: State<'_, Core>, terminal: u64, sequence: u64) {
-    if let Ok(owner) = check_owner(&state.0.lock().unwrap(), terminal) {
-        let _ = owner.ack.try_send(sequence);
-    }
+    state.0.lock().unwrap().ack_terminal(terminal, sequence);
 }
 
 #[tauri::command]

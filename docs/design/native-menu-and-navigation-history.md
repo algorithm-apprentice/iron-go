@@ -209,3 +209,25 @@ successful jump, and the Control-Minus bindings. `npm run check` and Chromium
 passed. The rebuilt Apple Silicon DMG passed image, icon resource and bundle
 signature checks. Creation under the fixture parent was verified; the real
 location picker's cancellation was not part of this run.
+
+## Follow-up: delayed Back replay in the workbench
+
+Exercise the normal preview workbench, including its explorer, keyboard
+commands, and project transition dialog. Intercept one preview `File` read
+in each isolated Chromium page so the test can stop Back after it has started
+reopening a closed tab. Release that read only after a newer navigation commits
+or the user cancels a dirty project transition. The old target must not open
+or activate, the selected editor and any dirty state must survive, and a fresh
+Back (and Forward after cancellation) must still follow the committed history.
+
+A history-only test cannot prove that the workbench passes the current-visit
+guard to the editor. A native acceptance probe could hold a disk read, but the
+race is in renderer code and Chromium exercises the same replay wiring. The
+test changes only the preview file-read boundary and does not add a shipped
+test hook or use a timer to decide when the replay is pending.
+
+Both focused Chromium cases passed. Temporarily omitting the replay's
+`current` guard at the editor boundary made the newer-jump case reopen the
+old tab in the background and the canceled-transition case activate it. Both
+tests passed again when the guard was restored. `npm run check` also passed.
+No product changes or native acceptance were needed for this follow-up.

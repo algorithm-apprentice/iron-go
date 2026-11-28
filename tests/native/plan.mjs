@@ -3,6 +3,23 @@ import { parseArgs } from "node:util";
 
 export const fixtureGroups = ["lifecycle", "files", "go", "debug", "quit", "quit-save", "recovery", "recent", "trash", "terminal", "accessibility"];
 
+export const missingGopls = "gopls not installed";
+export const goLanguageCases = [
+  "gopls publishes/clears real errors and completes a Go symbol",
+  "gopls hover and definition work through Monaco",
+  "gopls symbol and reference navigation uses unsaved UTF-16 locations",
+  "Organize Imports updates only the Go buffer as one undoable edit",
+  "Rename previews real cross-file changes and rejects a stale workspace",
+  "opens Go standard library and offline dependency source in an isolated read-only viewer",
+  "runs exactly one Go test from its editor action",
+  "whole-line selection highlights the selected number, not its endpoint",
+  "gopls colors identifiers in an unsaved Go buffer",
+  "native Go Back and Forward restore a dirty editor across a gopls jump",
+  "keyboard command runs only the test at a dirty renamed declaration",
+];
+const goBuildCase = "builds, runs, and tests the actual Go module";
+const goRelaunchCase = "a new native app restores the selected Go configuration without session secrets";
+
 export function nativePlan(args) {
   const { values } = parseArgs({ args, options: {
     "skip-build": { type: "boolean" }, "require-gopls": { type: "boolean" },
@@ -56,7 +73,29 @@ export function validTerminal(group, terminal) {
   return typeof action === "string" && terminal?.action === action && typeof terminal.rendererObserved === "string";
 }
 
-export function summarizeGroup(group, { worker, report, failure, cleanup, nativeTerminal, diagnostics = [] }) {
+function goReportFailure(report, { reopen, requireGopls }) {
+  const cases = new Map();
+  for (const entry of report.cases) {
+    if (cases.has(entry.name)) return `Duplicate native Go case: ${entry.name}`;
+    cases.set(entry.name, entry);
+  }
+  const expected = reopen ? [goRelaunchCase] : [goBuildCase, ...goLanguageCases];
+  const missing = expected.filter(name => !cases.has(name));
+  if (missing.length) return `Missing native Go cases: ${missing.join("; ")}`;
+  const baseline = reopen ? goRelaunchCase : goBuildCase;
+  if (cases.get(baseline).result !== "pass") return `Native Go case did not pass: ${baseline}`;
+  if (reopen) return;
+  if (typeof report.goplsAvailable !== "boolean") return "Missing native gopls capability result.";
+  if (!report.goplsAvailable && requireGopls) return "Required native gopls was unavailable.";
+  for (const name of goLanguageCases) {
+    const entry = cases.get(name);
+    if (report.goplsAvailable ? entry.result !== "pass" : entry.result !== "skip" || entry.reason !== missingGopls) {
+      return `Native Go case disagrees with the gopls capability result: ${name}`;
+    }
+  }
+}
+
+export function summarizeGroup(group, { worker, report, failure, cleanup, nativeTerminal, diagnostics = [], reopen, requireGopls }) {
   const valid = validReport(group, report);
   const primary = failure || (valid && report.failure) || (valid && report.cases.find(entry => entry.result === "fail")?.error)
     || (worker?.code !== 0 || worker.signal ? `Worker exited: ${JSON.stringify(worker ?? null)}` : undefined)
@@ -67,7 +106,8 @@ export function summarizeGroup(group, { worker, report, failure, cleanup, native
       ? "Missing verified native Quit; watchdog EOF is not the Quit oracle." : undefined);
   const secondary = [...diagnostics, ...(valid ? report.diagnostics ?? [] : [])];
   if (cleanup && primary) secondary.push(cleanup);
-  return { group, result: primary || cleanup ? "fail" : "pass", ...(primary || cleanup ? { failure: primary || cleanup } : {}),
+  const verdict = primary || cleanup || (group === "go" && goReportFailure(report, { reopen, requireGopls }));
+  return { group, result: verdict ? "fail" : "pass", ...(verdict ? { failure: verdict } : {}),
     ...(secondary.length ? { diagnostics: secondary } : {}), ...(worker ? { worker } : {}),
     ...(valid ? { cases: report.cases, terminal: report.terminal } : { cases: [] }) };
 }

@@ -121,3 +121,55 @@ test("Run and Debug share save rejection, successful ordering, and exclusive adm
     assert.deepEqual(trace, ["saving", "saved", kind]);
   }
 });
+
+test("a launch retired during save cannot dispatch into a replacement project", async () => {
+  for (const kind of ["run", "debug"]) {
+    const lane = new ExecutionLane(() => {});
+    const save = Promise.withResolvers();
+    const dispatched = [];
+    const old = lane.start("old", kind, { ...clean, save: () => save.promise },
+      async token => { dispatched.push(token.project); });
+    assert.equal(lane.preparing, true);
+    lane.retire();
+
+    let active;
+    await lane.start("new", "run", clean, async token => {
+      dispatched.push(token.project);
+      active = token;
+      lane.taskEvent(token, "started");
+    });
+    save.resolve();
+    await old;
+    assert.deepEqual(dispatched, ["new"]);
+    assert.ok(active);
+    assert.equal(lane.owns(active), true);
+    assert.equal(lane.canStopTask, true);
+  }
+});
+
+test("a failed Stop restores the running task and lets the user retry", async () => {
+  const lane = new ExecutionLane(() => {});
+  const project = { id: 1 };
+  let active;
+  await lane.start(project, "run", clean, async token => {
+    active = token;
+    lane.taskEvent(token, "started");
+  });
+  const stop = Promise.withResolvers();
+  const first = lane.stopTask(target => {
+    assert.equal(target, project);
+    return stop.promise;
+  });
+  assert.equal(lane.canStopTask, false);
+  stop.reject(new Error("Stop failed"));
+  await assert.rejects(first, /Stop failed/);
+  assert.equal(lane.owns(active), true);
+  assert.equal(lane.canStopTask, true);
+
+  const retries = [];
+  await lane.stopTask(async target => { retries.push(target); });
+  assert.deepEqual(retries, [project]);
+  assert.equal(lane.owns(active), true, "Stop acknowledgement alone does not release the task");
+  assert.equal(lane.taskEvent(active, "finished"), true);
+  assert.equal(lane.occupied, false);
+});

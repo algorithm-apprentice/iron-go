@@ -934,6 +934,92 @@ test("keyboard cycles open editors in order without dropping unsaved edits", asy
   });
 });
 
+const historyTab = (page, name, selected) => page.getByRole("tab", { name, exact: true, selected });
+
+async function prepareClosedHistoryTarget(page) {
+  for (const name of ["README.md", "go.mod"]) {
+    await page.locator(`#explorer [data-path="${name}"]`).click();
+    await historyTab(page, name, true).waitFor();
+  }
+  await page.getByRole("button", { name: "Close README.md", exact: true }).click();
+  await historyTab(page, "README.md").waitFor({ state: "detached" });
+}
+
+async function holdBackRead(page) {
+  await page.evaluate(() => {
+    const read = File.prototype.arrayBuffer;
+    const gate = Promise.withResolvers();
+    const hold = { ready: false, release: gate.resolve };
+    window.heldHistoryRead = hold;
+    File.prototype.arrayBuffer = async function () {
+      if (!this.webkitRelativePath.endsWith("/README.md")) return read.call(this);
+      File.prototype.arrayBuffer = read;
+      const bytes = await read.call(this);
+      hold.ready = true;
+      await gate.promise;
+      return bytes;
+    };
+  });
+  await page.keyboard.press("Control+Minus");
+  await page.waitForFunction(() => window.heldHistoryRead.ready, undefined, { timeout: 5000 });
+  await historyTab(page, "go.mod", true).waitFor();
+  return () => page.evaluate(() => {
+    window.heldHistoryRead.release();
+    delete window.heldHistoryRead;
+    // Let the released read and its awaited activation callbacks finish.
+    return new Promise(resolve => requestAnimationFrame(resolve));
+  });
+}
+
+test("a delayed Back read cannot replace a newer editor jump", async () => {
+  await scenario("back-read-superseded-by-jump", async page => {
+    await prepareClosedHistoryTarget(page);
+    const release = await holdBackRead(page);
+
+    // An ordinary tab jump exercises the workbench guard without opening a modal.
+    await historyTab(page, "main.go").click();
+    await historyTab(page, "main.go", true).waitFor();
+    await release();
+    assert.equal(await historyTab(page, "main.go", true).count(), 1, "the newer jump stays selected");
+    assert.equal(await historyTab(page, "README.md").count(), 0, "stale Back must not even reopen the tab in the background");
+
+    await page.keyboard.press("Control+Minus");
+    await historyTab(page, "go.mod", true).waitFor();
+    await page.keyboard.press("Control+Minus");
+    await historyTab(page, "README.md", true).waitFor();
+  });
+});
+
+test("a delayed Back read stays canceled after canceling a project transition", async () => {
+  await scenario("back-read-superseded-by-canceled-transition", async page => {
+    await prepareClosedHistoryTarget(page);
+    await page.locator("#editor textarea.inputarea").focus();
+    await page.keyboard.insertText("// history-replay-marker\n");
+    const caret = await page.locator("#cursor").innerText();
+    const release = await holdBackRead(page);
+
+    await page.locator("#import-folder").setInputFiles(join(fixture, "internal", "status"));
+    const dialog = page.getByRole("dialog", { name: "Leave this project?" });
+    await dialog.waitFor();
+    assert.equal(await page.locator("#new-file").isDisabled(), true);
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await dialog.waitFor({ state: "hidden" });
+    await page.waitForFunction(() => !document.querySelector("#new-file").disabled, undefined, { timeout: 5000 });
+
+    await release();
+    assert.equal(await historyTab(page, "go.mod", true).count(), 1, "canceling the transition cannot revive Back");
+    assert.equal(await historyTab(page, "README.md").count(), 0, "the canceled replay must not reopen the target");
+
+    await page.keyboard.press("Control+Minus");
+    await historyTab(page, "README.md", true).waitFor();
+    await page.keyboard.press("Control+Shift+Minus");
+    await historyTab(page, "go.mod", true).waitFor();
+    assert.equal(await page.locator('.tab.dirty [data-path="go.mod"]').count(), 1);
+    await page.locator("#editor .view-lines").getByText(/history-replay-marker/).waitFor();
+    assert.equal(await page.locator("#cursor").innerText(), caret);
+  });
+});
+
 test("caret lookup wiring drops restored cursor, model and reservation intents before dispatch", async () => {
   await documentScenario("caret-test-wiring", async page => {
     const calls = await page.evaluate(async () => {

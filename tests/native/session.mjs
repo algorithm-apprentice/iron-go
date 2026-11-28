@@ -4,7 +4,7 @@ import { mkdir, readFile, readdir, rename, stat, symlink, writeFile } from "node
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { expectedGoSyntax, goSyntaxSample, renderedGoSyntax } from "../go-syntax-sample.mjs";
-import { runtimeClean } from "./plan.mjs";
+import { goLanguageCases, missingGopls, runtimeClean } from "./plan.mjs";
 
 if (!process.send) throw new Error("Run native acceptance through workbench.mjs.");
 const { group, reopen, values, driver, artifacts, fixture, home, pid, quitHelper, trashRoot, accessibilityHelper, peer } = JSON.parse(process.argv[2]);
@@ -2007,6 +2007,7 @@ async function holdConfiguredBuild(launch = () => click("#run")) {
 
 async function goSuite() {
   const capabilities = await probeTools({ gopls: !!values["require-gopls"] });
+  report.goplsAvailable = capabilities.gopls;
   await openOrbit();
   // Monaco can open before the independent package/tool probes finish. A
   // click during discovery is correctly rejected by the workbench.
@@ -2048,14 +2049,9 @@ async function goSuite() {
   });
 
   if (!capabilities.gopls) {
-    for (const name of ["gopls publishes/clears real errors and completes a Go symbol", "gopls hover and definition work through Monaco",
-      "gopls symbol and reference navigation uses unsaved UTF-16 locations", "Organize Imports updates only the Go buffer as one undoable edit",
-      "Rename previews real cross-file changes and rejects a stale workspace",
-      "opens Go standard library and offline dependency source in an isolated read-only viewer", "runs exactly one Go test from its editor action",
-      "whole-line selection highlights the selected number, not its endpoint", "gopls colors identifiers in an unsaved Go buffer",
-      "native Go Back and Forward restore a dirty editor across a gopls jump"]) {
-      console.log(`  SKIP ${name} (gopls not installed)`);
-      report.cases.push({ name, result: "skip", reason: "gopls not installed" });
+    for (const name of goLanguageCases) {
+      console.log(`  SKIP ${name} (${missingGopls})`);
+      report.cases.push({ name, result: "skip", reason: missingGopls });
     }
   } else {
     await record("gopls publishes/clears real errors and completes a Go symbol", async () => {
@@ -2451,8 +2447,6 @@ func (c SemanticCourier) SemanticDeliver(SemanticMessage string) string {
         value => /PASS: TestKeyboardRenamed[\s\S]*exit code 0/.test(value), 30_000);
       assert.doesNotMatch(result, /PASS: TestAnother|PASS: TestSummary/);
     });
-  } else {
-    report.cases.push({ name: "keyboard command runs only the test at a dirty renamed declaration", result: "skip", reason: "gopls not installed" });
   }
   await record("structured Go tests keep terminal results after output clipping and navigate failures", async () => {
     const relative = "cmd/orbit/structured_test.go";

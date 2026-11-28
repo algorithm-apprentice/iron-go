@@ -66,7 +66,7 @@ function validateProfile(profile: Profile) {
   validateLaunch(profile);
 }
 
-function readSaved(raw: string | null): Saved {
+export function readSaved(raw: string | null): Saved {
   const empty: Saved = { version: 1, profiles: [] };
   if (!raw || raw.length > 4 * 1024 * 1024) return empty;
   try {

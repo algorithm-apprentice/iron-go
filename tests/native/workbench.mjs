@@ -322,7 +322,8 @@ async function runGroup(executable, env, group, quitHelper, reopen = false, acce
       catch (error) { cleanup = `Could not remove disposable group: ${error}`; preserve.add(fixtureRoot); }
     }
   }
-  return summarizeGroup(group, { worker: workerExit, report: groupReport, failure, cleanup, nativeTerminal, diagnostics });
+  return summarizeGroup(group, { worker: workerExit, report: groupReport, failure, cleanup, nativeTerminal, diagnostics,
+    reopen, requireGopls: values["require-gopls"] });
 }
 
 try {
